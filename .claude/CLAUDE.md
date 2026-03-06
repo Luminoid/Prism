@@ -57,6 +57,34 @@ make check  # SwiftLint + SwiftFormat
 - Swift Testing framework (`@Test`, `#expect`, `@Suite`)
 - Mock types: `MockFilter`, `MockRenderer`, `MockCameraDelegate`
 
+## SwiftLint & SwiftFormat
+
+Code must pass `swiftlint --strict` and `swiftformat --lint .` (`make check`).
+
+**SwiftLint rules to follow when writing code:**
+- **No force casts** (`as!`) — use `guard let ... as?` or `if let ... as?`
+- **No force unwrapping** (`!`) — use optional binding
+- **`prefer_self_in_static_references`** — use `Self` not the type name in return types and static method references
+- **`for_where`** — use `for x in items where condition` instead of `if` inside `for`
+- **`implicit_return`** — single-expression closures, computed properties, and switch cases omit `return`
+- **`trailing_comma`** (mandatory) — trailing comma in multi-line collections and argument lists
+- **`force_try`** — avoid `try!`, use `try?` or `do/catch`
+- **`sorted_first_last`** — use `.min()` / `.max()` not `.sorted().first` / `.sorted().last`
+
+**SwiftFormat rules to follow when writing code:**
+- **`--ifdef indent`** — indent code inside `#if` / `#else` / `#endif` blocks
+- **`--self remove`** — don't use `self.` when not required
+- **`--commas always`** — trailing commas in multi-line lists
+- **`preferFinalClasses`** — classes are `final` unless designed for subclassing
+- **`docComments`** — use `///` doc comments for public API
+
+**Lint paths:** `Sources`, `Tests` (Example not included in SwiftLint `included` but should follow same style)
+
+## Example App
+
+- **Never commit `DEVELOPMENT_TEAM`** in `project.pbxproj` — set it to `""` or omit it. Use `project.yml` (XcodeGen) as the source of truth; regenerate pbxproj with `xcodegen generate`
+- Example uses XcodeGen (`Example/project.yml`) — edit `project.yml`, not `project.pbxproj` directly
+
 ## Key Patterns
 
 - **Threading**: Session operations on `sessionQueue`, video frames on `dataOutputQueue`, UI on `MainActor`
