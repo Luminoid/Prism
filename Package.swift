@@ -23,7 +23,7 @@ let package = Package(
             path: "Sources/PrismCore",
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency"),
-            ]
+            ],
         ),
         .target(
             name: "PrismUI",
@@ -35,17 +35,17 @@ let package = Package(
             swiftSettings: [
                 .defaultIsolation(MainActor.self),
                 .enableExperimentalFeature("StrictConcurrency"),
-            ]
+            ],
         ),
         .testTarget(
             name: "PrismCoreTests",
             dependencies: ["PrismCore"],
-            path: "Tests/PrismCoreTests"
+            path: "Tests/PrismCoreTests",
         ),
         .testTarget(
             name: "PrismUITests",
             dependencies: ["PrismUI"],
-            path: "Tests/PrismUITests"
+            path: "Tests/PrismUITests",
         ),
-    ]
+    ],
 )
