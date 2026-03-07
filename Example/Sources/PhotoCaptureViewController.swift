@@ -17,7 +17,6 @@ final class PhotoCaptureViewController: UIViewController {
     private let filterPipeline = PRMFilterPipeline()
     private let previewView = PRMPreviewMetalView(frame: .zero)
     private let captureButton = PRMCameraButton()
-    private let imageView = UIImageView()
     private let aspectOverlay = PRMAspectRatioOverlayView()
 
     private let dataOutputQueue = DispatchQueue(
@@ -56,7 +55,6 @@ final class PhotoCaptureViewController: UIViewController {
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
-        imageView.isHidden = true
         let sm = sessionManager
         sm.sessionQueue.async { sm.startSession() }
     }
@@ -76,17 +74,6 @@ final class PhotoCaptureViewController: UIViewController {
         // Aspect ratio overlay
         view.addSubview(aspectOverlay)
         aspectOverlay.snp.makeConstraints { $0.edges.equalToSuperview() }
-
-        // Captured image overlay
-        imageView.contentMode = .scaleAspectFit
-        imageView.backgroundColor = .black
-        imageView.isHidden = true
-        imageView.isUserInteractionEnabled = true
-        view.addSubview(imageView)
-        imageView.snp.makeConstraints { $0.edges.equalToSuperview() }
-
-        let dismissTap = UITapGestureRecognizer(target: self, action: #selector(dismissCapture))
-        imageView.addGestureRecognizer(dismissTap)
 
         // Filter selector (scrollable — 19 segments won't fit at fixed width)
         var filterNames = ["None"]
@@ -445,19 +432,7 @@ final class PhotoCaptureViewController: UIViewController {
     }
 
     private func showCapturedPhoto(data: Data) {
-        guard let image = UIImage(data: data) else { return }
-        imageView.image = image
-        imageView.isHidden = false
-        UIImageWriteToSavedPhotosAlbum(image, self, #selector(imageSaved(_:didFinishSavingWithError:contextInfo:)), nil)
-    }
-
-    @objc private func imageSaved(_ image: UIImage, didFinishSavingWithError error: Error?, contextInfo: UnsafeRawPointer?) {
-        let message = if let error { "Save failed: \(error.localizedDescription)" } else { "Saved to Photos" }
-        CaptureHelper.showToast(message, in: view)
-    }
-
-    @objc private func dismissCapture() {
-        imageView.isHidden = true
-        imageView.image = nil
+        let previewVC = PhotoPreviewViewController(photoData: data)
+        navigationController?.pushViewController(previewVC, animated: true)
     }
 }

@@ -1,5 +1,6 @@
 #if canImport(UIKit) && canImport(CoreMotion)
     import CoreMotion
+    import SnapKit
     import UIKit
 
     // MARK: - PRMLevelIndicatorView
@@ -38,7 +39,12 @@
         }
 
         /// The threshold in degrees within which the device is considered level.
+        /// Uses hysteresis: enters level state at this threshold, exits at `levelThreshold + 0.5`.
         public var levelThreshold: Double = 1.0
+
+        /// Smoothing factor for the low-pass filter (0.0–1.0).
+        /// Lower values = smoother but laggier; higher = more responsive but jittery.
+        public var smoothingFactor: Double = 0.15
 
         /// Whether the level indicator is actively tracking device motion.
         ///
@@ -67,6 +73,12 @@
         /// except for the final stop in deinit (which runs after all other references are gone).
         private nonisolated(unsafe) let motionManager = CMMotionManager()
         private let motionQueue = OperationQueue()
+        /// Tracks previous level state to avoid redundant color/accessibility updates.
+        private var wasLevel: Bool = false
+        /// Low-pass filtered roll value in radians.
+        private var filteredRollRadians: Double = 0
+        /// Hysteresis margin in degrees — must exceed `levelThreshold + hysteresis` to exit level state.
+        private let hysteresisMargin: Double = 0.5
 
         // MARK: - Initialization
 
@@ -94,6 +106,9 @@
             shapeLayer.strokeColor = lineColor.cgColor
             shapeLayer.lineWidth = lineWidth
             shapeLayer.lineCap = .round
+            // Disable implicit animations — updates arrive at 30fps from motion data,
+            // so Core Animation interpolation adds overhead with no visual benefit.
+            shapeLayer.actions = ["transform": NSNull(), "strokeColor": NSNull()]
             layer.addSublayer(shapeLayer)
 
             motionQueue.maxConcurrentOperationCount = 1
@@ -102,34 +117,76 @@
 
         // MARK: - Layout
 
+        override public func didMoveToSuperview() {
+            super.didMoveToSuperview()
+            guard superview != nil else { return }
+            snp.makeConstraints { make in
+                make.center.equalToSuperview()
+                make.width.equalToSuperview()
+                make.height.equalTo(snp.width)
+            }
+        }
+
         override public func layoutSubviews() {
             super.layoutSubviews()
-            shapeLayer.frame = bounds
+            // Use bounds + position instead of frame — setting frame on a
+            // transformed layer is undefined and shifts the visual center.
+            shapeLayer.bounds = bounds
+            shapeLayer.position = CGPoint(x: bounds.midX, y: bounds.midY)
             updateLinePath()
         }
 
         // MARK: - Motion Updates
 
-        private func startMotionUpdates() {
+        private nonisolated func startMotionUpdates() {
             #if targetEnvironment(simulator)
                 // CoreMotion plist lookup crashes on Simulator — no motion hardware available.
                 return
             #else
                 guard motionManager.isDeviceMotionAvailable else { return }
-                motionManager.deviceMotionUpdateInterval = 1.0 / 30.0
+                motionManager.deviceMotionUpdateInterval = 1.0 / 60.0
 
                 motionManager.startDeviceMotionUpdates(to: motionQueue) { [weak self] motion, _ in
-                    guard let self, let motion else { return }
+                    guard let motion else { return }
+                    // Use gravity vector instead of attitude.roll — Euler angles
+                    // suffer from gimbal lock near vertical, causing wild values.
+                    // atan2(gx, -gy) projects gravity onto the screen plane and
+                    // returns 0 when level, regardless of device pitch.
+                    let gx = motion.gravity.x
+                    let gy = motion.gravity.y
+                    let rawRollRadians = atan2(-gx, -gy)
 
-                    let rollRadians = motion.attitude.roll
-                    let rollDegrees = rollRadians * 180.0 / .pi
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
 
-                    DispatchQueue.main.async {
+                        // Low-pass filter (exponential moving average) to smooth jitter.
+                        let alpha = self.smoothingFactor
+                        self.filteredRollRadians = alpha * rawRollRadians + (1.0 - alpha) * self.filteredRollRadians
+
+                        let rollDegrees = self.filteredRollRadians * 180.0 / .pi
                         self.currentRollDegrees = rollDegrees
-                        self.isLevel = abs(rollDegrees) <= self.levelThreshold
-                        self.updateLineColor()
-                        self.applyRotation(radians: rollRadians)
-                        self.accessibilityValue = self.isLevel ? "Level" : String(format: "%.1f degrees", rollDegrees)
+
+                        // Hysteresis: harder to exit level state than to enter it.
+                        let absDegrees = abs(rollDegrees)
+                        let leveled = if self.isLevel {
+                            absDegrees <= self.levelThreshold + self.hysteresisMargin
+                        } else {
+                            absDegrees <= self.levelThreshold
+                        }
+                        self.isLevel = leveled
+
+                        // Snap-to-zero: show perfectly level when within threshold.
+                        let displayRadians = leveled ? 0 : self.filteredRollRadians
+                        self.applyRotation(radians: displayRadians)
+
+                        // Only update color and accessibility on state transitions.
+                        if leveled != self.wasLevel {
+                            self.wasLevel = leveled
+                            self.updateLineColor()
+                            self.accessibilityValue = leveled
+                                ? "Level"
+                                : String(format: "%.1f degrees", rollDegrees)
+                        }
                     }
                 }
             #endif
@@ -138,7 +195,9 @@
         private func stopMotionUpdates() {
             motionManager.stopDeviceMotionUpdates()
             currentRollDegrees = 0
+            filteredRollRadians = 0
             isLevel = false
+            wasLevel = false
             shapeLayer.transform = CATransform3DIdentity
             updateLineColor()
         }

@@ -45,10 +45,18 @@ public final class PRMVideoCaptureHelper: NSObject, @unchecked Sendable {
 
     /// Starts recording to a movie file output.
     ///
+    /// Call this on the session queue. Capture the video rotation angle on the main thread
+    /// before dispatching to the session queue (e.g., via ``currentVideoRotationAngle()``).
+    ///
     /// - Parameters:
     ///   - movieFileOutput: The configured `AVCaptureMovieFileOutput`.
     ///   - connection: The video connection to use. If `nil`, uses the output's first video connection.
-    public func startRecording(to movieFileOutput: AVCaptureMovieFileOutput, connection: AVCaptureConnection? = nil) {
+    ///   - videoRotationAngle: The rotation angle to apply. Defaults to portrait (90°).
+    public func startRecording(
+        to movieFileOutput: AVCaptureMovieFileOutput,
+        connection: AVCaptureConnection? = nil,
+        videoRotationAngle: CGFloat = PRMVideoRotationAngle.portrait,
+    ) {
         guard state == .idle else {
             PRMLogger.capture.warning("Cannot start recording: already in state \(String(describing: self.state))")
             return
@@ -57,10 +65,8 @@ public final class PRMVideoCaptureHelper: NSObject, @unchecked Sendable {
         let url = PRMFileHelper.temporaryFileURL(withExtension: "mov")
         outputURL = url
 
-        // Set video rotation angle if available
         if let connection = connection ?? movieFileOutput.connection(with: .video) {
-            let angle = currentVideoRotationAngle()
-            connection.prm_setVideoRotationAngle(angle)
+            connection.prm_setVideoRotationAngle(videoRotationAngle)
         }
 
         movieFileOutput.startRecording(to: url, recordingDelegate: self)
@@ -82,13 +88,15 @@ public final class PRMVideoCaptureHelper: NSObject, @unchecked Sendable {
     // MARK: - Orientation
 
     /// Returns the current video rotation angle based on device orientation.
-    private func currentVideoRotationAngle() -> CGFloat {
+    ///
+    /// Must be called on the main thread. Capture the result before dispatching
+    /// to the session queue for ``startRecording(to:connection:videoRotationAngle:)``.
+    @MainActor
+    public func currentVideoRotationAngle() -> CGFloat {
         #if canImport(UIKit)
-            return MainActor.assumeIsolated {
-                UIDevice.current.orientation.prm_videoRotationAngle ?? PRMVideoRotationAngle.portrait
-            }
+            UIDevice.current.orientation.prm_videoRotationAngle ?? PRMVideoRotationAngle.portrait
         #else
-            return PRMVideoRotationAngle.landscapeRight
+            PRMVideoRotationAngle.landscapeRight
         #endif
     }
 }

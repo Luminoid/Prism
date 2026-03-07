@@ -103,13 +103,24 @@ final class VideoCaptureViewController: UIViewController {
         }
 
         // Stabilization mode picker
+        let stabLabel = UILabel()
+        stabLabel.text = "Stabilization"
+        stabLabel.textColor = .white
+        stabLabel.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        stabLabel.textAlignment = .center
+        view.addSubview(stabLabel)
+        stabLabel.snp.makeConstraints {
+            $0.top.equalTo(timerLabel.snp.bottom).offset(8)
+            $0.leading.trailing.equalToSuperview().inset(16)
+        }
+
         let stabSegmented = UISegmentedControl(items: ["Off", "Standard", "Cinematic", "Auto"])
         stabSegmented.selectedSegmentIndex = 0
         stabSegmented.addTarget(self, action: #selector(stabilizationChanged(_:)), for: .valueChanged)
         stabSegmented.backgroundColor = UIColor.black.withAlphaComponent(0.5)
         view.addSubview(stabSegmented)
         stabSegmented.snp.makeConstraints {
-            $0.top.equalTo(timerLabel.snp.bottom).offset(8)
+            $0.top.equalTo(stabLabel.snp.bottom).offset(4)
             $0.leading.trailing.equalToSuperview().inset(16)
         }
 
@@ -281,12 +292,22 @@ final class VideoCaptureViewController: UIViewController {
             let tempURL = PRMFileHelper.temporaryFileURL(withExtension: "mov")
             filePathLabel.text = "Output: \(tempURL.lastPathComponent)"
 
-            videoCaptureHelper.startRecording(to: movieFileOutput)
+            // Capture orientation on main thread, then start recording on session queue
+            let angle = videoCaptureHelper.currentVideoRotationAngle()
+            let helper = videoCaptureHelper
+            let sm = sessionManager
+            sm.sessionQueue.async {
+                helper.startRecording(to: movieFileOutput, videoRotationAngle: angle)
+            }
             recordButton.fillColor = .white
             frameRateSlider.isEnabled = false
         } else {
             updateStateBadge(.finalizing)
-            videoCaptureHelper.stopRecording(to: movieFileOutput)
+            let helper = videoCaptureHelper
+            let sm = sessionManager
+            sm.sessionQueue.async {
+                helper.stopRecording(to: movieFileOutput)
+            }
             recordButton.fillColor = .systemRed
             frameRateSlider.isEnabled = true
         }
@@ -294,7 +315,11 @@ final class VideoCaptureViewController: UIViewController {
 
     private func stopRecordingIfNeeded() {
         guard let movieFileOutput, videoCaptureHelper.state == .recording else { return }
-        videoCaptureHelper.stopRecording(to: movieFileOutput)
+        let helper = videoCaptureHelper
+        let sm = sessionManager
+        sm.sessionQueue.async {
+            helper.stopRecording(to: movieFileOutput)
+        }
     }
 
     private func updateStateBadge(_ state: PRMVideoRecordingState) {

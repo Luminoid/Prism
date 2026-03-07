@@ -47,3 +47,5 @@ targets:
         NSMicrophoneUsageDescription: Microphone access is required for video recording demos.
         NSPhotoLibraryAddUsageDescription: Photo library access is required to save captured photos and videos.
         UIRequiresFullScreen: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait

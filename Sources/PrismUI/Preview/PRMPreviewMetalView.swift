@@ -174,10 +174,8 @@ public final class PRMPreviewMetalView: MTKView, @unchecked Sendable {
     /// Thread-safe: can be called from any queue (dispatches drawing to the main actor).
     /// Call this from the filter pipeline's `onFrame` callback.
     public nonisolated func requestDraw() {
-        DispatchQueue.main.async { [self] in
-            MainActor.assumeIsolated {
-                self.draw()
-            }
+        Task { @MainActor [self] in
+            self.draw()
         }
     }
 
