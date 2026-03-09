@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreImage
+import Photos
 import PrismCore
 import UIKit
 
@@ -47,7 +48,19 @@ enum CaptureHelper {
             if let captureFilter {
                 if let ciImage = CIImage(data: data),
                    let filtered = captureFilter.render(image: ciImage) {
-                    return PRMImageHelper.jpegData(from: filtered)
+                    // Preserve EXIF metadata from original photo in filtered output
+                    let context = CIContext()
+                    let colorSpace = filtered.colorSpace ?? CGColorSpaceCreateDeviceRGB()
+                    let properties = ciImage.properties
+                    return context.jpegRepresentation(
+                        of: filtered,
+                        colorSpace: colorSpace,
+                        options: [
+                            kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.9,
+                            CIImageRepresentationOption(rawValue: kCGImagePropertyExifDictionary as String): properties[kCGImagePropertyExifDictionary as String] as Any,
+                            CIImageRepresentationOption(rawValue: kCGImagePropertyTIFFDictionary as String): properties[kCGImagePropertyTIFFDictionary as String] as Any,
+                        ],
+                    )
                 }
             }
             return data
@@ -59,12 +72,23 @@ enum CaptureHelper {
             let data = completedProcessor.capturedPhotoData
             Task { @MainActor in
                 activeProcessor = nil
-                guard let data, let image = UIImage(data: data) else {
+                guard let data else {
                     completion("Capture failed")
                     return
                 }
-                UIImageWriteToSavedPhotosAlbum(image, nil, nil, nil)
-                completion("Saved to Photos")
+                PHPhotoLibrary.shared().performChanges {
+                    let options = PHAssetResourceCreationOptions()
+                    let request = PHAssetCreationRequest.forAsset()
+                    request.addResource(with: .photo, data: data, options: options)
+                } completionHandler: { success, error in
+                    DispatchQueue.main.async {
+                        if success {
+                            completion("Saved to Photos")
+                        } else {
+                            completion("Save failed: \(error?.localizedDescription ?? "unknown")")
+                        }
+                    }
+                }
             }
         }
 

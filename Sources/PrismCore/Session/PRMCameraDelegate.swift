@@ -22,6 +22,9 @@ public protocol PRMCameraDelegate: AnyObject, Sendable {
 
     /// Called when the white balance mode changes.
     func didUpdateWhiteBalance(mode: AVCaptureDevice.WhiteBalanceMode)
+
+    /// Called when the camera device switches (e.g., front to back).
+    func didSwitchCamera(to device: AVCaptureDevice)
 }
 
 /// Default implementations — all optional.
@@ -36,4 +39,5 @@ public extension PRMCameraDelegate {
     func didUpdateTorch(isOn: Bool, level: Float) {}
     func didUpdateExposure(bias: Float, mode: AVCaptureDevice.ExposureMode) {}
     func didUpdateWhiteBalance(mode: AVCaptureDevice.WhiteBalanceMode) {}
+    func didSwitchCamera(to device: AVCaptureDevice) {}
 }

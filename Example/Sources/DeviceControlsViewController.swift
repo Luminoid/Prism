@@ -341,12 +341,11 @@ final class DeviceControlsViewController: UIViewController {
 
         // Frame Rate
         let maxFPS = Float(PRMFrameRateHelper.maxSupportedFrameRate(for: device))
+        let currentFPS = PRMFrameRateHelper.currentFrameRate(for: device) ?? 30
         fpsSlider.minimumValue = 1
         fpsSlider.maximumValue = min(maxFPS, 240)
-        fpsSlider.value = 30
-        let slowMo = PRMFrameRateHelper.supportsSlowMotion(on: device)
-        let ranges = PRMFrameRateHelper.supportedFrameRateRanges(for: device)
-        fpsLabel.text = "30 fps | Max: \(Int(maxFPS)) | SlowMo: \(slowMo ? "Yes" : "No") | \(ranges.count) range(s)"
+        fpsSlider.value = Float(currentFPS)
+        updateFPSLabel(fps: currentFPS)
 
         // Stabilization
         updateStabilizationLabel()
@@ -515,11 +514,13 @@ final class DeviceControlsViewController: UIViewController {
             tint: tintSlider.value,
         )
         let sm = sessionManager
-        sm.sessionQueue.async {
+        sm.sessionQueue.async { [weak self] in
             guard let device = sm.videoDevice else { return }
             try? PRMWhiteBalanceHelper.lockWhiteBalance(temperatureAndTint: tempAndTint, on: device)
+            DispatchQueue.main.async {
+                self?.updateWBLabel()
+            }
         }
-        updateWBLabel()
     }
 
     private func updateWBLabel() {
@@ -572,7 +573,7 @@ final class DeviceControlsViewController: UIViewController {
     // MARK: - Actions — Frame Rate
 
     @objc private func fpsChanged() {
-        let fps = Float64(Int(fpsSlider.value))
+        let fps = Float64(fpsSlider.value).rounded()
         sessionManager.setFrameRate(fps)
         updateFPSLabel(fps: fps)
     }
@@ -582,9 +583,10 @@ final class DeviceControlsViewController: UIViewController {
         sm.sessionQueue.async {
             guard let device = sm.videoDevice else { return }
             try? PRMFrameRateHelper.resetToDefaultFrameRate(on: device)
+            let actualFPS = PRMFrameRateHelper.currentFrameRate(for: device) ?? 30
             DispatchQueue.main.async { [weak self] in
-                self?.fpsSlider.value = 30
-                self?.updateFPSLabel(fps: 30)
+                self?.fpsSlider.value = Float(actualFPS)
+                self?.updateFPSLabel(fps: actualFPS)
             }
         }
     }

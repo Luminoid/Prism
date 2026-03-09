@@ -10,7 +10,7 @@ import PrismCore
 ///
 /// Thread-safe: `pixelBuffer`, `rotation`, and `mirroring` can be set from any queue.
 public final class PRMPreviewMetalView: MTKView, @unchecked Sendable {
-    // MARK: - Rotation
+    // MARK: - Types
 
     /// Rotation applied to the preview texture.
     public enum Rotation: Int, Sendable {
@@ -20,7 +20,24 @@ public final class PRMPreviewMetalView: MTKView, @unchecked Sendable {
         case rotate270Degrees
     }
 
+    /// How the preview texture is scaled to fit the view.
+    public enum ContentFit: Sendable {
+        /// Scale to fill the view, cropping excess (default).
+        case fill
+        /// Scale to fit entirely within the view, letterboxing if needed.
+        case fit
+    }
+
     // MARK: - Public Properties
+
+    /// How the preview is scaled to fit the view. Defaults to `.fill`.
+    ///
+    /// Thread-safe: can be set from any queue.
+    public nonisolated(unsafe) var contentFit: ContentFit = .fill {
+        didSet {
+            syncQueue.sync { internalContentFit = contentFit }
+        }
+    }
 
     /// Whether the preview is horizontally mirrored (front camera).
     ///
@@ -61,6 +78,7 @@ public final class PRMPreviewMetalView: MTKView, @unchecked Sendable {
     private nonisolated(unsafe) var internalPixelBuffer: CVPixelBuffer?
     private nonisolated(unsafe) var internalMirroring = false
     private nonisolated(unsafe) var internalRotation: Rotation = .rotate0Degrees
+    private nonisolated(unsafe) var internalContentFit: ContentFit = .fill
 
     // Metal pipeline
     private var renderPipelineState: MTLRenderPipelineState?
@@ -76,6 +94,7 @@ public final class PRMPreviewMetalView: MTKView, @unchecked Sendable {
     // Last known state for recalculation
     private var lastTextureMirroring = false
     private var lastTextureRotation: Rotation = .rotate0Degrees
+    private var lastContentFit: ContentFit = .fill
     private var lastTextureWidth = 0
     private var lastTextureHeight = 0
     private var lastBounds = CGRect.zero
@@ -186,11 +205,13 @@ public final class PRMPreviewMetalView: MTKView, @unchecked Sendable {
         var currentPixelBuffer: CVPixelBuffer?
         var currentMirroring = false
         var currentRotation: Rotation = .rotate0Degrees
+        var currentContentFit: ContentFit = .fill
 
         syncQueue.sync {
             currentPixelBuffer = internalPixelBuffer
             currentMirroring = internalMirroring
             currentRotation = internalRotation
+            currentContentFit = internalContentFit
         }
 
         guard let pixelBuffer = currentPixelBuffer else { return }
@@ -226,18 +247,21 @@ public final class PRMPreviewMetalView: MTKView, @unchecked Sendable {
             || height != lastTextureHeight
             || bounds != lastBounds
             || currentMirroring != lastTextureMirroring
-            || currentRotation != lastTextureRotation {
+            || currentRotation != lastTextureRotation
+            || currentContentFit != lastContentFit {
             setupTransform(
                 width: width,
                 height: height,
                 mirroring: currentMirroring,
                 rotation: currentRotation,
+                contentFit: currentContentFit,
             )
             lastTextureWidth = width
             lastTextureHeight = height
             lastBounds = bounds
             lastTextureMirroring = currentMirroring
             lastTextureRotation = currentRotation
+            lastContentFit = currentContentFit
         }
 
         guard let vertexCoordBuffer, let textureCoordBuffer else { return }
@@ -261,7 +285,7 @@ public final class PRMPreviewMetalView: MTKView, @unchecked Sendable {
 
     // MARK: - Transform Setup
 
-    private func setupTransform(width: Int, height: Int, mirroring: Bool, rotation: Rotation) {
+    private func setupTransform(width: Int, height: Int, mirroring: Bool, rotation: Rotation, contentFit: ContentFit) {
         guard let metalDevice = device else { return }
 
         // Calculate aspect-fill scaling
@@ -287,13 +311,23 @@ public final class PRMPreviewMetalView: MTKView, @unchecked Sendable {
 
         guard textureWidth > 0, textureHeight > 0 else { return }
 
-        // Aspect fill
-        if textureWidth / textureHeight > drawableWidth / drawableHeight {
-            scaleX = textureWidth / textureHeight * drawableHeight / drawableWidth
-            scaleY = 1.0
-        } else {
-            scaleX = 1.0
-            scaleY = textureHeight / textureWidth * drawableWidth / drawableHeight
+        switch contentFit {
+        case .fill:
+            if textureWidth / textureHeight > drawableWidth / drawableHeight {
+                scaleX = textureWidth / textureHeight * drawableHeight / drawableWidth
+                scaleY = 1.0
+            } else {
+                scaleX = 1.0
+                scaleY = textureHeight / textureWidth * drawableWidth / drawableHeight
+            }
+        case .fit:
+            if textureWidth / textureHeight > drawableWidth / drawableHeight {
+                scaleX = 1.0
+                scaleY = drawableWidth / drawableHeight * textureHeight / textureWidth
+            } else {
+                scaleX = drawableHeight / drawableWidth * textureWidth / textureHeight
+                scaleY = 1.0
+            }
         }
 
         if mirroring {

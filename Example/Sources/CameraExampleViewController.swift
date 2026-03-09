@@ -206,9 +206,7 @@ final class CameraExampleViewController: UIViewController {
 
             // Show camera/lens info
             if let device = sm.videoDevice {
-                let lenses = PRMZoomHelper.lensInfos(for: device)
-                let lensDescriptions = lenses.map { "\($0.focalLength) mm (\(String(format: "%.1f", $0.displayZoomFactor))×)" }
-                let cameraInfo = "\(device.localizedName)\n\(lensDescriptions.joined(separator: ", "))"
+                let cameraInfo = Self.cameraInfoText(for: device)
                 DispatchQueue.main.async {
                     self?.cameraInfoLabel.text = cameraInfo
                 }
@@ -216,6 +214,7 @@ final class CameraExampleViewController: UIViewController {
 
             DispatchQueue.main.async {
                 preview.rotation = .rotate90Degrees
+                preview.contentFit = .fit
             }
         }
     }
@@ -369,6 +368,24 @@ final class CameraExampleViewController: UIViewController {
     }
 }
 
+// MARK: - Helpers
+
+extension CameraExampleViewController {
+    /// Builds a camera info string showing device name and lens details.
+    /// For multi-lens (virtual) devices, lists each lens with focal length and zoom.
+    /// For single-lens devices (e.g., front camera), shows the computed focal length.
+    nonisolated static func cameraInfoText(for device: AVCaptureDevice) -> String {
+        let lenses = PRMZoomHelper.lensInfos(for: device)
+        if lenses.isEmpty {
+            // Single-lens device — compute focal length from current zoom factor
+            let focalLength = Int(PRMZoomHelper.focalLength35mm(for: device).rounded())
+            return "\(device.localizedName)\n≈\(focalLength) mm"
+        }
+        let lensDescriptions = lenses.map { "\($0.focalLength) mm (\(String(format: "%.1f", $0.displayZoomFactor))×)" }
+        return "\(device.localizedName)\n\(lensDescriptions.joined(separator: ", "))"
+    }
+}
+
 // MARK: - PRMCameraDelegate
 
 extension CameraExampleViewController: PRMCameraDelegate {
@@ -397,6 +414,13 @@ extension CameraExampleViewController: PRMCameraDelegate {
     nonisolated func didUpdateWhiteBalance(mode: AVCaptureDevice.WhiteBalanceMode) {
         DispatchQueue.main.async { [weak self] in
             self?.statusLabel.text = "White Balance: \(mode.description)"
+        }
+    }
+
+    nonisolated func didSwitchCamera(to device: AVCaptureDevice) {
+        let cameraInfo = Self.cameraInfoText(for: device)
+        DispatchQueue.main.async { [weak self] in
+            self?.cameraInfoLabel.text = cameraInfo
         }
     }
 }

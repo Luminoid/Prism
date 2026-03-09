@@ -102,6 +102,16 @@ public enum PRMFrameRateHelper: Sendable {
 
     // MARK: - Queries
 
+    /// Returns the current effective frame rate derived from `activeVideoMinFrameDuration`.
+    ///
+    /// Returns `nil` if no custom frame rate is set (duration is invalid or zero).
+    public static func currentFrameRate(for device: AVCaptureDevice) -> Float64? {
+        let duration = device.activeVideoMinFrameDuration
+        let seconds = CMTimeGetSeconds(duration)
+        guard seconds > 0, seconds.isFinite else { return nil }
+        return 1.0 / seconds
+    }
+
     /// Returns all supported frame rate ranges for the device's active format.
     public static func supportedFrameRateRanges(
         for device: AVCaptureDevice,

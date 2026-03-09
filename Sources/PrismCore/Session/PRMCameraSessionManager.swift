@@ -242,6 +242,11 @@ public final class PRMCameraSessionManager: @unchecked Sendable {
             }
 
             session.commitConfiguration()
+
+            if videoDevice === newDevice {
+                cameraDelegate?.didSwitchCamera(to: newDevice)
+            }
+
             return true
         } catch {
             PRMLogger.session.error("Cannot switch camera: \(error.localizedDescription)")
@@ -304,8 +309,9 @@ public final class PRMCameraSessionManager: @unchecked Sendable {
     /// Safe to call from any thread — dispatches to `sessionQueue`.
     public func setZoom(factor: CGFloat) {
         sessionQueue.async { [weak self] in
-            guard let device = self?.videoDevice else { return }
+            guard let self, let device = self.videoDevice else { return }
             try? PRMZoomHelper.setZoomFactor(factor, on: device)
+            self.cameraDelegate?.didUpdateZoom(factor: device.videoZoomFactor)
         }
     }
 
@@ -314,8 +320,9 @@ public final class PRMCameraSessionManager: @unchecked Sendable {
     /// Safe to call from any thread — dispatches to `sessionQueue`.
     public func rampZoom(to factor: CGFloat, withRate rate: Float = 1.0) {
         sessionQueue.async { [weak self] in
-            guard let device = self?.videoDevice else { return }
+            guard let self, let device = self.videoDevice else { return }
             try? PRMZoomHelper.rampZoom(to: factor, withRate: rate, on: device)
+            self.cameraDelegate?.didUpdateZoom(factor: device.videoZoomFactor)
         }
     }
 
@@ -324,8 +331,12 @@ public final class PRMCameraSessionManager: @unchecked Sendable {
     /// Safe to call from any thread — dispatches to `sessionQueue`.
     public func setTorch(mode: PRMTorchHelper.TorchMode) {
         sessionQueue.async { [weak self] in
-            guard let device = self?.videoDevice else { return }
+            guard let self, let device = self.videoDevice else { return }
             try? PRMTorchHelper.setTorchMode(mode, on: device)
+            self.cameraDelegate?.didUpdateTorch(
+                isOn: device.isTorchActive,
+                level: device.torchLevel,
+            )
         }
     }
 
@@ -334,8 +345,12 @@ public final class PRMCameraSessionManager: @unchecked Sendable {
     /// Safe to call from any thread — dispatches to `sessionQueue`.
     public func setExposureBias(_ bias: Float) {
         sessionQueue.async { [weak self] in
-            guard let device = self?.videoDevice else { return }
+            guard let self, let device = self.videoDevice else { return }
             try? PRMExposureHelper.setExposureTargetBias(bias, on: device)
+            self.cameraDelegate?.didUpdateExposure(
+                bias: device.exposureTargetBias,
+                mode: device.exposureMode,
+            )
         }
     }
 
@@ -344,8 +359,9 @@ public final class PRMCameraSessionManager: @unchecked Sendable {
     /// Safe to call from any thread — dispatches to `sessionQueue`.
     public func setWhiteBalance(mode: AVCaptureDevice.WhiteBalanceMode) {
         sessionQueue.async { [weak self] in
-            guard let device = self?.videoDevice else { return }
+            guard let self, let device = self.videoDevice else { return }
             try? PRMWhiteBalanceHelper.setWhiteBalanceMode(mode, on: device)
+            self.cameraDelegate?.didUpdateWhiteBalance(mode: device.whiteBalanceMode)
         }
     }
 
