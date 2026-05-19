@@ -92,12 +92,23 @@ public final class PRMCameraSession {
             try attachMovieFileOutput()
         }
 
+        applyPreferredStabilization(configuration.preferredVideoStabilizationMode)
+
         #if !os(macOS)
             if configuration.enableMultitaskingCameraAccess,
                session.isMultitaskingCameraAccessSupported {
                 session.isMultitaskingCameraAccessEnabled = true
             }
         #endif
+    }
+
+    private func applyPreferredStabilization(_ mode: AVCaptureVideoStabilizationMode) {
+        if let connection = videoDataOutput?.connection(with: .video) {
+            connection.prm_setStabilization(mode)
+        }
+        if let connection = movieFileOutput?.connection(with: .video) {
+            connection.prm_setStabilization(mode)
+        }
     }
 
     // MARK: - Lifecycle
@@ -231,7 +242,16 @@ public final class PRMCameraSession {
         let output = AVCapturePhotoOutput()
         output.maxPhotoQualityPrioritization = configuration.maxPhotoQualityPrioritization
         #if !os(macOS)
-            output.isLivePhotoCaptureEnabled = output.isLivePhotoCaptureSupported
+            if configuration.enableLivePhoto, output.isLivePhotoCaptureSupported {
+                output.isLivePhotoCaptureEnabled = true
+            }
+            if configuration.enableDepthDataDelivery, output.isDepthDataDeliverySupported {
+                output.isDepthDataDeliveryEnabled = true
+            }
+            if configuration.enablePortraitEffectsMatteDelivery,
+               output.isPortraitEffectsMatteDeliverySupported {
+                output.isPortraitEffectsMatteDeliveryEnabled = true
+            }
             if configuration.enableResponsiveCapture, output.isResponsiveCaptureSupported {
                 output.isResponsiveCaptureEnabled = true
             }

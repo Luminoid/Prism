@@ -43,6 +43,22 @@ public struct PRMCameraConfiguration: Sendable {
     /// iOS 17+: shorten shutter lag by buffering frames.
     public var enableZeroShutterLag: Bool
 
+    /// Enable Live Photo capture on the photo output. When false, the output's
+    /// `isLivePhotoCaptureEnabled` is left at the system default (off) so that the
+    /// extra movie pipeline isn't allocated for apps that don't use it.
+    public var enableLivePhoto: Bool
+
+    /// Enable depth data delivery on the photo output. Required for portrait
+    /// effects matte requests at capture time.
+    public var enableDepthDataDelivery: Bool
+
+    /// Enable portrait effects matte delivery on the photo output.
+    public var enablePortraitEffectsMatteDelivery: Bool
+
+    /// Preferred video stabilization mode for the video-data output connection.
+    /// Applied lazily once the connection is available.
+    public var preferredVideoStabilizationMode: AVCaptureVideoStabilizationMode
+
     /// iPad-only (iOS 16+): allow camera capture while the app is multitasking.
     public var enableMultitaskingCameraAccess: Bool
 
@@ -59,6 +75,10 @@ public struct PRMCameraConfiguration: Sendable {
         enableResponsiveCapture: Bool = true,
         enableAutoDeferredPhotoDelivery: Bool = true,
         enableZeroShutterLag: Bool = true,
+        enableLivePhoto: Bool = false,
+        enableDepthDataDelivery: Bool = false,
+        enablePortraitEffectsMatteDelivery: Bool = false,
+        preferredVideoStabilizationMode: AVCaptureVideoStabilizationMode = .auto,
         enableMultitaskingCameraAccess: Bool = false
     ) {
         self.sessionPreset = sessionPreset
@@ -73,6 +93,10 @@ public struct PRMCameraConfiguration: Sendable {
         self.enableResponsiveCapture = enableResponsiveCapture
         self.enableAutoDeferredPhotoDelivery = enableAutoDeferredPhotoDelivery
         self.enableZeroShutterLag = enableZeroShutterLag
+        self.enableLivePhoto = enableLivePhoto
+        self.enableDepthDataDelivery = enableDepthDataDelivery
+        self.enablePortraitEffectsMatteDelivery = enablePortraitEffectsMatteDelivery
+        self.preferredVideoStabilizationMode = preferredVideoStabilizationMode
         self.enableMultitaskingCameraAccess = enableMultitaskingCameraAccess
     }
 

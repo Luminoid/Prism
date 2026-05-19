@@ -20,6 +20,9 @@ public struct PRMCameraState: Sendable, Equatable {
     /// Current focus mode.
     public var focusMode: AVCaptureDevice.FocusMode
 
+    /// Current lens position (0.0 = near focus, 1.0 = far focus).
+    public var lensPosition: Float
+
     /// Current exposure mode.
     public var exposureMode: AVCaptureDevice.ExposureMode
 
@@ -47,6 +50,12 @@ public struct PRMCameraState: Sendable, Equatable {
     /// Currently active frame rate, or `nil` if no custom rate is set.
     public var frameRate: Float64?
 
+    /// Whether the active format currently has video HDR enabled.
+    public var isVideoHDREnabled: Bool
+
+    /// Whether low-light boost is currently active.
+    public var isLowLightBoostActive: Bool
+
     /// Whether session is currently interrupted.
     public var isInterrupted: Bool
 
@@ -56,6 +65,7 @@ public struct PRMCameraState: Sendable, Equatable {
         torchMode: AVCaptureDevice.TorchMode = .off,
         torchLevel: Float = 0,
         focusMode: AVCaptureDevice.FocusMode = .continuousAutoFocus,
+        lensPosition: Float = 0,
         exposureMode: AVCaptureDevice.ExposureMode = .continuousAutoExposure,
         exposureBias: Float = 0,
         iso: Float = 0,
@@ -65,6 +75,8 @@ public struct PRMCameraState: Sendable, Equatable {
         whiteBalanceTint: Float = 0,
         activeStabilizationMode: AVCaptureVideoStabilizationMode = .off,
         frameRate: Float64? = nil,
+        isVideoHDREnabled: Bool = false,
+        isLowLightBoostActive: Bool = false,
         isInterrupted: Bool = false
     ) {
         self.isRunning = isRunning
@@ -72,6 +84,7 @@ public struct PRMCameraState: Sendable, Equatable {
         self.torchMode = torchMode
         self.torchLevel = torchLevel
         self.focusMode = focusMode
+        self.lensPosition = lensPosition
         self.exposureMode = exposureMode
         self.exposureBias = exposureBias
         self.iso = iso
@@ -81,6 +94,8 @@ public struct PRMCameraState: Sendable, Equatable {
         self.whiteBalanceTint = whiteBalanceTint
         self.activeStabilizationMode = activeStabilizationMode
         self.frameRate = frameRate
+        self.isVideoHDREnabled = isVideoHDREnabled
+        self.isLowLightBoostActive = isLowLightBoostActive
         self.isInterrupted = isInterrupted
     }
 }

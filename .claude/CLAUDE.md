@@ -23,7 +23,7 @@
 
 - **`PRM` prefix** for all public types, **`prm_`** for AVFoundation extension methods.
 - **No LumiKit dependency** — fully standalone package.
-- **Value-type filters** — `PRMFilter` is a `Sendable` protocol with no `AnyObject` requirement; all 17 built-in filters are structs.
+- **Value-type filters** — `PRMFilter` is a `Sendable` protocol with no `AnyObject` requirement; all 18 built-in filters are structs (17 generic + `PRMPortraitBokehFilter`).
 - **Composition over inheritance** — `PRMBasicFilterRenderer(context:description:filterFactory:)`, no per-filter subclasses.
 - **No `PHPhotoLibrary`** in the library — capture helpers deliver data/URLs and consuming apps save.
 - **One CIContext per pipeline** — `PRMRenderContext` wraps a shared Metal-backed `CIContext` with `.cacheIntermediates: false` (per WWDC '20).
@@ -37,19 +37,22 @@ Sources/PrismCore/
 ├── Camera/      PRMCameraActor, PRMCamera, PRMCameraSession, PRMCameraConfiguration,
 │                PRMCameraDevice, PRMCameraState, PRMRotationCoordinator,
 │                PRMPermissions, PRMSessionError
-├── Capture/     PRMPhotoCapture, PRMPhotoSettings, PRMPhoto,
-│                PRMVideoRecorder, PRMRecording, PRMDepthCapture
-├── Device/      AVCaptureDevice+Zoom/Torch/Exposure/WhiteBalance/FrameRate,
+├── Capture/     PRMPhotoCapture (still / Live Photo / Portrait / burst),
+│                PRMPhotoSettings, PRMPhoto, PRMLivePhoto, PRMPortraitPhoto,
+│                PRMNightModeCapture, PRMVideoRecorder, PRMRecording, PRMDepthCapture
+├── Device/      AVCaptureDevice+Zoom/Torch/Exposure/WhiteBalance/FrameRate/ISO/Lens/HDR,
 │                AVCaptureConnection+Stabilization, PRMLens
 ├── Filter/      PRMFilter, PRMFilterRenderer, PRMBasicFilterRenderer,
 │                PRMFilterChain, PRMFilterPipeline, PRMBufferPoolAllocator,
-│                PRMRenderContext, PRMVideoFrame, Filters/{Color,Blur,Stylize,Distortion}
+│                PRMRenderContext, PRMVideoFrame,
+│                Filters/{Color,Blur,Stylize,Distortion,PortraitBokeh}
 └── Utilities/   PRMLogger, PRMTempFile, PRMImage
 
 Sources/PrismUI/
 ├── Preview/     PRMPreviewView, Shaders/PassThrough.metal
 └── Components/  PRMShutterButton, PRMFocusIndicatorView, PRMGridView,
-                 PRMLevelIndicatorView, PRMAspectRatioMaskView, PRMCaptureEventHelper
+                 PRMLevelIndicatorView, PRMAspectRatioMaskView, PRMCaptureEventHelper,
+                 PRMSettingsDrawerView, PRMSettingsRow
 ```
 
 ## Build & Test
@@ -67,7 +70,7 @@ make check   # SwiftLint + SwiftFormat
 
 ## Test Structure
 
-- **35 test suites, 121 tests** — Swift Testing (`@Test`, `#expect`, `@Suite`)
+- **44 test suites, 138 tests** — Swift Testing (`@Test`, `#expect`, `@Suite`)
 - Tests mirror source structure exactly
 - The intensity-blend correctness fix is verified with golden pixel-comparison tests in `PRMFilterChainTests`
 - Device-touching paths (`AVCaptureDevice` extensions, `PRMPhotoCapture`/`PRMVideoRecorder`/`PRMDepthCapture` start/stop) can't run on simulator — `AVCaptureDevice.default(for:)` returns `nil`. Those modules are covered via **value-type tests** (enums, structs, presets), **API surface locks** (`KeyPath` lookups that fail to compile on signature drift), and **Sendable conformance checks** (`Task.detached` round-trips). Full hardware paths are exercised via the example app + manual test plan.
@@ -98,4 +101,4 @@ make check   # SwiftLint + SwiftFormat
 
 ---
 
-*Last updated 2026-05-18 — post-audit hardening (force-unwrap removal, `final` on `PRMLevelIndicatorView`, CMMotionManager injection, `PRMTempFile` logging, test backfill to 121 tests across 35 suites).*
+*Last updated 2026-05-18 — full settings surface (drawer + every supported AVFoundation API) and new capture modes (Live Photo, Portrait + depth, burst, night-mode composite). 138 tests across 44 suites.*

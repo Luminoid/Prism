@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (full settings surface + new capture modes)
+
+- **PrismCore/Capture**: `PRMLivePhoto` (paired still + movie sidecar), `PRMPortraitPhoto` (still + depth + portrait effects matte), `PRMNightModeCapture` (multi-frame averaging long-exposure), burst helper `PRMPhotoCapture.captureBurst(count:)`
+- **PrismCore/Filter**: `PRMPortraitBokehFilter` (matte or depth-driven `CIDepthBlurEffect`)
+- **PrismCore/Device**: `AVCaptureDevice+ISO.swift` (`prm_setISO`, `prm_setShutterSpeed`, `prm_isoRange`, `prm_shutterSpeedRange`), `AVCaptureDevice+Lens.swift` (`prm_setFocusMode`, `prm_setLensPosition`, `prm_setLensPositionAsync`), `AVCaptureDevice+HDR.swift` (`prm_setVideoHDR`, `prm_setLowLightBoost`, `prm_isLowLightBoostActive`)
+- **PrismCore/Camera**: `PRMCamera` gains `setLensPosition(_:)`, `setISO(_:)`, `setShutterSpeed(seconds:)`, `setVideoHDR(_:)`, `setLowLightBoost(_:)`; `PRMCameraConfiguration` gains `enableLivePhoto`, `enableDepthDataDelivery`, `enablePortraitEffectsMatteDelivery`, `preferredVideoStabilizationMode`; `PRMCameraState` gains `lensPosition`, `isVideoHDREnabled`, `isLowLightBoostActive`; `PRMPhotoSettings` gains `livePhoto`, `portraitEffectsMatte`, `constantColorEnabled` builder methods
+- **PrismUI/Components**: `PRMSettingsDrawerView` (slide-in right-edge drawer with sectioned scroll), `PRMSettingsRow` (collapsible row with SF Symbol header, value label, and arbitrary content view)
+- **Example Studio**: full settings drawer wires every supported API (EV/ISO/shutter sliders, WB Kelvin slider + preset chips, manual focus lens-position slider, HDR auto/on/off, low-light boost, stabilization mode, codec); mode strip extends to PHOTO/LIVE/PORTRAIT/PANO/VIDEO/SLO-MO/NIGHT; top bar gains timer (3s/10s/off), burst toggle, and settings (`slider.horizontal.3`) chip
+
+### Notes
+
+- Panorama mode is wired into the UI but currently shows a "stitching not yet implemented" toast — frame accumulation + Vision stitching is a follow-up
+- Live Photo capture requires `enableLivePhoto = true` on `PRMCameraConfiguration`; portrait depth requires `enableDepthDataDelivery` + `enablePortraitEffectsMatteDelivery`
+
 ### Breaking redesign — full API rewrite
 
 Every public type has been reshaped against current Apple guidance (iOS 17+ `RotationCoordinator`, iOS 17/18 photo APIs, Swift 6.2 strict concurrency, WWDC '20 Core Image best practices). No source-compatible upgrade path; consumers should adopt the new API.
@@ -62,7 +76,7 @@ Every public type has been reshaped against current Apple guidance (iOS 17+ `Rot
 
 ### Stats after redesign
 
-- 37 PrismCore source files + 7 PrismUI source files
-- 22 test files / 77 tests across 24 suites, all passing on iOS Simulator
+- 44 PrismCore source files + 9 PrismUI source files
+- 41 test files / 138 tests across 44 suites, all passing on iOS Simulator
 - Zero SwiftLint or SwiftFormat violations
 - 3 example screens (down from 8)

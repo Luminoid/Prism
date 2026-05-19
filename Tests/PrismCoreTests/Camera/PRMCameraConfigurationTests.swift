@@ -17,6 +17,10 @@ struct PRMCameraConfigurationTests {
         #expect(config.enableResponsiveCapture)
         #expect(config.enableAutoDeferredPhotoDelivery)
         #expect(config.enableZeroShutterLag)
+        #expect(!config.enableLivePhoto)
+        #expect(!config.enableDepthDataDelivery)
+        #expect(!config.enablePortraitEffectsMatteDelivery)
+        #expect(config.preferredVideoStabilizationMode == .auto)
         #expect(!config.enableMultitaskingCameraAccess)
     }
 
@@ -33,11 +37,19 @@ struct PRMCameraConfigurationTests {
             sessionPreset: .hd1920x1080,
             cameraPosition: .front,
             includesAudio: false,
-            enableZeroShutterLag: false
+            enableZeroShutterLag: false,
+            enableLivePhoto: true,
+            enableDepthDataDelivery: true,
+            enablePortraitEffectsMatteDelivery: true,
+            preferredVideoStabilizationMode: .cinematic
         )
         #expect(config.sessionPreset == .hd1920x1080)
         #expect(config.cameraPosition == .front)
         #expect(!config.includesAudio)
         #expect(!config.enableZeroShutterLag)
+        #expect(config.enableLivePhoto)
+        #expect(config.enableDepthDataDelivery)
+        #expect(config.enablePortraitEffectsMatteDelivery)
+        #expect(config.preferredVideoStabilizationMode == .cinematic)
     }
 }

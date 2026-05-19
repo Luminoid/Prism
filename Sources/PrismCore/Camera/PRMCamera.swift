@@ -173,7 +173,44 @@ public final class PRMCamera {
             if let connection = await self.session.videoDataOutput?.connection(with: .video) {
                 connection.prm_setStabilization(mode)
             }
+            if let connection = await self.session.movieFileOutput?.connection(with: .video) {
+                connection.prm_setStabilization(mode)
+            }
         }
+        await refreshState()
+    }
+
+    /// Locks focus at the given lens position (0 = near, 1 = far). Returns after the
+    /// physical lens move completes.
+    public func setLensPosition(_ position: Float) async {
+        await PRMCameraActor.shared.run { [session] in
+            guard let device = await session.videoDevice else { return }
+            try? await device.prm_setLensPosition(position)
+        }
+        await refreshState()
+    }
+
+    /// Sets manual ISO at the current shutter speed.
+    public func setISO(_ iso: Float) async {
+        await runOnDevice { try? $0.prm_setISO(iso) }
+        await refreshState()
+    }
+
+    /// Sets manual shutter speed (in seconds) at the current ISO.
+    public func setShutterSpeed(seconds: Double) async {
+        await runOnDevice { try? $0.prm_setShutterSpeed(seconds: seconds) }
+        await refreshState()
+    }
+
+    /// Enables, disables, or restores auto for video HDR. `nil` returns to auto.
+    public func setVideoHDR(_ enabled: Bool?) async {
+        await runOnDevice { try? $0.prm_setVideoHDR(enabled) }
+        await refreshState()
+    }
+
+    /// Enables or disables automatic low-light boost when the device supports it.
+    public func setLowLightBoost(_ enabled: Bool) async {
+        await runOnDevice { try? $0.prm_setLowLightBoost(enabled) }
         await refreshState()
     }
 
@@ -248,9 +285,12 @@ public final class PRMCamera {
             newState.torchMode = device.torchMode
             newState.torchLevel = device.torchLevel
             newState.focusMode = device.focusMode
+            newState.lensPosition = device.lensPosition
             newState.exposureMode = device.exposureMode
             newState.exposureBias = device.exposureTargetBias
             newState.iso = device.iso
+            newState.isVideoHDREnabled = device.activeFormat.isVideoHDRSupported && device.isVideoHDREnabled
+            newState.isLowLightBoostActive = device.prm_isLowLightBoostActive
             let durationSeconds = CMTimeGetSeconds(device.exposureDuration)
             newState.exposureDurationSeconds = (durationSeconds > 0 && durationSeconds.isFinite) ? durationSeconds : nil
             newState.whiteBalanceMode = device.whiteBalanceMode
