@@ -31,37 +31,91 @@ public final class PRMFilterPipeline: NSObject, @unchecked Sendable {
 
     /// The currently active renderer. Setting `nil` makes the pipeline pass through raw frames.
     public var activeRenderer: (any PRMFilterRenderer)? {
-        didSet {
-            if oldValue !== activeRenderer { oldValue?.reset() }
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return _activeRenderer
+        }
+        set {
+            stateLock.lock()
+            let old = _activeRenderer
+            _activeRenderer = newValue
+            stateLock.unlock()
+            if old !== newValue { old?.reset() }
         }
     }
 
     /// Enable/disable frame processing. Set to `false` during session reconfiguration.
-    public var isEnabled: Bool = false
+    public var isEnabled: Bool {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return _isEnabled
+        }
+        set {
+            stateLock.lock()
+            _isEnabled = newValue
+            stateLock.unlock()
+        }
+    }
 
     /// Callback delivery (legacy / sync consumers). Called on the data-output queue.
-    public var onFrame: ((PRMVideoFrame) -> Void)?
+    public var onFrame: ((PRMVideoFrame) -> Void)? {
+        get {
+            stateLock.lock()
+            defer { stateLock.unlock() }
+            return _onFrame
+        }
+        set {
+            stateLock.lock()
+            _onFrame = newValue
+            stateLock.unlock()
+        }
+    }
 
     /// Most recent frame's format description.
-    public private(set) var currentFormatDescription: CMFormatDescription?
+    public var currentFormatDescription: CMFormatDescription? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _currentFormatDescription
+    }
+
+    // MARK: - Private storage
+
+    private var _activeRenderer: (any PRMFilterRenderer)?
+    private var _isEnabled: Bool = false
+    private var _onFrame: ((PRMVideoFrame) -> Void)?
+    private var _currentFormatDescription: CMFormatDescription?
+    private let stateLock = NSLock()
 
     // MARK: - Streams
 
     private var streamContinuations: [UUID: AsyncStream<PRMVideoFrame>.Continuation] = [:]
-    private let streamLock = NSLock()
+
+    deinit {
+        // Don't leave consumers hanging on `for await frame in pipeline.frameStream()` if the
+        // pipeline is deallocated mid-iteration.
+        stateLock.lock()
+        let continuations = Array(streamContinuations.values)
+        streamContinuations.removeAll()
+        stateLock.unlock()
+        for continuation in continuations {
+            continuation.finish()
+        }
+    }
 
     /// Async stream of processed frames.
     public func frameStream() -> AsyncStream<PRMVideoFrame> {
         AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
             let id = UUID()
-            streamLock.lock()
+            stateLock.lock()
             streamContinuations[id] = continuation
-            streamLock.unlock()
+            stateLock.unlock()
             continuation.onTermination = { @Sendable [weak self] _ in
                 guard let self else { return }
-                streamLock.lock()
+                stateLock.lock()
                 streamContinuations.removeValue(forKey: id)
-                streamLock.unlock()
+                stateLock.unlock()
             }
         }
     }
@@ -75,15 +129,28 @@ extension PRMFilterPipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
         didOutput sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
-        guard isEnabled else { return }
+        // Snapshot all shared state under one lock so frame delivery sees a consistent view —
+        // and so a concurrent `activeRenderer = nil` can't reset() the renderer while we're
+        // mid-render here on the data-output queue.
+        stateLock.lock()
+        let enabled = _isEnabled
+        let renderer = _activeRenderer
+        let onFrameCallback = _onFrame
+        let continuations = Array(streamContinuations.values)
+        stateLock.unlock()
+
+        guard enabled else { return }
         guard let videoBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
               let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) else { return }
 
-        currentFormatDescription = formatDescription
+        stateLock.lock()
+        _currentFormatDescription = formatDescription
+        stateLock.unlock()
+
         let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
         var processedBuffer = videoBuffer
-        if let renderer = activeRenderer {
+        if let renderer {
             if !renderer.isPrepared {
                 renderer.prepare(with: formatDescription, outputRetainedBufferCountHint: 3)
             }
@@ -97,11 +164,7 @@ extension PRMFilterPipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
             timestamp: timestamp,
             formatDescription: formatDescription
         )
-        onFrame?(frame)
-
-        streamLock.lock()
-        let continuations = Array(streamContinuations.values)
-        streamLock.unlock()
+        onFrameCallback?(frame)
         for continuation in continuations {
             continuation.yield(frame)
         }

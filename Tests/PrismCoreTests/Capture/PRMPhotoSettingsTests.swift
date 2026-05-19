@@ -14,7 +14,6 @@ struct PRMPhotoSettingsTests {
         #expect(settings.depthDataDelivery == nil)
         #expect(!settings.livePhoto)
         #expect(settings.portraitEffectsMatte == nil)
-        #expect(settings.constantColorEnabled == nil)
     }
 
     @Test
@@ -26,14 +25,12 @@ struct PRMPhotoSettingsTests {
             .autoRedEyeReduction(true)
             .livePhoto(true)
             .portraitEffectsMatte(true)
-            .constantColorEnabled(true)
         #expect(settings.flashMode == .auto)
         #expect(settings.qualityPrioritization == .quality)
         #expect(settings.codec == .hevc)
         #expect(settings.autoRedEyeReduction == true)
         #expect(settings.livePhoto)
         #expect(settings.portraitEffectsMatte == true)
-        #expect(settings.constantColorEnabled == true)
     }
 
     @Test

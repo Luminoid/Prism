@@ -30,6 +30,12 @@ public struct PRMCameraConfiguration: Sendable {
     /// The pixel format for video data output. Defaults to 32BGRA (Metal + Core Image friendly).
     public var videoPixelFormat: OSType
 
+    /// Whether the video data output drops frames that arrive while the previous one is still
+    /// being processed. Default `true` is correct for preview/filter pipelines; set to `false`
+    /// for ML / scientific capture where frame-accurate streams matter more than realtime
+    /// throughput.
+    public var discardsLateVideoFrames: Bool
+
     /// Photo quality prioritization ceiling. Per-capture requests may select up to this level.
     /// (Replaces the deprecated `isAutoStillImageStabilizationEnabled` flag.)
     public var maxPhotoQualityPrioritization: AVCapturePhotoOutput.QualityPrioritization
@@ -59,7 +65,9 @@ public struct PRMCameraConfiguration: Sendable {
     /// Applied lazily once the connection is available.
     public var preferredVideoStabilizationMode: AVCaptureVideoStabilizationMode
 
-    /// iPad-only (iOS 16+): allow camera capture while the app is multitasking.
+    /// iPad-only (iOS 16+): allow camera capture while the app is multitasking. iPhone returns
+    /// `isMultitaskingCameraAccessSupported == false` at runtime; an info log is emitted when
+    /// this is true on an unsupported device.
     public var enableMultitaskingCameraAccess: Bool
 
     public init(
@@ -71,6 +79,7 @@ public struct PRMCameraConfiguration: Sendable {
         includesPhotoOutput: Bool = true,
         includesMovieFileOutput: Bool = false,
         videoPixelFormat: OSType = kCVPixelFormatType_32BGRA,
+        discardsLateVideoFrames: Bool = true,
         maxPhotoQualityPrioritization: AVCapturePhotoOutput.QualityPrioritization = .quality,
         enableResponsiveCapture: Bool = true,
         enableAutoDeferredPhotoDelivery: Bool = true,
@@ -89,6 +98,7 @@ public struct PRMCameraConfiguration: Sendable {
         self.includesPhotoOutput = includesPhotoOutput
         self.includesMovieFileOutput = includesMovieFileOutput
         self.videoPixelFormat = videoPixelFormat
+        self.discardsLateVideoFrames = discardsLateVideoFrames
         self.maxPhotoQualityPrioritization = maxPhotoQualityPrioritization
         self.enableResponsiveCapture = enableResponsiveCapture
         self.enableAutoDeferredPhotoDelivery = enableAutoDeferredPhotoDelivery

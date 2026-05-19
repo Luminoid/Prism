@@ -65,4 +65,14 @@ public struct PRMRenderContext: @unchecked Sendable {
             ]
         )
     }
+
+    /// Process-wide shared render context.
+    ///
+    /// Apple's guidance is one `CIContext` per pipeline. Most apps run a single camera pipeline
+    /// at a time, so a process-wide shared context is the friction-free correct path. Apps that
+    /// run multiple simultaneous pipelines (e.g. preview + capture re-encode + ML inference)
+    /// should allocate per-pipeline contexts via ``init(name:)``.
+    ///
+    /// `nil` only if Metal is unavailable (e.g. simulators on hosts without GPU).
+    public static let shared: Self? = Self(name: "PRMRenderContext.shared")
 }

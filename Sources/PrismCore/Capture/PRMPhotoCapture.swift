@@ -68,8 +68,8 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
                 lock.unlock()
                 output.capturePhoto(with: avSettings, delegate: self)
             }
-        } onCancel: {
-            self.markCancelled(avSettings.uniqueID)
+        } onCancel: { [weak self] in
+            self?.markCancelled(avSettings.uniqueID)
         }
     }
 
@@ -111,8 +111,8 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
                     lock.unlock()
                     output.capturePhoto(with: liveSettings, delegate: self)
                 }
-            } onCancel: {
-                self.markCancelled(liveSettings.uniqueID)
+            } onCancel: { [weak self] in
+                self?.markCancelled(liveSettings.uniqueID)
             }
         #endif
     }
@@ -146,12 +146,12 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
 
     // MARK: - Pending tracker
 
-    fileprivate enum PendingKind {
+    enum PendingKind {
         case single
         case live(movieURL: URL)
     }
 
-    fileprivate final class PendingCapture {
+    final class PendingCapture {
         let kind: PendingKind
         let filter: (any PRMFilter)?
         let context: PRMRenderContext?
@@ -190,6 +190,27 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         }
         lock.unlock()
     }
+
+    fileprivate func renderPhoto(
+        originalData: Data,
+        photo: AVCapturePhoto,
+        pending: PendingCapture
+    ) -> PRMPhoto {
+        let metadata = photo.metadata
+        let finalData: Data
+        if let filter = pending.filter, let context = pending.context, let sourceImage = CIImage(data: originalData) {
+            let filtered = filter.render(sourceImage)
+            let preservedProperties = sourceImage.properties.merging(metadata) { _, new in new }
+            finalData = PRMImage.jpegDataPreservingMetadata(
+                from: filtered,
+                originalProperties: preservedProperties,
+                context: context
+            ) ?? originalData
+        } else {
+            finalData = originalData
+        }
+        return PRMPhoto(data: finalData, underlyingPhoto: photo, metadata: metadata)
+    }
 }
 
 // MARK: - AVCapturePhotoCaptureDelegate
@@ -208,104 +229,55 @@ extension PRMPhotoCapture: AVCapturePhotoCaptureDelegate {
         error: Error?
     ) {
         let id = photo.resolvedSettings.uniqueID
-        // For single captures we resume here; for live we stash and wait for the movie.
-        lock.lock()
-        guard let pending = pendingCaptures[id] else {
-            lock.unlock()
-            return
-        }
 
-        if pending.cancelled {
-            pendingCaptures.removeValue(forKey: id)
-            lock.unlock()
-            switch pending.kind {
-            case .single:
-                pending.singleContinuation?.resume(throwing: PRMSessionError.cancelled)
-            case let .live(movieURL):
-                PRMTempFile.remove(movieURL)
-                pending.liveContinuation?.resume(throwing: PRMSessionError.cancelled)
-            }
-            return
-        }
-        if let error {
-            pendingCaptures.removeValue(forKey: id)
-            lock.unlock()
-            switch pending.kind {
-            case .single:
-                pending.singleContinuation?.resume(
-                    throwing: PRMSessionError.photoCaptureFailed(error.localizedDescription)
-                )
-            case let .live(movieURL):
-                PRMTempFile.remove(movieURL)
-                pending.liveContinuation?.resume(
-                    throwing: PRMSessionError.photoCaptureFailed(error.localizedDescription)
-                )
-            }
-            return
-        }
-        guard let originalData = photo.fileDataRepresentation() else {
-            pendingCaptures.removeValue(forKey: id)
-            lock.unlock()
-            switch pending.kind {
-            case .single:
-                pending.singleContinuation?.resume(
-                    throwing: PRMSessionError.photoCaptureFailed("No file data representation")
-                )
-            case let .live(movieURL):
-                PRMTempFile.remove(movieURL)
-                pending.liveContinuation?.resume(
-                    throwing: PRMSessionError.photoCaptureFailed("No file data representation")
-                )
-            }
-            return
-        }
+        // Compute the outcome (and dequeue if final) under the lock; *resume* continuations
+        // after unlock so we never hold the lock across user-visible work.
+        let outcome: PhotoOutcome = {
+            lock.lock()
+            defer { lock.unlock() }
+            guard let pending = pendingCaptures[id] else { return .ignore }
 
-        let metadata = photo.metadata
-        let finalData: Data
-        if let filter = pending.filter, let context = pending.context, let sourceImage = CIImage(data: originalData) {
-            let filtered = filter.render(sourceImage)
-            let preservedProperties = sourceImage.properties.merging(metadata) { _, new in new }
-            finalData = PRMImage.jpegDataPreservingMetadata(
-                from: filtered,
-                originalProperties: preservedProperties,
-                context: context
-            ) ?? originalData
-        } else {
-            finalData = originalData
-        }
-
-        let result = PRMPhoto(
-            data: finalData,
-            underlyingPhoto: photo,
-            metadata: metadata
-        )
-
-        switch pending.kind {
-        case .single:
-            pendingCaptures.removeValue(forKey: id)
-            lock.unlock()
-            pending.singleContinuation?.resume(returning: result)
-        case let .live(movieURL):
-            pending.capturedPhoto = result
-            // If the movie finished first, complete now.
-            if pending.liveMovieReady || pending.liveMovieError != nil {
+            if pending.cancelled {
                 pendingCaptures.removeValue(forKey: id)
-                let movieError = pending.liveMovieError
-                lock.unlock()
-                if let movieError {
-                    PRMTempFile.remove(movieURL)
-                    pending.liveContinuation?.resume(
-                        throwing: PRMSessionError.photoCaptureFailed(movieError.localizedDescription)
-                    )
-                } else {
-                    pending.liveContinuation?.resume(
-                        returning: PRMLivePhoto(photo: result, movieURL: movieURL)
-                    )
-                }
-            } else {
-                lock.unlock()
+                return .terminal(pending, .failure(PRMSessionError.cancelled))
             }
-        }
+            if let error {
+                pendingCaptures.removeValue(forKey: id)
+                return .terminal(pending, .failure(
+                    PRMSessionError.photoCaptureFailed(error.localizedDescription)
+                ))
+            }
+            guard let originalData = photo.fileDataRepresentation() else {
+                pendingCaptures.removeValue(forKey: id)
+                return .terminal(pending, .failure(
+                    PRMSessionError.photoCaptureFailed("No file data representation")
+                ))
+            }
+
+            let result = renderPhoto(originalData: originalData, photo: photo, pending: pending)
+
+            switch pending.kind {
+            case .single:
+                pendingCaptures.removeValue(forKey: id)
+                return .terminal(pending, .success(result))
+            case .live:
+                pending.capturedPhoto = result
+                // If the movie finished first, complete now.
+                if pending.liveMovieReady || pending.liveMovieError != nil {
+                    pendingCaptures.removeValue(forKey: id)
+                    if let movieError = pending.liveMovieError {
+                        return .terminal(pending, .failure(
+                            PRMSessionError.photoCaptureFailed(movieError.localizedDescription)
+                        ))
+                    } else {
+                        return .terminal(pending, .success(result))
+                    }
+                }
+                return .pendingLiveMovie
+            }
+        }()
+
+        outcome.resume()
     }
 
     #if !os(macOS)
@@ -318,31 +290,64 @@ extension PRMPhotoCapture: AVCapturePhotoCaptureDelegate {
             error: Error?
         ) {
             let id = resolvedSettings.uniqueID
-            lock.lock()
-            guard let pending = pendingCaptures[id], case let .live(movieURL) = pending.kind else {
-                lock.unlock()
-                return
-            }
-            pending.liveMovieReady = error == nil
-            pending.liveMovieError = error
-
-            // If the photo arrived first, complete now.
-            if let photo = pending.capturedPhoto {
-                pendingCaptures.removeValue(forKey: id)
-                lock.unlock()
-                if let error {
-                    PRMTempFile.remove(movieURL)
-                    pending.liveContinuation?.resume(
-                        throwing: PRMSessionError.photoCaptureFailed(error.localizedDescription)
-                    )
-                } else {
-                    pending.liveContinuation?.resume(
-                        returning: PRMLivePhoto(photo: photo, movieURL: movieURL)
-                    )
+            let outcome: PhotoOutcome = {
+                lock.lock()
+                defer { lock.unlock() }
+                guard let pending = pendingCaptures[id], case .live = pending.kind else {
+                    return .ignore
                 }
-            } else {
-                lock.unlock()
-            }
+                pending.liveMovieReady = error == nil
+                pending.liveMovieError = error
+
+                // If the photo arrived first, complete now; otherwise wait.
+                guard let photo = pending.capturedPhoto else { return .pendingPhoto }
+                pendingCaptures.removeValue(forKey: id)
+                if let error {
+                    return .terminal(pending, .failure(
+                        PRMSessionError.photoCaptureFailed(error.localizedDescription)
+                    ))
+                }
+                return .terminal(pending, .success(photo))
+            }()
+            outcome.resume()
         }
     #endif
+}
+
+// MARK: - PhotoOutcome
+
+/// Resolution of a delegate callback against the pending-capture state machine. Computed under
+/// the lock; resumed (via `resume()`) after the lock is released.
+private enum PhotoOutcome {
+    /// No pending capture for this ID (e.g. a duplicate / stale callback) — drop on the floor.
+    case ignore
+    /// Waiting for the Live Photo movie sidecar to finish.
+    case pendingLiveMovie
+    /// Waiting for the Live Photo still to finish.
+    case pendingPhoto
+    /// Both halves have arrived (or one half failed) — resume the continuation.
+    case terminal(PRMPhotoCapture.PendingCapture, Result<PRMPhoto, Error>)
+
+    func resume() {
+        guard case let .terminal(pending, result) = self else { return }
+        switch pending.kind {
+        case .single:
+            switch result {
+            case let .success(photo):
+                pending.singleContinuation?.resume(returning: photo)
+            case let .failure(error):
+                pending.singleContinuation?.resume(throwing: error)
+            }
+        case let .live(movieURL):
+            switch result {
+            case let .success(photo):
+                pending.liveContinuation?.resume(
+                    returning: PRMLivePhoto(photo: photo, movieURL: movieURL)
+                )
+            case let .failure(error):
+                PRMTempFile.remove(movieURL)
+                pending.liveContinuation?.resume(throwing: error)
+            }
+        }
+    }
 }

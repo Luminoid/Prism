@@ -27,6 +27,16 @@
             didSet { applyExpansion(animated: true) }
         }
 
+        /// Title font. Override to match the host app's type ramp.
+        public var titleFont: UIFont = .systemFont(ofSize: 13, weight: .semibold) {
+            didSet { titleLabel.font = titleFont }
+        }
+
+        /// Value-label font. Defaults to a monospaced digit font for tabular numerics.
+        public var valueFont: UIFont = .monospacedSystemFont(ofSize: 11, weight: .medium) {
+            didSet { valueLabel.font = valueFont }
+        }
+
         public var onToggle: ((Bool) -> Void)?
 
         // MARK: - Subviews
@@ -90,7 +100,7 @@
 
             titleLabel.text = title
             titleLabel.textColor = .white
-            titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+            titleLabel.font = titleFont
             headerButton.addSubview(titleLabel)
             titleLabel.snp.makeConstraints {
                 $0.leading.equalTo(symbolView.snp.trailing).offset(10)
@@ -99,7 +109,7 @@
 
             valueLabel.text = valueText
             valueLabel.textColor = UIColor.white.withAlphaComponent(0.7)
-            valueLabel.font = .monospacedSystemFont(ofSize: 11, weight: .medium)
+            valueLabel.font = valueFont
             valueLabel.textAlignment = .right
             headerButton.addSubview(valueLabel)
 

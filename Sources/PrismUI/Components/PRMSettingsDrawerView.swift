@@ -19,6 +19,16 @@
         /// Translucent backdrop dimming the camera preview when open. Tap to dismiss.
         public var dimsBackdrop: Bool = true
 
+        /// Title font. Override to match the host app's type ramp.
+        public var titleFont: UIFont = .systemFont(ofSize: 16, weight: .bold) {
+            didSet { titleLabel.font = titleFont }
+        }
+
+        /// Section-header font.
+        public var sectionHeaderFont: UIFont = .systemFont(ofSize: 10, weight: .heavy) {
+            didSet { restyleSectionHeaders() }
+        }
+
         public var onClose: (() -> Void)?
 
         // MARK: - Subviews
@@ -71,20 +81,29 @@
 
             titleLabel.text = title
             titleLabel.textColor = .white
-            titleLabel.font = .systemFont(ofSize: 16, weight: .bold)
+            titleLabel.font = titleFont
             containerView.addSubview(titleLabel)
             titleLabel.snp.makeConstraints {
                 $0.top.equalTo(containerView.safeAreaLayoutGuide).offset(16)
                 $0.leading.equalToSuperview().offset(16)
             }
 
-            closeButton.setImage(UIImage(systemName: "xmark.circle.fill"), for: .normal)
-            closeButton.tintColor = UIColor.white.withAlphaComponent(0.7)
+            // 44×44 hit target per HIG; the 28pt glyph stays visually centered via
+            // UIButton.Configuration's content insets (the old `contentEdgeInsets` API is
+            // deprecated when any UIButton in the process opts into UIButton.Configuration).
+            var config = UIButton.Configuration.plain()
+            config.image = UIImage(systemName: "xmark.circle.fill")
+            config.baseForegroundColor = UIColor.white.withAlphaComponent(0.7)
+            let inset: CGFloat = (44 - 28) / 2
+            config.contentInsets = NSDirectionalEdgeInsets(
+                top: inset, leading: inset, bottom: inset, trailing: inset
+            )
+            closeButton.configuration = config
             containerView.addSubview(closeButton)
             closeButton.snp.makeConstraints {
                 $0.centerY.equalTo(titleLabel)
-                $0.trailing.equalToSuperview().offset(-12)
-                $0.size.equalTo(CGSize(width: 28, height: 28))
+                $0.trailing.equalToSuperview().offset(-4)
+                $0.size.equalTo(CGSize(width: 44, height: 44))
             }
             closeButton.addAction(UIAction { [weak self] _ in
                 self?.setOpen(false, animated: true)
@@ -144,7 +163,7 @@
 
         /// Adds a section header label followed by the given rows.
         public func appendSection(title: String, rows: [PRMSettingsRow]) {
-            let header = SectionHeader(title: title)
+            let header = SectionHeader(title: title, font: sectionHeaderFont)
             stackView.addArrangedSubview(header)
             for row in rows {
                 stackView.addArrangedSubview(row)
@@ -158,9 +177,17 @@
 
         /// Removes every section and row.
         public func clear() {
-            for view in stackView.arrangedSubviews {
-                stackView.removeArrangedSubview(view)
+            // Iterate a snapshot, not the live array — `removeFromSuperview()` mutates
+            // `arrangedSubviews` automatically (UIStackView observes view removal).
+            for view in Array(stackView.arrangedSubviews) {
                 view.removeFromSuperview()
+            }
+        }
+
+        private func restyleSectionHeaders() {
+            for view in stackView.arrangedSubviews {
+                guard let header = view as? SectionHeader else { continue }
+                header.applyFont(sectionHeaderFont)
             }
         }
     }
@@ -168,12 +195,13 @@
     // MARK: - SectionHeader
 
     private final class SectionHeader: UIView {
-        init(title: String) {
+        private let label = UILabel()
+
+        init(title: String, font: UIFont) {
             super.init(frame: .zero)
-            let label = UILabel()
             label.text = title.uppercased()
             label.textColor = UIColor.white.withAlphaComponent(0.55)
-            label.font = .systemFont(ofSize: 10, weight: .heavy)
+            label.font = font
             label.letterSpacing = 1.2
             addSubview(label)
             label.snp.makeConstraints {
@@ -186,7 +214,11 @@
 
         @available(*, unavailable)
         required init?(coder _: NSCoder) {
-            fatalError("Use init(title:)")
+            fatalError("Use init(title:font:)")
+        }
+
+        func applyFont(_ font: UIFont) {
+            label.font = font
         }
     }
 

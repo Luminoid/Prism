@@ -7,7 +7,10 @@ import CoreVideo
 /// for downstream consumers (preview view, video recorder, ML pipelines).
 ///
 /// Marked `@unchecked Sendable` because `CVPixelBuffer` and `CMFormatDescription` are Core
-/// Foundation reference types that AVFoundation guarantees are thread-safe to read.
+/// Foundation reference types that are safe to *pass across* threads. `CVPixelBuffer` is
+/// mutable — its IOSurface can be locked for write — so receivers must not lock for writing
+/// while the producer is still rendering. The pipeline only writes the buffer from the
+/// data-output queue and surfaces it read-only to consumers.
 public struct PRMVideoFrame: @unchecked Sendable {
     /// The (possibly filtered) pixel buffer.
     public let pixelBuffer: CVPixelBuffer

@@ -406,17 +406,3 @@ public final class PRMCamera {
         #endif
     }
 }
-
-// MARK: - PRMCameraActor helper
-
-public extension PRMCameraActor {
-    /// Runs an isolated closure on the actor and returns its result.
-    static func run<T: Sendable>(_ body: @Sendable () async -> T) async -> T {
-        await body()
-    }
-
-    /// Instance-method shim so callers can write `await PRMCameraActor.shared.run { ... }`.
-    func run<T: Sendable>(_ body: @Sendable () async -> T) async -> T {
-        await body()
-    }
-}

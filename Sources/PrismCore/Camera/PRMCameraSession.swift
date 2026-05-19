@@ -81,7 +81,10 @@ public final class PRMCameraSession {
         }
 
         if configuration.includesVideoDataOutput {
-            try attachVideoDataOutput(pixelFormat: configuration.videoPixelFormat)
+            try attachVideoDataOutput(
+                pixelFormat: configuration.videoPixelFormat,
+                discardsLateVideoFrames: configuration.discardsLateVideoFrames
+            )
         }
 
         if configuration.includesPhotoOutput {
@@ -95,9 +98,14 @@ public final class PRMCameraSession {
         applyPreferredStabilization(configuration.preferredVideoStabilizationMode)
 
         #if !os(macOS)
-            if configuration.enableMultitaskingCameraAccess,
-               session.isMultitaskingCameraAccessSupported {
-                session.isMultitaskingCameraAccessEnabled = true
+            if configuration.enableMultitaskingCameraAccess {
+                if session.isMultitaskingCameraAccessSupported {
+                    session.isMultitaskingCameraAccessEnabled = true
+                } else {
+                    PRMLogger.session.info(
+                        "Multitasking camera access requested but not supported on this device (iPad only)"
+                    )
+                }
             }
         #endif
     }
@@ -220,17 +228,31 @@ public final class PRMCameraSession {
             mediaType: .audio,
             position: .unspecified
         )
-        guard let audio = discovery.devices.first else { return }
-        guard let input = try? AVCaptureDeviceInput(device: audio),
-              session.canAddInput(input) else { return }
+        guard let audio = discovery.devices.first else {
+            PRMLogger.session.warning("No microphone available; audio input skipped")
+            return
+        }
+        let input: AVCaptureDeviceInput
+        do {
+            input = try AVCaptureDeviceInput(device: audio)
+        } catch {
+            PRMLogger.session.warning(
+                "Failed to create audio input: \(error.localizedDescription, privacy: .public)"
+            )
+            return
+        }
+        guard session.canAddInput(input) else {
+            PRMLogger.session.warning("Cannot add audio input to session; skipping")
+            return
+        }
         session.addInput(input)
         audioDeviceInput = input
     }
 
-    private func attachVideoDataOutput(pixelFormat: OSType) throws {
+    private func attachVideoDataOutput(pixelFormat: OSType, discardsLateVideoFrames: Bool) throws {
         let output = AVCaptureVideoDataOutput()
         output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: pixelFormat]
-        output.alwaysDiscardsLateVideoFrames = true
+        output.alwaysDiscardsLateVideoFrames = discardsLateVideoFrames
         guard session.canAddOutput(output) else {
             throw PRMSessionError.cannotAttachToSession("Cannot add video data output")
         }
@@ -242,32 +264,56 @@ public final class PRMCameraSession {
         let output = AVCapturePhotoOutput()
         output.maxPhotoQualityPrioritization = configuration.maxPhotoQualityPrioritization
         #if !os(macOS)
-            if configuration.enableLivePhoto, output.isLivePhotoCaptureSupported {
-                output.isLivePhotoCaptureEnabled = true
-            }
-            if configuration.enableDepthDataDelivery, output.isDepthDataDeliverySupported {
-                output.isDepthDataDeliveryEnabled = true
-            }
-            if configuration.enablePortraitEffectsMatteDelivery,
-               output.isPortraitEffectsMatteDeliverySupported {
-                output.isPortraitEffectsMatteDeliveryEnabled = true
-            }
-            if configuration.enableResponsiveCapture, output.isResponsiveCaptureSupported {
-                output.isResponsiveCaptureEnabled = true
-            }
-            if configuration.enableAutoDeferredPhotoDelivery,
-               output.isAutoDeferredPhotoDeliverySupported {
-                output.isAutoDeferredPhotoDeliveryEnabled = true
-            }
-            if configuration.enableZeroShutterLag, output.isZeroShutterLagSupported {
-                output.isZeroShutterLagEnabled = true
-            }
+            applyPhotoOutputFeature(
+                "Live Photo",
+                requested: configuration.enableLivePhoto,
+                supported: output.isLivePhotoCaptureSupported
+            ) { output.isLivePhotoCaptureEnabled = true }
+            applyPhotoOutputFeature(
+                "Depth data delivery",
+                requested: configuration.enableDepthDataDelivery,
+                supported: output.isDepthDataDeliverySupported
+            ) { output.isDepthDataDeliveryEnabled = true }
+            applyPhotoOutputFeature(
+                "Portrait effects matte",
+                requested: configuration.enablePortraitEffectsMatteDelivery,
+                supported: output.isPortraitEffectsMatteDeliverySupported
+            ) { output.isPortraitEffectsMatteDeliveryEnabled = true }
+            applyPhotoOutputFeature(
+                "Responsive capture",
+                requested: configuration.enableResponsiveCapture,
+                supported: output.isResponsiveCaptureSupported
+            ) { output.isResponsiveCaptureEnabled = true }
+            applyPhotoOutputFeature(
+                "Auto-deferred photo delivery",
+                requested: configuration.enableAutoDeferredPhotoDelivery,
+                supported: output.isAutoDeferredPhotoDeliverySupported
+            ) { output.isAutoDeferredPhotoDeliveryEnabled = true }
+            applyPhotoOutputFeature(
+                "Zero shutter lag",
+                requested: configuration.enableZeroShutterLag,
+                supported: output.isZeroShutterLagSupported
+            ) { output.isZeroShutterLagEnabled = true }
         #endif
         guard session.canAddOutput(output) else {
             throw PRMSessionError.cannotAttachToSession("Cannot add photo output")
         }
         session.addOutput(output)
         photoOutput = output
+    }
+
+    private func applyPhotoOutputFeature(
+        _ name: String,
+        requested: Bool,
+        supported: Bool,
+        apply: () -> Void
+    ) {
+        guard requested else { return }
+        guard supported else {
+            PRMLogger.session.info("\(name, privacy: .public) requested but not supported on this device")
+            return
+        }
+        apply()
     }
 
     private func attachMovieFileOutput() throws {

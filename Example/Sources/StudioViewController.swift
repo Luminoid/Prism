@@ -113,6 +113,19 @@ final class StudioViewController: UIViewController {
 
     private var lastDevice: PRMCameraDevice?
 
+    /// Drives `PRMCamera.rampZoom` / `.cancelZoomRamp` — smooth 1.0×→2.0× ramp at rate 1.0.
+    fileprivate var isZoomRamping = false
+
+    private var rotationStreamTask: Task<Void, Never>?
+
+    // Error + interruption observers (toasts surfaced via showToast).
+    private var errorStreamTask: Task<Void, Never>?
+    private var interruptionStreamTask: Task<Void, Never>?
+    private var stateStreamTask: Task<Void, Never>?
+
+    /// Hardware shutter (Camera Control button on iPhone 16+, volume buttons elsewhere).
+    private let captureEventHelper = PRMCaptureEventHelper()
+
     // MARK: - Lifecycle
 
     override func viewDidLoad() {
@@ -124,13 +137,28 @@ final class StudioViewController: UIViewController {
 
         setupLayout()
         wireGestures()
+        previewView.addInteraction(captureEventHelper.makeInteraction())
+        captureEventHelper.onPrimaryAction = { [weak self] in self?.handleShutterTap() }
+        captureEventHelper.onSecondaryAction = { [weak self] in self?.flipCameraSync() }
         Task { await bootCamera() }
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        rotationStreamTask?.cancel()
+        errorStreamTask?.cancel()
+        interruptionStreamTask?.cancel()
+        stateStreamTask?.cancel()
+        rotationStreamTask = nil
+        errorStreamTask = nil
+        interruptionStreamTask = nil
+        stateStreamTask = nil
         Task { await camera.stop() }
         navigationController?.setNavigationBarHidden(false, animated: animated)
+    }
+
+    private func flipCameraSync() {
+        Task { await flipCamera() }
     }
 
     override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
@@ -331,7 +359,8 @@ final class StudioViewController: UIViewController {
         populateModeStrip()
         populateDrawer()
 
-        Task { [weak self] in
+        // PRMCamera state stream — drives the telemetry strip.
+        stateStreamTask = Task { [weak self] in
             guard let self else { return }
             for await state in camera.stateStream() {
                 guard !Task.isCancelled else { break }
@@ -339,8 +368,44 @@ final class StudioViewController: UIViewController {
             }
         }
 
+        // PRMCamera error stream — surface AVFoundation runtime errors as a toast.
+        errorStreamTask = Task { [weak self] in
+            guard let self else { return }
+            for await error in camera.errorStream() {
+                guard !Task.isCancelled else { break }
+                showToast("Runtime error: \(error.localizedDescription)")
+            }
+        }
+
+        // PRMCamera interruption stream — phone calls, Control Center pip, etc.
+        interruptionStreamTask = Task { [weak self] in
+            guard let self else { return }
+            for await interrupted in camera.interruptionStream() {
+                guard !Task.isCancelled else { break }
+                showToast(interrupted ? "Session interrupted" : "Session resumed")
+            }
+        }
+
+        // PRMRotationCoordinator — replaces the hard-coded `.rotate90` so the preview
+        // stays gravity-aligned across device orientations.
+        if let device = await camera.session.videoDevice {
+            let coordinator = PRMRotationCoordinator(device: device, previewLayer: nil)
+            rotationCoordinator = coordinator
+            rotationStreamTask = Task { [weak self] in
+                for await angle in coordinator.previewRotationAngles() {
+                    guard !Task.isCancelled else { break }
+                    await MainActor.run {
+                        self?.previewView.rotation = PRMPreviewView.Rotation(angle: angle)
+                    }
+                }
+            }
+        }
+
         await camera.start()
     }
+
+    /// Holds the rotation coordinator so it can be torn down on disappear.
+    private var rotationCoordinator: PRMRotationCoordinator?
 
     // MARK: - Lens strip
 
@@ -423,16 +488,41 @@ final class StudioViewController: UIViewController {
         }
     }
 
+    // Photo-settings knobs surfaced in the drawer — feed every PRMPhotoSettings build via makePhotoSettings().
+    private var photoCodec: AVVideoCodecType = .hevc
+    private var capMaxDimensions: Bool = false
+    private var autoRedEyeReductionEnabled: Bool = false
+
+    /// Builds a `PRMPhotoSettings` honoring the drawer knobs so PRMPhotoSettings.codec /
+    /// .maxDimensions / .autoRedEyeReduction actually take effect.
+    private func makePhotoSettings(
+        flash: AVCaptureDevice.FlashMode,
+        quality: AVCapturePhotoOutput.QualityPrioritization
+    ) -> PRMPhotoSettings {
+        var settings = PRMPhotoSettings()
+            .flashMode(flash)
+            .qualityPrioritization(quality)
+            .codec(photoCodec)
+            .autoRedEyeReduction(autoRedEyeReductionEnabled)
+        if capMaxDimensions, let output = photoCapture?.output {
+            settings = settings.maxDimensions(output.maxPhotoDimensions)
+        }
+        return settings
+    }
+
     private func capturePhoto() {
         guard let photoCapture else { return }
-        let settings = PRMPhotoSettings()
-            .flashMode(torchOn ? .on : .auto)
-            .qualityPrioritization(.quality)
+        let settings = makePhotoSettings(flash: torchOn ? .on : .auto, quality: .quality)
 
         flashOverlay()
         Task {
             do {
-                let photo = try await photoCapture.capturePhoto(settings: settings)
+                let photo = try await photoCapture.capturePhoto(
+                    settings: settings,
+                    willCapture: { [weak self] in
+                        Task { @MainActor [weak self] in self?.shutterFlashTick() }
+                    }
+                )
                 await saveToPhotoLibrary(data: photo.data)
             } catch {
                 showToast("Capture failed: \(error.localizedDescription)")
@@ -440,11 +530,15 @@ final class StudioViewController: UIViewController {
         }
     }
 
+    /// Small UI tick driven by `PRMPhotoCapture.capturePhoto(willCapture:)` — fires on
+    /// shutter open, before the photo finishes encoding.
+    private func shutterFlashTick() {
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
+
     private func captureBurst() {
         guard let photoCapture else { return }
-        let settings = PRMPhotoSettings()
-            .flashMode(torchOn ? .on : .auto)
-            .qualityPrioritization(.speed)
+        let settings = makePhotoSettings(flash: torchOn ? .on : .auto, quality: .speed)
         flashOverlay()
         Task {
             do {
@@ -461,7 +555,7 @@ final class StudioViewController: UIViewController {
 
     private func captureLivePhoto() {
         guard let photoCapture else { return }
-        let settings = PRMPhotoSettings().flashMode(.off).qualityPrioritization(.quality)
+        let settings = makePhotoSettings(flash: .off, quality: .quality)
         flashOverlay()
         Task {
             do {
@@ -475,7 +569,7 @@ final class StudioViewController: UIViewController {
 
     private func capturePortraitPhoto() {
         guard let photoCapture else { return }
-        let settings = PRMPhotoSettings().flashMode(.off).qualityPrioritization(.quality)
+        let settings = makePhotoSettings(flash: .off, quality: .quality)
         flashOverlay()
         Task {
             do {
@@ -799,14 +893,21 @@ final class StudioViewController: UIViewController {
         drawer.clear()
         drawer.appendSection(title: "Exposure", rows: [
             makeEVRow(device: device),
+            makeExposureModeRow(),
             makeISORow(device: device),
             makeShutterRow(device: device),
+            makeCustomExposurePresetRow(device: device),
         ])
         drawer.appendSection(title: "White Balance", rows: [
+            makeWhiteBalanceModeRow(),
             makeWhiteBalanceRow(),
         ])
         drawer.appendSection(title: "Focus", rows: [
+            makeFocusModeRow(),
             makeFocusRow(),
+        ])
+        drawer.appendSection(title: "Zoom", rows: [
+            makeZoomRampRow(device: device),
         ])
         drawer.appendSection(title: "Capture", rows: [
             makeHDRRow(),
@@ -815,7 +916,166 @@ final class StudioViewController: UIViewController {
         ])
         drawer.appendSection(title: "Format", rows: [
             makeCodecRow(),
+            makeMaxDimensionsRow(),
+            makeRedEyeRow(),
         ])
+    }
+}
+
+// MARK: - Drawer row builders
+
+extension StudioViewController {
+    private func makeExposureModeRow() -> PRMSettingsRow {
+        let segmented = UISegmentedControl(items: ["Locked", "Auto", "Cont"])
+        segmented.selectedSegmentIndex = 1
+        let row = PRMSettingsRow(
+            symbolName: "lock.shield",
+            title: "Exposure Mode",
+            valueText: "auto",
+            content: segmented
+        )
+        segmented.addAction(UIAction { [weak self, weak row] _ in
+            let mode: AVCaptureDevice.ExposureMode
+            switch segmented.selectedSegmentIndex {
+            case 0: mode = .locked; row?.valueText = "locked"
+            case 1: mode = .autoExpose; row?.valueText = "auto"
+            default: mode = .continuousAutoExposure; row?.valueText = "continuous"
+            }
+            Task { await self?.camera.setExposureMode(mode) }
+        }, for: .valueChanged)
+        return row
+    }
+
+    private func makeCustomExposurePresetRow(device: PRMCameraDevice) -> PRMSettingsRow {
+        let segmented = UISegmentedControl(items: ["Day", "Indoor", "Night"])
+        segmented.selectedSegmentIndex = UISegmentedControl.noSegment
+        let row = PRMSettingsRow(
+            symbolName: "wand.and.stars",
+            title: "Custom Exposure",
+            valueText: "—",
+            content: segmented
+        )
+        segmented.addAction(UIAction { [weak self, weak row] _ in
+            guard let self else { return }
+            let (duration, iso, label): (CMTime, Float, String) = switch segmented.selectedSegmentIndex {
+            case 0: (CMTime(value: 1, timescale: 500), max(50, device.isoRange.lowerBound), "1/500 · ISO \(Int(device.isoRange.lowerBound))")
+            case 1: (CMTime(value: 1, timescale: 60), min(400, device.isoRange.upperBound), "1/60 · ISO 400")
+            default: (CMTime(value: 1, timescale: 30), min(1600, device.isoRange.upperBound), "1/30 · ISO 1600")
+            }
+            row?.valueText = label
+            Task { await camera.setCustomExposure(duration: duration, iso: iso) }
+        }, for: .valueChanged)
+        return row
+    }
+
+    private func makeWhiteBalanceModeRow() -> PRMSettingsRow {
+        let segmented = UISegmentedControl(items: ["Locked", "Auto", "Cont"])
+        segmented.selectedSegmentIndex = 1
+        let row = PRMSettingsRow(
+            symbolName: "circle.dashed",
+            title: "WB Mode",
+            valueText: "auto",
+            content: segmented
+        )
+        segmented.addAction(UIAction { [weak self, weak row] _ in
+            let mode: AVCaptureDevice.WhiteBalanceMode
+            switch segmented.selectedSegmentIndex {
+            case 0: mode = .locked; row?.valueText = "locked"
+            case 1: mode = .autoWhiteBalance; row?.valueText = "auto"
+            default: mode = .continuousAutoWhiteBalance; row?.valueText = "continuous"
+            }
+            Task { await self?.camera.setWhiteBalanceMode(mode) }
+        }, for: .valueChanged)
+        return row
+    }
+
+    private func makeFocusModeRow() -> PRMSettingsRow {
+        let segmented = UISegmentedControl(items: ["Locked", "Auto", "Cont"])
+        segmented.selectedSegmentIndex = 2
+        let row = PRMSettingsRow(
+            symbolName: "scope",
+            title: "Focus Mode",
+            valueText: "continuous",
+            content: segmented
+        )
+        segmented.addAction(UIAction { [weak self, weak row] _ in
+            let mode: AVCaptureDevice.FocusMode
+            switch segmented.selectedSegmentIndex {
+            case 0: mode = .locked; row?.valueText = "locked"
+            case 1: mode = .autoFocus; row?.valueText = "auto"
+            default: mode = .continuousAutoFocus; row?.valueText = "continuous"
+            }
+            guard let self else { return }
+            let session = camera.session
+            Task { @PRMCameraActor in
+                guard let device = session.videoDevice else { return }
+                try? device.prm_setFocusMode(mode)
+            }
+        }, for: .valueChanged)
+        return row
+    }
+
+    private func makeZoomRampRow(device: PRMCameraDevice) -> PRMSettingsRow {
+        let button = UIButton(type: .system)
+        button.setTitle("Ramp →", for: .normal)
+        button.setTitleColor(.systemYellow, for: .normal)
+        button.titleLabel?.font = .systemFont(ofSize: 13, weight: .semibold)
+        let target: CGFloat = min(2.0, device.maxZoomFactor)
+        let row = PRMSettingsRow(
+            symbolName: "arrow.up.right.and.arrow.down.left.rectangle",
+            title: "Smooth Ramp",
+            valueText: "→ \(String(format: "%.1f×", target))",
+            content: button
+        )
+        button.addAction(UIAction { [weak self, weak row] _ in
+            guard let self else { return }
+            if isZoomRamping {
+                Task { await self.camera.cancelZoomRamp() }
+                isZoomRamping = false
+                row?.valueText = "→ \(String(format: "%.1f×", target))"
+                button.setTitle("Ramp →", for: .normal)
+            } else {
+                Task { await self.camera.rampZoom(to: target, rate: 1.0) }
+                isZoomRamping = true
+                row?.valueText = "ramping…"
+                button.setTitle("Cancel", for: .normal)
+            }
+        }, for: .touchUpInside)
+        return row
+    }
+
+    private func makeMaxDimensionsRow() -> PRMSettingsRow {
+        let toggle = UISwitch()
+        toggle.isOn = capMaxDimensions
+        let row = PRMSettingsRow(
+            symbolName: "square.dashed",
+            title: "Max Dimensions",
+            valueText: toggle.isOn ? "cap" : "default",
+            content: toggle
+        )
+        toggle.addAction(UIAction { [weak self, weak row] _ in
+            guard let self else { return }
+            capMaxDimensions = toggle.isOn
+            row?.valueText = toggle.isOn ? "cap" : "default"
+        }, for: .valueChanged)
+        return row
+    }
+
+    private func makeRedEyeRow() -> PRMSettingsRow {
+        let toggle = UISwitch()
+        toggle.isOn = autoRedEyeReductionEnabled
+        let row = PRMSettingsRow(
+            symbolName: "eye.trianglebadge.exclamationmark",
+            title: "Auto Red-Eye",
+            valueText: toggle.isOn ? "on" : "off",
+            content: toggle
+        )
+        toggle.addAction(UIAction { [weak self, weak row] _ in
+            guard let self else { return }
+            autoRedEyeReductionEnabled = toggle.isOn
+            row?.valueText = toggle.isOn ? "on" : "off"
+        }, for: .valueChanged)
+        return row
     }
 
     private func makeEVRow(device: PRMCameraDevice) -> PRMSettingsRow {
@@ -1015,15 +1275,18 @@ final class StudioViewController: UIViewController {
 
     private func makeCodecRow() -> PRMSettingsRow {
         let segmented = UISegmentedControl(items: ["JPEG", "HEIC"])
-        segmented.selectedSegmentIndex = 1
+        segmented.selectedSegmentIndex = photoCodec == .jpeg ? 0 : 1
         let row = PRMSettingsRow(
             symbolName: "doc.zipper",
             title: "Codec",
-            valueText: "heic",
+            valueText: photoCodec == .jpeg ? "jpeg" : "heic",
             content: segmented
         )
-        segmented.addAction(UIAction { [weak row] _ in
-            row?.valueText = segmented.selectedSegmentIndex == 0 ? "jpeg" : "heic"
+        segmented.addAction(UIAction { [weak self, weak row] _ in
+            guard let self else { return }
+            let codec: AVVideoCodecType = segmented.selectedSegmentIndex == 0 ? .jpeg : .hevc
+            photoCodec = codec
+            row?.valueText = codec == .jpeg ? "jpeg" : "heic"
         }, for: .valueChanged)
         return row
     }

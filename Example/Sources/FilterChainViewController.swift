@@ -28,9 +28,11 @@ final class FilterChainViewController: UIViewController {
         case blur = "Blur"
         case stylize = "Stylize"
         case distort = "Distort"
+        case other = "Other"
     }
 
     private let catalog: [CatalogEntry] = [
+        .init(name: "Brightness", category: .color) { PRMBrightnessFilter(value: 0.15) },
         .init(name: "Sepia", category: .color) { PRMSepiaFilter() },
         .init(name: "Vignette", category: .color) { PRMVignetteFilter() },
         .init(name: "Grayscale", category: .color) { PRMGrayscaleFilter() },
@@ -51,6 +53,8 @@ final class FilterChainViewController: UIViewController {
         .init(name: "Twirl", category: .distort) { PRMTwirlDistortionFilter() },
         .init(name: "Pinch", category: .distort) { PRMPinchDistortionFilter() },
         .init(name: "Vortex", category: .distort) { PRMVortexDistortionFilter() },
+
+        .init(name: "Pass-through", category: .other) { PRMPassThroughFilter() },
     ]
 
     // MARK: - Camera / pipeline
@@ -77,6 +81,18 @@ final class FilterChainViewController: UIViewController {
     private let libraryStack = UIStackView()
     private let activeEmptyLabel = UILabel()
 
+    /// Chain-management toolbar that exercises `PRMFilterChain.removeAll`, `.move`, `.setIntensity`.
+    private let toolbarStack = UIStackView()
+    private let clearButton = UIButton(type: .system)
+    private let shuffleButton = UIButton(type: .system)
+    private let randomizeButton = UIButton(type: .system)
+
+    /// `frameStream()` telemetry — runs alongside `onFrame` to demonstrate dual delivery.
+    private let fpsLabel = UILabel()
+    private var frameStreamTask: Task<Void, Never>?
+    private var frameStreamFrameCount: Int = 0
+    private var fpsTimer: Timer?
+
     /// In-memory mirror of `chain.entries` to bind to the visual stack.
     private var activeEntries: [(uuid: UUID, name: String, make: @Sendable () -> any PRMFilter, intensity: Float)] = []
 
@@ -94,6 +110,10 @@ final class FilterChainViewController: UIViewController {
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        frameStreamTask?.cancel()
+        frameStreamTask = nil
+        fpsTimer?.invalidate()
+        fpsTimer = nil
         Task { await camera.stop() }
     }
 
@@ -103,10 +123,27 @@ final class FilterChainViewController: UIViewController {
         // Preview — top half
         view.addSubview(previewView)
         previewView.rotation = .rotate90
+        previewView.contentFit = .fill
         previewView.snp.makeConstraints {
             $0.top.equalTo(view.safeAreaLayoutGuide)
             $0.leading.trailing.equalToSuperview()
             $0.height.equalToSuperview().multipliedBy(0.5)
+        }
+
+        // FPS readout (proves frameStream() delivery alongside onFrame).
+        fpsLabel.font = .monospacedSystemFont(ofSize: 11, weight: .semibold)
+        fpsLabel.textColor = UIColor.white.withAlphaComponent(0.85)
+        fpsLabel.backgroundColor = UIColor.black.withAlphaComponent(0.45)
+        fpsLabel.layer.cornerRadius = 6
+        fpsLabel.layer.masksToBounds = true
+        fpsLabel.textAlignment = .center
+        fpsLabel.text = " stream … "
+        view.addSubview(fpsLabel)
+        fpsLabel.snp.makeConstraints {
+            $0.top.equalTo(view.safeAreaLayoutGuide).offset(8)
+            $0.trailing.equalToSuperview().offset(-12)
+            $0.height.equalTo(22)
+            $0.width.greaterThanOrEqualTo(96)
         }
 
         // Bottom container
@@ -153,6 +190,28 @@ final class FilterChainViewController: UIViewController {
             $0.leading.equalToSuperview().offset(20)
         }
 
+        // Chain-management toolbar.
+        configureToolbarButton(clearButton, title: "Clear")
+        configureToolbarButton(shuffleButton, title: "Shuffle")
+        configureToolbarButton(randomizeButton, title: "Random Intensity")
+        clearButton.addAction(UIAction { [weak self] _ in self?.clearChain() }, for: .touchUpInside)
+        shuffleButton.addAction(UIAction { [weak self] _ in self?.shuffleChain() }, for: .touchUpInside)
+        randomizeButton.addAction(UIAction { [weak self] _ in self?.randomizeIntensities() }, for: .touchUpInside)
+
+        toolbarStack.axis = .horizontal
+        toolbarStack.spacing = 8
+        toolbarStack.distribution = .fillEqually
+        toolbarStack.addArrangedSubview(clearButton)
+        toolbarStack.addArrangedSubview(shuffleButton)
+        toolbarStack.addArrangedSubview(randomizeButton)
+        drawer.addSubview(toolbarStack)
+        toolbarStack.snp.makeConstraints {
+            $0.top.equalTo(activeStackContainer.snp.bottom).offset(8)
+            $0.leading.equalToSuperview().offset(16)
+            $0.trailing.equalToSuperview().offset(-16)
+            $0.height.equalTo(32)
+        }
+
         // Category segmented
         categorySegmented.selectedSegmentIndex = 0
         categorySegmented.backgroundColor = UIColor.white.withAlphaComponent(0.06)
@@ -162,7 +221,7 @@ final class FilterChainViewController: UIViewController {
         categorySegmented.addAction(UIAction { [weak self] _ in self?.rebuildLibrary() }, for: .valueChanged)
         drawer.addSubview(categorySegmented)
         categorySegmented.snp.makeConstraints {
-            $0.top.equalTo(activeStackContainer.snp.bottom).offset(16)
+            $0.top.equalTo(toolbarStack.snp.bottom).offset(12)
             $0.leading.equalToSuperview().offset(16)
             $0.trailing.equalToSuperview().offset(-16)
             $0.height.equalTo(32)
@@ -185,6 +244,52 @@ final class FilterChainViewController: UIViewController {
         }
     }
 
+    private func configureToolbarButton(_ button: UIButton, title: String) {
+        var config = UIButton.Configuration.plain()
+        config.title = title
+        config.baseForegroundColor = .white
+        config.background.backgroundColor = UIColor.white.withAlphaComponent(0.08)
+        config.background.cornerRadius = 8
+        config.titleTextAttributesTransformer = .init { input in
+            var attributes = input
+            attributes.font = .systemFont(ofSize: 11, weight: .semibold)
+            return attributes
+        }
+        button.configuration = config
+    }
+
+    // MARK: - Toolbar actions (exercise PRMFilterChain.removeAll / move / setIntensity)
+
+    private func clearChain() {
+        activeEntries.removeAll()
+        // Use the chain's `removeAll()` directly (rather than `replace([])`) to exercise that API.
+        chain.removeAll()
+        rebuildActiveStack()
+    }
+
+    private func shuffleChain() {
+        guard activeEntries.count >= 2 else { return }
+        // Drive PRMFilterChain.move by computing a Fisher-Yates-style swap sequence,
+        // applying each move to both the mirror array and the chain.
+        for index in stride(from: activeEntries.count - 1, through: 1, by: -1) {
+            let target = Int.random(in: 0 ... index)
+            guard target != index else { continue }
+            activeEntries.swapAt(index, target)
+            chain.move(from: index, to: target)
+        }
+        rebuildActiveStack()
+    }
+
+    private func randomizeIntensities() {
+        for index in activeEntries.indices {
+            let intensity = Float.random(in: 0.2 ... 1.0)
+            activeEntries[index].intensity = intensity
+            // Drive PRMFilterChain.setIntensity rather than rebuilding entries.
+            chain.setIntensity(intensity, at: index)
+        }
+        rebuildActiveStack()
+    }
+
     // MARK: - Camera boot
 
     private func bootCamera() async {
@@ -202,6 +307,22 @@ final class FilterChainViewController: UIViewController {
         pipeline.onFrame = { [weak self] frame in
             self?.previewView.update(frame.pixelBuffer)
         }
+
+        // Consume frameStream() in parallel — proves AsyncStream delivery works alongside onFrame.
+        frameStreamTask = Task { [weak self, pipeline] in
+            for await _ in pipeline.frameStream() {
+                guard !Task.isCancelled else { break }
+                await MainActor.run { self?.frameStreamFrameCount += 1 }
+            }
+        }
+        fpsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                fpsLabel.text = " stream \(frameStreamFrameCount) fps "
+                frameStreamFrameCount = 0
+            }
+        }
+
         await camera.start()
     }
 

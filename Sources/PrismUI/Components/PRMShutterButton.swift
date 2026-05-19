@@ -47,7 +47,6 @@
 
         private let ringView = UIView()
         private let innerView = UIView()
-        private var pulseAnimating = false
 
         // MARK: - Init
 
@@ -137,7 +136,6 @@
 
         private func startPulse() {
             guard !UIAccessibility.isReduceMotionEnabled else { return }
-            pulseAnimating = true
             UIView.animate(
                 withDuration: 0.7,
                 delay: 0,
@@ -147,7 +145,6 @@
         }
 
         private func stopPulse() {
-            pulseAnimating = false
             innerView.layer.removeAllAnimations()
             innerView.alpha = 1.0
         }

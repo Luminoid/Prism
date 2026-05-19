@@ -23,12 +23,15 @@ public extension AVCaptureDevice {
     func prm_setLensPosition(_ position: Float) async throws {
         guard isFocusModeSupported(.locked) else { return }
         let clamped = min(max(position, 0.0), 1.0)
+        // Lock, kick off the focus move, unlock — *then* await. Holding the device lock across
+        // the `await` would stall any concurrent `lockForConfiguration` caller for the full
+        // physical lens-move duration (tens of ms).
         try lockForConfiguration()
-        defer { unlockForConfiguration() }
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             setFocusModeLocked(lensPosition: clamped) { _ in
                 continuation.resume()
             }
+            unlockForConfiguration()
         }
     }
 

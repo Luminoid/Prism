@@ -26,15 +26,33 @@ final class RootCatalogViewController: UIViewController {
         ),
         Demo(
             title: "Studio",
-            subtitle: "Photo · Video · Slow-mo · Lens picker · Live telemetry",
+            subtitle: "DSLR · all controls + hw shutter + rotation coordinator",
             symbol: "camera.aperture",
             make: { StudioViewController() }
         ),
         Demo(
             title: "Filter Chain",
-            subtitle: "Reorderable filters with intensity blending",
+            subtitle: "Multi-filter chain · reorder · intensity blending",
             symbol: "wand.and.rays",
             make: { FilterChainViewController() }
+        ),
+        Demo(
+            title: "Basic Renderer",
+            subtitle: "Single-filter pipeline + filtered photo capture",
+            symbol: "camera.macro",
+            make: { BasicRendererViewController() }
+        ),
+        Demo(
+            title: "Depth Inspector",
+            subtitle: "Live depth map · PRMDepthCapture + filtering",
+            symbol: "view.3d",
+            make: { DepthInspectorViewController() }
+        ),
+        Demo(
+            title: "Configuration Lab",
+            subtitle: "Every PRMCameraConfiguration knob · Apply + reconfigure",
+            symbol: "slider.horizontal.3",
+            make: { ConfigurationLabViewController() }
         ),
     ]
 

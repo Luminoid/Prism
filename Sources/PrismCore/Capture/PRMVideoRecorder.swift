@@ -37,6 +37,9 @@ public final class PRMVideoRecorder: NSObject, @unchecked Sendable {
     // MARK: - Start / Stop
 
     /// Starts recording to a new tmp file. Returns when the file output has actually begun.
+    ///
+    /// Honors `Task` cancellation: if the surrounding task is cancelled while waiting for the
+    /// file output to begin, recording is stopped and the call throws ``PRMSessionError/cancelled``.
     public func start(
         rotationAngle: CGFloat? = nil,
         stabilizationMode: AVCaptureVideoStabilizationMode? = nil
@@ -53,16 +56,24 @@ public final class PRMVideoRecorder: NSObject, @unchecked Sendable {
             }
         }
 
-        try await withCheckedThrowingContinuation { continuation in
-            lock.lock()
-            startContinuation = continuation
-            state = .recording(url: url, startedAt: Date())
-            lock.unlock()
-            output.startRecording(to: url, recordingDelegate: self)
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                lock.lock()
+                startContinuation = continuation
+                state = .recording(url: url, startedAt: Date())
+                lock.unlock()
+                output.startRecording(to: url, recordingDelegate: self)
+            }
+        } onCancel: { [weak self] in
+            self?.output.stopRecording()
         }
     }
 
     /// Stops recording. Returns when the file is finalized.
+    ///
+    /// Honors `Task` cancellation: cancellation during finalization does NOT abort writing
+    /// (the file is already being flushed by AVFoundation) — the call still resumes when the
+    /// delegate fires, so the caller gets the partial recording. Use ``cancel()`` to discard.
     public func stop() async throws -> PRMRecording {
         guard case .recording = state else {
             throw PRMSessionError.videoRecordingFailed("Not currently recording")
@@ -74,6 +85,13 @@ public final class PRMVideoRecorder: NSObject, @unchecked Sendable {
             lock.unlock()
             output.stopRecording()
         }
+    }
+
+    /// Stops recording and discards the file. Use when the user aborts mid-recording.
+    public func cancel() {
+        guard case let .recording(url, _) = state else { return }
+        output.stopRecording()
+        PRMTempFile.remove(url)
     }
 }
 

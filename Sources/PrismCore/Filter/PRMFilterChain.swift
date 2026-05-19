@@ -36,17 +36,53 @@ public final class PRMFilterChain: PRMFilterRenderer, @unchecked Sendable {
     // MARK: - Properties
 
     public let description: String
-    public private(set) var isPrepared = false
-    public private(set) var outputFormatDescription: CMFormatDescription?
-    public private(set) var inputFormatDescription: CMFormatDescription?
 
-    public private(set) var entries: [Entry]
-    public var count: Int { entries.count }
-    public var isEmpty: Bool { entries.isEmpty }
+    public var isPrepared: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _isPrepared
+    }
 
-    private let context: PRMRenderContext
+    public var outputFormatDescription: CMFormatDescription? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _outputFormatDescription
+    }
+
+    public var inputFormatDescription: CMFormatDescription? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _inputFormatDescription
+    }
+
+    public var entries: [Entry] {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _entries
+    }
+
+    public var count: Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _entries.count
+    }
+
+    public var isEmpty: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _entries.isEmpty
+    }
+
+    // MARK: - Private storage
+
+    private var _isPrepared = false
+    private var _outputFormatDescription: CMFormatDescription?
+    private var _inputFormatDescription: CMFormatDescription?
+    private var _entries: [Entry]
     private var outputColorSpace: CGColorSpace?
     private var outputPixelBufferPool: CVPixelBufferPool?
+    private let context: PRMRenderContext
+    private let stateLock = NSLock()
 
     // MARK: - Init
 
@@ -57,43 +93,57 @@ public final class PRMFilterChain: PRMFilterRenderer, @unchecked Sendable {
     ) {
         self.context = context
         self.description = description
-        self.entries = entries
+        _entries = entries
     }
 
     // MARK: - Mutation
 
     public func append(_ filter: any PRMFilter, intensity: Float = 1.0) {
-        entries.append(Entry(filter: filter, intensity: intensity))
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        _entries.append(Entry(filter: filter, intensity: intensity))
     }
 
     public func append(_ entry: Entry) {
-        entries.append(entry)
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        _entries.append(entry)
     }
 
     public func remove(at index: Int) {
-        guard index >= 0, index < entries.count else { return }
-        entries.remove(at: index)
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard index >= 0, index < _entries.count else { return }
+        _entries.remove(at: index)
     }
 
     public func removeAll() {
-        entries.removeAll()
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        _entries.removeAll()
     }
 
     public func replace(_ entries: [Entry]) {
-        self.entries = entries
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        _entries = entries
     }
 
     public func setIntensity(_ intensity: Float, at index: Int) {
-        guard index >= 0, index < entries.count else { return }
-        let current = entries[index]
-        entries[index] = Entry(filter: current.filter, intensity: intensity)
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard index >= 0, index < _entries.count else { return }
+        let current = _entries[index]
+        _entries[index] = Entry(filter: current.filter, intensity: intensity)
     }
 
     public func move(from source: Int, to destination: Int) {
-        guard source >= 0, source < entries.count else { return }
-        guard destination >= 0, destination < entries.count else { return }
-        let entry = entries.remove(at: source)
-        entries.insert(entry, at: destination)
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard source >= 0, source < _entries.count else { return }
+        guard destination >= 0, destination < _entries.count else { return }
+        let entry = _entries.remove(at: source)
+        _entries.insert(entry, at: destination)
     }
 
     // MARK: - PRMFilterRenderer
@@ -109,29 +159,42 @@ public final class PRMFilterChain: PRMFilterRenderer, @unchecked Sendable {
             return
         }
 
+        stateLock.lock()
         outputPixelBufferPool = allocation.bufferPool
         outputColorSpace = allocation.colorSpace
-        outputFormatDescription = allocation.formatDescription
-        inputFormatDescription = formatDescription
-        isPrepared = true
+        _outputFormatDescription = allocation.formatDescription
+        _inputFormatDescription = formatDescription
+        _isPrepared = true
+        stateLock.unlock()
     }
 
     public func reset() {
+        stateLock.lock()
         outputColorSpace = nil
         outputPixelBufferPool = nil
-        outputFormatDescription = nil
-        inputFormatDescription = nil
-        isPrepared = false
+        _outputFormatDescription = nil
+        _inputFormatDescription = nil
+        _isPrepared = false
+        stateLock.unlock()
     }
 
     public func render(pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
-        guard isPrepared, let pool = outputPixelBufferPool else { return nil }
-        guard !entries.isEmpty else { return pixelBuffer }
+        // Snapshot under one lock so the render pass sees a consistent (entries, pool) view —
+        // a concurrent `remove(at:)` or `reset()` can't tear the iteration.
+        stateLock.lock()
+        let prepared = _isPrepared
+        let pool = outputPixelBufferPool
+        let entriesSnapshot = _entries
+        let colorSpace = outputColorSpace
+        stateLock.unlock()
+
+        guard prepared, let pool else { return nil }
+        guard !entriesSnapshot.isEmpty else { return pixelBuffer }
 
         let sourceImage = CIImage(cvImageBuffer: pixelBuffer)
         var currentImage = sourceImage
 
-        for entry in entries {
+        for entry in entriesSnapshot {
             let filtered = entry.filter.render(currentImage)
 
             switch entry.intensity {
@@ -171,7 +234,7 @@ public final class PRMFilterChain: PRMFilterRenderer, @unchecked Sendable {
             currentImage,
             to: outputPixelBuffer,
             bounds: currentImage.extent,
-            colorSpace: outputColorSpace
+            colorSpace: colorSpace
         )
         return outputPixelBuffer
     }
