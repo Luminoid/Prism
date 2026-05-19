@@ -1,237 +1,186 @@
-import AVFoundation
 import PrismCore
 import SnapKit
 import UIKit
 
 // MARK: - PermissionsViewController
 
-/// Demonstrates `PRMPermissionHelper` (camera/mic status, request, settingsURL)
-/// and `PRMSessionSetupResult` (authorization flow).
+/// Dark-themed permissions flow for camera + microphone.
 final class PermissionsViewController: UIViewController {
-    // MARK: - Properties
-
-    private let cameraStatusLabel = UILabel()
-    private let micStatusLabel = UILabel()
-    private let sessionResultLabel = UILabel()
-    private let requestCameraButton = UIButton(type: .system)
-    private let requestMicButton = UIButton(type: .system)
-    private let setupSessionButton = UIButton(type: .system)
-    private let openSettingsButton = UIButton(type: .system)
-
-    // MARK: - Lifecycle
+    private let cameraCard = PermissionCard(title: "Camera", symbol: "camera")
+    private let micCard = PermissionCard(title: "Microphone", symbol: "microphone")
 
     override func viewDidLoad() {
         super.viewDidLoad()
         title = "Permissions"
         view.backgroundColor = .systemBackground
-        setupUI()
-        refreshStatuses()
-    }
 
-    override func viewWillAppear(_ animated: Bool) {
-        super.viewWillAppear(animated)
-        refreshStatuses()
-    }
+        let stack = UIStackView(arrangedSubviews: [cameraCard, micCard])
+        stack.axis = .vertical
+        stack.spacing = 16
+        stack.layoutMargins = UIEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        stack.isLayoutMarginsRelativeArrangement = true
 
-    // MARK: - Setup
-
-    private func setupUI() {
         let scrollView = UIScrollView()
         view.addSubview(scrollView)
         scrollView.snp.makeConstraints { $0.edges.equalToSuperview() }
-
-        let stack = UIStackView()
-        stack.axis = .vertical
-        stack.spacing = 24
-        stack.layoutMargins = UIEdgeInsets(top: 24, left: 20, bottom: 24, right: 20)
-        stack.isLayoutMarginsRelativeArrangement = true
         scrollView.addSubview(stack)
         stack.snp.makeConstraints {
             $0.edges.equalToSuperview()
             $0.width.equalToSuperview()
         }
 
-        // Camera section
-        let cameraCard = makeCard(
-            title: "Camera Permission",
-            statusLabel: cameraStatusLabel,
-            button: requestCameraButton,
-            action: #selector(requestCamera),
-        )
-        stack.addArrangedSubview(cameraCard)
+        let openSettings = UIButton(configuration: .gray())
+        openSettings.setTitle("Open System Settings", for: .normal)
+        openSettings.addAction(UIAction { [weak self] _ in self?.openSystemSettings() }, for: .touchUpInside)
+        stack.addArrangedSubview(openSettings)
 
-        // Microphone section
-        let micCard = makeCard(
-            title: "Microphone Permission",
-            statusLabel: micStatusLabel,
-            button: requestMicButton,
-            action: #selector(requestMicrophone),
-        )
-        stack.addArrangedSubview(micCard)
+        let footer = UILabel()
+        footer.text = "Camera and microphone permissions persist; you can revoke them in Settings."
+        footer.font = .preferredFont(forTextStyle: .footnote)
+        footer.textColor = .secondaryLabel
+        footer.numberOfLines = 0
+        stack.addArrangedSubview(footer)
 
-        // Session setup section
-        let sessionCard = makeSessionCard()
-        stack.addArrangedSubview(sessionCard)
-
-        // Open Settings
-        openSettingsButton.setTitle("Open App Settings", for: .normal)
-        openSettingsButton.titleLabel?.font = .systemFont(ofSize: 16, weight: .medium)
-        openSettingsButton.addTarget(self, action: #selector(openSettings), for: .touchUpInside)
-        stack.addArrangedSubview(openSettingsButton)
-
-        // Info text
-        let infoLabel = UILabel()
-        infoLabel.text = """
-        This screen demonstrates PRMPermissionHelper and PRMSessionSetupResult. \
-        Camera and microphone permissions must be granted before starting a capture session.
-        """
-        infoLabel.font = .systemFont(ofSize: 13)
-        infoLabel.textColor = .secondaryLabel
-        infoLabel.numberOfLines = 0
-        stack.addArrangedSubview(infoLabel)
+        cameraCard.onRequest = { [weak self] in self?.requestCamera() }
+        micCard.onRequest = { [weak self] in self?.requestMicrophone() }
     }
 
-    private func makeCard(
-        title: String,
-        statusLabel: UILabel,
-        button: UIButton,
-        action: Selector,
-    ) -> UIView {
-        let card = UIView()
-        card.backgroundColor = .secondarySystemBackground
-        card.layer.cornerRadius = 12
-
-        let titleLabel = UILabel()
-        titleLabel.text = title
-        titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
-
-        statusLabel.font = .monospacedSystemFont(ofSize: 15, weight: .medium)
-        statusLabel.textAlignment = .right
-
-        button.setTitle("Request Access", for: .normal)
-        button.addTarget(self, action: action, for: .touchUpInside)
-
-        let topRow = UIStackView(arrangedSubviews: [titleLabel, statusLabel])
-        topRow.distribution = .equalSpacing
-
-        let stack = UIStackView(arrangedSubviews: [topRow, button])
-        stack.axis = .vertical
-        stack.spacing = 12
-
-        card.addSubview(stack)
-        stack.snp.makeConstraints { $0.edges.equalToSuperview().inset(16) }
-
-        return card
-    }
-
-    private func makeSessionCard() -> UIView {
-        let card = UIView()
-        card.backgroundColor = .secondarySystemBackground
-        card.layer.cornerRadius = 12
-
-        let titleLabel = UILabel()
-        titleLabel.text = "Session Setup"
-        titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
-
-        sessionResultLabel.text = "Not tested"
-        sessionResultLabel.font = .monospacedSystemFont(ofSize: 15, weight: .medium)
-        sessionResultLabel.textColor = .secondaryLabel
-        sessionResultLabel.textAlignment = .right
-
-        setupSessionButton.setTitle("Test Session Setup", for: .normal)
-        setupSessionButton.addTarget(self, action: #selector(testSessionSetup), for: .touchUpInside)
-
-        let topRow = UIStackView(arrangedSubviews: [titleLabel, sessionResultLabel])
-        topRow.distribution = .equalSpacing
-
-        let stack = UIStackView(arrangedSubviews: [topRow, setupSessionButton])
-        stack.axis = .vertical
-        stack.spacing = 12
-
-        card.addSubview(stack)
-        stack.snp.makeConstraints { $0.edges.equalToSuperview().inset(16) }
-
-        return card
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        refresh()
     }
 
     // MARK: - Actions
 
-    @objc private func requestCamera() {
+    private func requestCamera() {
         Task {
-            _ = await PRMPermissionHelper.requestCameraAccess()
-            refreshStatuses()
+            _ = await PRMPermissions.requestCameraAccess()
+            refresh()
         }
     }
 
-    @objc private func requestMicrophone() {
+    private func requestMicrophone() {
         Task {
-            _ = await PRMPermissionHelper.requestMicrophoneAccess()
-            refreshStatuses()
+            _ = await PRMPermissions.requestMicrophoneAccess()
+            refresh()
         }
     }
 
-    @objc private func testSessionSetup() {
-        let sm = PRMCameraSessionManager()
-        sm.sessionQueue.async { [weak self] in
-            sm.checkAuthorization()
-            sm.configureSession(with: PRMCameraConfiguration())
-            let result = sm.setupResult
-            sm.stopSession()
-            DispatchQueue.main.async {
-                self?.displaySessionResult(result)
-            }
-        }
-    }
-
-    @objc private func openSettings() {
-        guard let url = PRMPermissionHelper.settingsURL() else { return }
+    private func openSystemSettings() {
+        guard let url = PRMPermissions.settingsURL() else { return }
         UIApplication.shared.open(url)
     }
 
-    // MARK: - UI Updates
+    private func refresh() {
+        cameraCard.apply(status: PRMPermissions.cameraStatus())
+        micCard.apply(status: PRMPermissions.microphoneStatus())
+    }
+}
 
-    private func refreshStatuses() {
-        let cameraStatus = PRMPermissionHelper.cameraStatus()
-        let micStatus = PRMPermissionHelper.microphoneStatus()
+// MARK: - PermissionCard
 
-        cameraStatusLabel.text = statusText(cameraStatus)
-        cameraStatusLabel.textColor = statusColor(cameraStatus)
-        requestCameraButton.isEnabled = cameraStatus == .notDetermined
+private final class PermissionCard: UIView {
+    var onRequest: (() -> Void)?
 
-        micStatusLabel.text = statusText(micStatus)
-        micStatusLabel.textColor = statusColor(micStatus)
-        requestMicButton.isEnabled = micStatus == .notDetermined
+    private let titleLabel = UILabel()
+    private let symbolView = UIImageView()
+    private let statusPill = StatusPillView()
+    private let requestButton = UIButton(configuration: .filled())
+
+    init(title: String, symbol: String) {
+        super.init(frame: .zero)
+        backgroundColor = .secondarySystemBackground
+        layer.cornerRadius = 16
+        layer.cornerCurve = .continuous
+
+        symbolView.image = UIImage(systemName: symbol)
+        symbolView.tintColor = .systemYellow
+        symbolView.contentMode = .scaleAspectFit
+
+        titleLabel.text = title
+        titleLabel.font = .preferredFont(forTextStyle: .title3).bold()
+
+        var config = UIButton.Configuration.filled()
+        config.title = "Request Access"
+        config.baseBackgroundColor = .systemYellow
+        config.baseForegroundColor = .black
+        requestButton.configuration = config
+        requestButton.addAction(UIAction { [weak self] _ in self?.onRequest?() }, for: .touchUpInside)
+
+        let topRow = UIStackView(arrangedSubviews: [symbolView, titleLabel, statusPill])
+        topRow.alignment = .center
+        topRow.spacing = 12
+
+        symbolView.snp.makeConstraints { $0.size.equalTo(32) }
+
+        let stack = UIStackView(arrangedSubviews: [topRow, requestButton])
+        stack.axis = .vertical
+        stack.spacing = 16
+        addSubview(stack)
+        stack.snp.makeConstraints { $0.edges.equalToSuperview().inset(20) }
     }
 
-    private func displaySessionResult(_ result: PRMSessionSetupResult) {
-        switch result {
-        case .success:
-            sessionResultLabel.text = "Success"
-            sessionResultLabel.textColor = .systemGreen
-        case .notAuthorized:
-            sessionResultLabel.text = "Not Authorized"
-            sessionResultLabel.textColor = .systemRed
-        case .configurationFailed:
-            sessionResultLabel.text = "Config Failed"
-            sessionResultLabel.textColor = .systemOrange
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("Use init(title:symbol:) instead")
+    }
+
+    func apply(status: PRMPermissions.Status) {
+        statusPill.apply(status: status)
+        requestButton.isHidden = status != .notDetermined
+    }
+}
+
+// MARK: - StatusPillView
+
+private final class StatusPillView: UIView {
+    private let label = UILabel()
+
+    init() {
+        super.init(frame: .zero)
+        layer.cornerRadius = 12
+        layer.cornerCurve = .continuous
+        label.font = .preferredFont(forTextStyle: .caption1).bold()
+        label.textAlignment = .center
+        addSubview(label)
+        label.snp.makeConstraints {
+            $0.top.bottom.equalToSuperview().inset(6)
+            $0.leading.trailing.equalToSuperview().inset(12)
         }
     }
 
-    private func statusText(_ status: PRMPermissionHelper.PermissionStatus) -> String {
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("Use init() instead")
+    }
+
+    func apply(status: PRMPermissions.Status) {
         switch status {
-        case .authorized: "Authorized"
-        case .denied: "Denied"
-        case .restricted: "Restricted"
-        case .notDetermined: "Not Determined"
+        case .authorized:
+            label.text = "Authorized"
+            label.textColor = .systemGreen
+            backgroundColor = UIColor.systemGreen.withAlphaComponent(0.15)
+        case .denied:
+            label.text = "Denied"
+            label.textColor = .systemRed
+            backgroundColor = UIColor.systemRed.withAlphaComponent(0.15)
+        case .restricted:
+            label.text = "Restricted"
+            label.textColor = .systemOrange
+            backgroundColor = UIColor.systemOrange.withAlphaComponent(0.15)
+        case .notDetermined:
+            label.text = "Not Set"
+            label.textColor = .secondaryLabel
+            backgroundColor = UIColor.secondarySystemFill
         }
     }
+}
 
-    private func statusColor(_ status: PRMPermissionHelper.PermissionStatus) -> UIColor {
-        switch status {
-        case .authorized: .systemGreen
-        case .denied: .systemRed
-        case .restricted: .systemOrange
-        case .notDetermined: .secondaryLabel
-        }
+// MARK: - UIFont bold helper
+
+private extension UIFont {
+    func bold() -> UIFont {
+        guard let descriptor = fontDescriptor.withSymbolicTraits(.traitBold) else { return self }
+        return UIFont(descriptor: descriptor, size: 0)
     }
 }

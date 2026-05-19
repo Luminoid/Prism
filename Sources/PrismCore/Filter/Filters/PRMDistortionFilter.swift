@@ -1,13 +1,8 @@
 import CoreImage
 
-// MARK: - PRMBumpDistortionFilter
+// MARK: - Bump
 
-/// Applies a bump distortion using CIBumpDistortion.
-///
-/// - Parameters:
-///   - radius: The area of effect (default 300.0).
-///   - scale: The bump height (-1.0 to 1.0, default 0.5).
-public final class PRMBumpDistortionFilter: PRMCameraFilter, @unchecked Sendable {
+public struct PRMBumpDistortionFilter: PRMFilter {
     public let radius: Float
     public let scale: Float
 
@@ -16,7 +11,7 @@ public final class PRMBumpDistortionFilter: PRMCameraFilter, @unchecked Sendable
         self.scale = scale
     }
 
-    public func render(image: CIImage) -> CIImage? {
+    public func render(_ image: CIImage) -> CIImage {
         let center = CIVector(x: image.extent.midX, y: image.extent.midY)
         return image.applyingFilter("CIBumpDistortion", parameters: [
             kCIInputCenterKey: center,
@@ -26,14 +21,9 @@ public final class PRMBumpDistortionFilter: PRMCameraFilter, @unchecked Sendable
     }
 }
 
-// MARK: - PRMTwirlDistortionFilter
+// MARK: - Twirl
 
-/// Applies a twirl distortion using CITwirlDistortion.
-///
-/// - Parameters:
-///   - radius: The area of effect (default 300.0).
-///   - angle: The twirl angle in radians (default π).
-public final class PRMTwirlDistortionFilter: PRMCameraFilter, @unchecked Sendable {
+public struct PRMTwirlDistortionFilter: PRMFilter {
     public let radius: Float
     public let angle: Float
 
@@ -42,7 +32,7 @@ public final class PRMTwirlDistortionFilter: PRMCameraFilter, @unchecked Sendabl
         self.angle = angle
     }
 
-    public func render(image: CIImage) -> CIImage? {
+    public func render(_ image: CIImage) -> CIImage {
         let center = CIVector(x: image.extent.midX, y: image.extent.midY)
         return image.applyingFilter("CITwirlDistortion", parameters: [
             kCIInputCenterKey: center,
@@ -52,14 +42,9 @@ public final class PRMTwirlDistortionFilter: PRMCameraFilter, @unchecked Sendabl
     }
 }
 
-// MARK: - PRMPinchDistortionFilter
+// MARK: - Pinch
 
-/// Applies a pinch distortion using CIPinchDistortion.
-///
-/// - Parameters:
-///   - radius: The area of effect (default 300.0).
-///   - scale: The pinch intensity (0.0 to 1.0, default 0.5).
-public final class PRMPinchDistortionFilter: PRMCameraFilter, @unchecked Sendable {
+public struct PRMPinchDistortionFilter: PRMFilter {
     public let radius: Float
     public let scale: Float
 
@@ -68,7 +53,7 @@ public final class PRMPinchDistortionFilter: PRMCameraFilter, @unchecked Sendabl
         self.scale = scale
     }
 
-    public func render(image: CIImage) -> CIImage? {
+    public func render(_ image: CIImage) -> CIImage {
         let center = CIVector(x: image.extent.midX, y: image.extent.midY)
         return image.applyingFilter("CIPinchDistortion", parameters: [
             kCIInputCenterKey: center,
@@ -78,14 +63,9 @@ public final class PRMPinchDistortionFilter: PRMCameraFilter, @unchecked Sendabl
     }
 }
 
-// MARK: - PRMVortexDistortionFilter
+// MARK: - Vortex
 
-/// Applies a vortex distortion using CIVortexDistortion.
-///
-/// - Parameters:
-///   - radius: The area of effect (default 300.0).
-///   - angle: The vortex angle in radians (default 56.55, ~10 full rotations).
-public final class PRMVortexDistortionFilter: PRMCameraFilter, @unchecked Sendable {
+public struct PRMVortexDistortionFilter: PRMFilter {
     public let radius: Float
     public let angle: Float
 
@@ -94,7 +74,7 @@ public final class PRMVortexDistortionFilter: PRMCameraFilter, @unchecked Sendab
         self.angle = angle
     }
 
-    public func render(image: CIImage) -> CIImage? {
+    public func render(_ image: CIImage) -> CIImage {
         let center = CIVector(x: image.extent.midX, y: image.extent.midY)
         return image.applyingFilter("CIVortexDistortion", parameters: [
             kCIInputCenterKey: center,

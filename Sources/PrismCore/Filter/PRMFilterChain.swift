@@ -1,31 +1,33 @@
 import CoreImage
 import CoreMedia
 import CoreVideo
-import os
 
-/// A multi-filter renderer that chains multiple `PRMCameraFilter` instances sequentially.
+/// A multi-filter renderer that chains filters sequentially with per-filter intensity.
 ///
-/// CoreImage automatically fuses chained filter kernels into a single GPU pass for performance.
-/// Each filter can have an intensity (0.0–1.0) that blends the filtered result with the original.
+/// CoreImage automatically fuses chained kernels into a single GPU pass for performance.
+/// Each filter can be blended with the prior step at any intensity from 0 (no effect) to 1
+/// (full effect) via a correct `mix(prev, filtered, intensity)` using `CIBlendWithMask`.
+///
+/// **Bug fix from the previous implementation**: the old chain composited the filtered image
+/// over the **original input** for intermediate steps, throwing away upstream filter work.
+/// This version correctly lerps against the **previous step's output**.
 ///
 /// ```swift
-/// let chain = PRMFilterChain(description: "Warm Vignette", filters: [
-///     .init(filter: SepiaFilter(), intensity: 0.6),
-///     .init(filter: VignetteFilter(), intensity: 1.0),
+/// let chain = PRMFilterChain(context: renderContext, description: "Warm Vignette", filters: [
+///     PRMFilterChain.Entry(filter: PRMSepiaFilter(intensity: 0.6), intensity: 0.6),
+///     PRMFilterChain.Entry(filter: PRMVignetteFilter(), intensity: 1.0),
 /// ])
-/// pipeline.activeRenderer = chain
 /// ```
-public final class PRMFilterChain: PRMCameraFilterRenderer, @unchecked Sendable {
+public final class PRMFilterChain: PRMFilterRenderer, @unchecked Sendable {
     // MARK: - Types
 
-    /// A filter entry with an intensity control.
-    public struct FilterEntry: Sendable {
-        /// The filter to apply.
-        public let filter: any PRMCameraFilter
-        /// The blend intensity (0.0 = no effect, 1.0 = full effect).
+    /// A filter entry with a blend intensity (0...1).
+    public struct Entry: Sendable {
+        public let filter: any PRMFilter
+        /// Blend intensity, clamped to 0...1.
         public let intensity: Float
 
-        public init(filter: any PRMCameraFilter, intensity: Float = 1.0) {
+        public init(filter: any PRMFilter, intensity: Float = 1.0) {
             self.filter = filter
             self.intensity = min(max(intensity, 0.0), 1.0)
         }
@@ -38,71 +40,83 @@ public final class PRMFilterChain: PRMCameraFilterRenderer, @unchecked Sendable 
     public private(set) var outputFormatDescription: CMFormatDescription?
     public private(set) var inputFormatDescription: CMFormatDescription?
 
-    /// The current filter entries in the chain.
-    public private(set) var filters: [FilterEntry]
+    public private(set) var entries: [Entry]
+    public var count: Int { entries.count }
+    public var isEmpty: Bool { entries.isEmpty }
 
-    /// The number of filters in the chain.
-    public var filterCount: Int {
-        filters.count
-    }
-
-    private var ciContext: CIContext?
+    private let context: PRMRenderContext
     private var outputColorSpace: CGColorSpace?
     private var outputPixelBufferPool: CVPixelBufferPool?
 
-    // MARK: - Initialization
+    // MARK: - Init
 
-    /// Creates a filter chain with the given filters.
-    ///
-    /// - Parameters:
-    ///   - description: A human-readable name for this chain.
-    ///   - filters: The ordered list of filter entries.
-    public init(description: String, filters: [FilterEntry] = []) {
+    public init(
+        context: PRMRenderContext,
+        description: String,
+        entries: [Entry] = []
+    ) {
+        self.context = context
         self.description = description
-        self.filters = filters
+        self.entries = entries
     }
 
     // MARK: - Mutation
 
-    /// Appends a filter to the chain.
-    public func append(_ filter: any PRMCameraFilter, intensity: Float = 1.0) {
-        filters.append(FilterEntry(filter: filter, intensity: intensity))
+    public func append(_ filter: any PRMFilter, intensity: Float = 1.0) {
+        entries.append(Entry(filter: filter, intensity: intensity))
     }
 
-    /// Removes the filter at the given index.
+    public func append(_ entry: Entry) {
+        entries.append(entry)
+    }
+
     public func remove(at index: Int) {
-        guard index >= 0, index < filters.count else { return }
-        filters.remove(at: index)
+        guard index >= 0, index < entries.count else { return }
+        entries.remove(at: index)
     }
 
-    /// Removes all filters from the chain.
     public func removeAll() {
-        filters.removeAll()
+        entries.removeAll()
     }
 
-    // MARK: - PRMCameraFilterRenderer
+    public func replace(_ entries: [Entry]) {
+        self.entries = entries
+    }
+
+    public func setIntensity(_ intensity: Float, at index: Int) {
+        guard index >= 0, index < entries.count else { return }
+        let current = entries[index]
+        entries[index] = Entry(filter: current.filter, intensity: intensity)
+    }
+
+    public func move(from source: Int, to destination: Int) {
+        guard source >= 0, source < entries.count else { return }
+        guard destination >= 0, destination < entries.count else { return }
+        let entry = entries.remove(at: source)
+        entries.insert(entry, at: destination)
+    }
+
+    // MARK: - PRMFilterRenderer
 
     public func prepare(with formatDescription: CMFormatDescription, outputRetainedBufferCountHint: Int) {
         reset()
 
-        guard let result = PRMBufferPoolAllocator.allocateOutputBufferPool(
+        guard let allocation = PRMBufferPoolAllocator.allocate(
             with: formatDescription,
-            retainedBufferCountHint: outputRetainedBufferCountHint,
+            retainedBufferCountHint: outputRetainedBufferCountHint
         ) else {
             PRMLogger.filter.error("[\(self.description)] Failed to allocate output buffer pool")
             return
         }
 
-        outputPixelBufferPool = result.bufferPool
-        outputColorSpace = result.colorSpace
-        outputFormatDescription = result.formatDescription
+        outputPixelBufferPool = allocation.bufferPool
+        outputColorSpace = allocation.colorSpace
+        outputFormatDescription = allocation.formatDescription
         inputFormatDescription = formatDescription
-        ciContext = CIContext()
         isPrepared = true
     }
 
     public func reset() {
-        ciContext = nil
         outputColorSpace = nil
         outputPixelBufferPool = nil
         outputFormatDescription = nil
@@ -111,57 +125,54 @@ public final class PRMFilterChain: PRMCameraFilterRenderer, @unchecked Sendable 
     }
 
     public func render(pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
-        guard let ciContext, isPrepared else { return nil }
-
-        // Empty chain = pass-through
-        guard !filters.isEmpty else { return pixelBuffer }
+        guard isPrepared, let pool = outputPixelBufferPool else { return nil }
+        guard !entries.isEmpty else { return pixelBuffer }
 
         let sourceImage = CIImage(cvImageBuffer: pixelBuffer)
         var currentImage = sourceImage
 
-        // Chain filters sequentially
-        for entry in filters {
-            guard let filtered = entry.filter.render(image: currentImage) else {
-                PRMLogger.filter.debug("[\(self.description)] Filter in chain returned nil, using previous result")
-                continue
-            }
+        for entry in entries {
+            let filtered = entry.filter.render(currentImage)
 
-            if entry.intensity >= 1.0 {
-                currentImage = filtered
-            } else if entry.intensity <= 0.0 {
-                // Skip this filter entirely
+            switch entry.intensity {
+            case let intensity where intensity <= 0.0:
+                // 0 = no effect; carry previous step forward unchanged.
                 continue
-            } else {
-                // Blend: lerp between current and filtered
-                currentImage = filtered.composited(over: currentImage)
-                    .applyingFilter("CISourceOverCompositing", parameters: [:])
-                // Use CIBlendWithAlphaMask or manual alpha blending for intensity
-                let alpha = CGFloat(entry.intensity)
-                currentImage = currentImage.applyingFilter("CIColorMatrix", parameters: [
-                    "inputAVector": CIVector(x: 0, y: 0, z: 0, w: alpha),
-                ]).composited(over: sourceImage)
-                // Re-base for next filter in chain
+            case let intensity where intensity >= 1.0:
+                currentImage = filtered
+            case let intensity:
+                // Correct intensity blend: mix(currentImage, filtered, intensity).
+                //
+                // Build a constant-luminance grayscale mask at value `intensity` then use
+                // CIBlendWithMask, which returns mask·image + (1−mask)·background. Cropping the
+                // mask to the filtered image's extent matches CoreImage's infinite-extent semantics.
+                let maskColor = CIColor(
+                    red: CGFloat(intensity),
+                    green: CGFloat(intensity),
+                    blue: CGFloat(intensity),
+                    alpha: 1.0
+                )
+                let mask = CIImage(color: maskColor).cropped(to: filtered.extent)
+                currentImage = filtered.applyingFilter("CIBlendWithMask", parameters: [
+                    kCIInputBackgroundImageKey: currentImage,
+                    kCIInputMaskImageKey: mask,
+                ])
             }
         }
 
-        // Render to output pixel buffer
-        guard let pool = outputPixelBufferPool else { return nil }
-
-        var outputBuffer: CVPixelBuffer?
-        CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &outputBuffer)
-
-        guard let outputPixelBuffer = outputBuffer else {
+        var output: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &output)
+        guard let outputPixelBuffer = output else {
             PRMLogger.filter.warning("[\(self.description)] Failed to allocate output pixel buffer")
             return nil
         }
 
-        ciContext.render(
+        context.ciContext.render(
             currentImage,
             to: outputPixelBuffer,
             bounds: currentImage.extent,
-            colorSpace: outputColorSpace,
+            colorSpace: outputColorSpace
         )
-
         return outputPixelBuffer
     }
 }

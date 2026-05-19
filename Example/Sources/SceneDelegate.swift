@@ -6,13 +6,16 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     func scene(
         _ scene: UIScene,
         willConnectTo session: UISceneSession,
-        options connectionOptions: UIScene.ConnectionOptions,
+        options connectionOptions: UIScene.ConnectionOptions
     ) {
         guard let windowScene = scene as? UIWindowScene else { return }
         let window = UIWindow(windowScene: windowScene)
-        let nav = UINavigationController(rootViewController: ExampleViewController())
+        let root = RootCatalogViewController()
+        let nav = UINavigationController(rootViewController: root)
         nav.navigationBar.prefersLargeTitles = true
+        nav.overrideUserInterfaceStyle = .dark
         window.rootViewController = nav
+        window.overrideUserInterfaceStyle = .dark
         window.makeKeyAndVisible()
         self.window = window
     }

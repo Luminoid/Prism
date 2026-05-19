@@ -15,7 +15,7 @@
     /// cameraView.addSubview(level)
     /// level.isActive = true  // Starts motion updates
     /// ```
-    public class PRMLevelIndicatorView: UIView {
+    public final class PRMLevelIndicatorView: UIView {
         // MARK: - Configuration
 
         /// The default line color when the device is tilted.
@@ -71,7 +71,15 @@
         /// `nonisolated(unsafe)` to allow access from nonisolated `deinit`.
         /// Safe because CMMotionManager is only started/stopped on MainActor
         /// except for the final stop in deinit (which runs after all other references are gone).
-        private nonisolated(unsafe) let motionManager = CMMotionManager()
+        ///
+        /// Injectable so a host app can pass its own shared instance — Apple documents that a
+        /// single CMMotionManager per process is preferred. The default `CMMotionManager()` is
+        /// the convenient choice for apps that only show one level indicator at a time.
+        private nonisolated(unsafe) let motionManager: CMMotionManager
+        /// Whether this view owns the motion manager — if `false`, `deinit` won't stop it,
+        /// leaving other consumers (or another `PRMLevelIndicatorView` sharing the same
+        /// manager) unaffected. `nonisolated` because `deinit` is nonisolated.
+        private nonisolated let ownsMotionManager: Bool
         private let motionQueue = OperationQueue()
         /// Tracks previous level state to avoid redundant color/accessibility updates.
         private var wasLevel: Bool = false
@@ -82,7 +90,26 @@
 
         // MARK: - Initialization
 
-        public init() {
+        /// Creates a level indicator with its own internal `CMMotionManager`.
+        ///
+        /// For apps that already manage a shared `CMMotionManager` (or that show multiple
+        /// motion-driven UI elements), use ``init(motionManager:)`` to inject the shared
+        /// instance — Apple recommends one CMMotionManager per process.
+        public convenience init() {
+            self.init(motionManager: CMMotionManager(), ownsMotionManager: true)
+        }
+
+        /// Creates a level indicator that shares the given `CMMotionManager`.
+        ///
+        /// The view will not stop motion updates on deinit — the manager's lifecycle stays
+        /// with the caller.
+        public convenience init(motionManager: CMMotionManager) {
+            self.init(motionManager: motionManager, ownsMotionManager: false)
+        }
+
+        private init(motionManager: CMMotionManager, ownsMotionManager: Bool) {
+            self.motionManager = motionManager
+            self.ownsMotionManager = ownsMotionManager
             super.init(frame: .zero)
             setup()
         }
@@ -93,7 +120,9 @@
         }
 
         deinit {
-            motionManager.stopDeviceMotionUpdates()
+            if ownsMotionManager {
+                motionManager.stopDeviceMotionUpdates()
+            }
         }
 
         private func setup() {

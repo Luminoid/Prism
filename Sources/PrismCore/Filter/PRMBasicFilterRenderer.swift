@@ -1,66 +1,64 @@
 import CoreImage
 import CoreMedia
 import CoreVideo
-import os
 
-/// A composition-based filter renderer that bridges `PRMCameraFilter` to `PRMCameraFilterRenderer`.
+/// A composition-based renderer that wraps a single ``PRMFilter`` for live video.
 ///
-/// Instead of subclassing (AnimalVision's old pattern), create renderers with a factory closure:
+/// Shares the provided ``PRMRenderContext`` (so one Metal-backed `CIContext` covers the
+/// whole pipeline). Allocates its own pixel-buffer pool sized to the input format.
+///
 /// ```swift
-/// let grayscale = PRMBasicFilterRenderer(description: "Grayscale") { GrayscaleFilter() }
+/// let renderer = PRMBasicFilterRenderer(
+///     context: renderContext,
+///     description: "Sepia"
+/// ) { PRMSepiaFilter(intensity: 0.8) }
 /// ```
-///
-/// This eliminates all per-filter renderer subclasses — each becomes a one-liner in the consuming app.
-public final class PRMBasicFilterRenderer: PRMCameraFilterRenderer, @unchecked Sendable {
-    // MARK: - Properties
-
+public final class PRMBasicFilterRenderer: PRMFilterRenderer, @unchecked Sendable {
     public let description: String
     public private(set) var isPrepared = false
     public private(set) var outputFormatDescription: CMFormatDescription?
     public private(set) var inputFormatDescription: CMFormatDescription?
 
-    private let filterFactory: @Sendable () -> any PRMCameraFilter
-    private var filter: (any PRMCameraFilter)?
-    private var ciContext: CIContext?
+    private let context: PRMRenderContext
+    private let filterFactory: @Sendable () -> any PRMFilter
+    private var filter: (any PRMFilter)?
     private var outputColorSpace: CGColorSpace?
     private var outputPixelBufferPool: CVPixelBufferPool?
 
-    // MARK: - Initialization
-
-    /// Creates a new renderer with a factory closure that produces the filter.
-    ///
     /// - Parameters:
-    ///   - description: A human-readable name for this renderer.
-    ///   - filterFactory: A closure that creates a fresh `PRMCameraFilter` instance.
-    public init(description: String, filterFactory: @escaping @Sendable () -> any PRMCameraFilter) {
+    ///   - context: Shared Metal-backed CIContext.
+    ///   - description: Display name for this renderer.
+    ///   - filterFactory: Creates a fresh `PRMFilter` instance when the renderer is prepared.
+    public init(
+        context: PRMRenderContext,
+        description: String,
+        filterFactory: @escaping @Sendable () -> any PRMFilter
+    ) {
+        self.context = context
         self.description = description
         self.filterFactory = filterFactory
     }
 
-    // MARK: - PRMCameraFilterRenderer
-
     public func prepare(with formatDescription: CMFormatDescription, outputRetainedBufferCountHint: Int) {
         reset()
 
-        guard let result = PRMBufferPoolAllocator.allocateOutputBufferPool(
+        guard let allocation = PRMBufferPoolAllocator.allocate(
             with: formatDescription,
-            retainedBufferCountHint: outputRetainedBufferCountHint,
+            retainedBufferCountHint: outputRetainedBufferCountHint
         ) else {
             PRMLogger.filter.error("[\(self.description)] Failed to allocate output buffer pool")
             return
         }
 
-        outputPixelBufferPool = result.bufferPool
-        outputColorSpace = result.colorSpace
-        outputFormatDescription = result.formatDescription
+        outputPixelBufferPool = allocation.bufferPool
+        outputColorSpace = allocation.colorSpace
+        outputFormatDescription = allocation.formatDescription
         inputFormatDescription = formatDescription
-        ciContext = CIContext()
         filter = filterFactory()
         isPrepared = true
     }
 
     public func reset() {
-        ciContext = nil
         filter = nil
         outputColorSpace = nil
         outputPixelBufferPool = nil
@@ -70,34 +68,24 @@ public final class PRMBasicFilterRenderer: PRMCameraFilterRenderer, @unchecked S
     }
 
     public func render(pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
-        guard let ciContext, let filter, isPrepared else {
-            return nil
-        }
+        guard isPrepared, let filter, let pool = outputPixelBufferPool else { return nil }
 
         let sourceImage = CIImage(cvImageBuffer: pixelBuffer)
+        let filtered = filter.render(sourceImage)
 
-        guard let filteredImage = filter.render(image: sourceImage) else {
-            PRMLogger.filter.warning("[\(self.description)] Filter failed to render image")
-            return nil
-        }
-
-        guard let pool = outputPixelBufferPool else { return nil }
-
-        var outputBuffer: CVPixelBuffer?
-        CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &outputBuffer)
-
-        guard let outputPixelBuffer = outputBuffer else {
+        var output: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &output)
+        guard let outputPixelBuffer = output else {
             PRMLogger.filter.warning("[\(self.description)] Failed to allocate output pixel buffer")
             return nil
         }
 
-        ciContext.render(
-            filteredImage,
+        context.ciContext.render(
+            filtered,
             to: outputPixelBuffer,
-            bounds: filteredImage.extent,
-            colorSpace: outputColorSpace,
+            bounds: filtered.extent,
+            colorSpace: outputColorSpace
         )
-
         return outputPixelBuffer
     }
 }

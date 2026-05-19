@@ -1,0 +1,67 @@
+import AVFoundation
+
+/// Errors thrown by the camera session pipeline.
+public enum PRMSessionError: Error, Sendable, Equatable {
+    /// The user has not granted camera access.
+    case notAuthorized
+
+    /// No video device is available for the requested camera position.
+    case noVideoDevice(AVCaptureDevice.Position)
+
+    /// Could not create an input from the discovered device.
+    case cannotCreateDeviceInput(String)
+
+    /// `AVCaptureSession.canAddInput`/`canAddOutput` returned `false`.
+    case cannotAttachToSession(String)
+
+    /// Session emitted a runtime error notification.
+    case runtime(AVError)
+
+    /// Photo capture failed before delivering a final photo.
+    case photoCaptureFailed(String)
+
+    /// Video recording failed.
+    case videoRecordingFailed(String)
+
+    /// Operation cancelled (e.g., async task was cancelled mid-capture).
+    case cancelled
+
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        switch (lhs, rhs) {
+        case (.notAuthorized, .notAuthorized): true
+        case (.cancelled, .cancelled): true
+        case let (.noVideoDevice(a), .noVideoDevice(b)): a == b
+        case let (.cannotCreateDeviceInput(a), .cannotCreateDeviceInput(b)): a == b
+        case let (.cannotAttachToSession(a), .cannotAttachToSession(b)): a == b
+        case let (.runtime(a), .runtime(b)): a.code == b.code
+        case let (.photoCaptureFailed(a), .photoCaptureFailed(b)): a == b
+        case let (.videoRecordingFailed(a), .videoRecordingFailed(b)): a == b
+        default: false
+        }
+    }
+}
+
+// MARK: - LocalizedError
+
+extension PRMSessionError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .notAuthorized:
+            "Camera access has not been granted."
+        case let .noVideoDevice(position):
+            "No video device available for camera position \(position.rawValue)."
+        case let .cannotCreateDeviceInput(reason):
+            "Cannot create video input: \(reason)"
+        case let .cannotAttachToSession(reason):
+            "Cannot attach to capture session: \(reason)"
+        case let .runtime(error):
+            "Capture session runtime error: \(error.localizedDescription)"
+        case let .photoCaptureFailed(reason):
+            "Photo capture failed: \(reason)"
+        case let .videoRecordingFailed(reason):
+            "Video recording failed: \(reason)"
+        case .cancelled:
+            "Operation cancelled."
+        }
+    }
+}

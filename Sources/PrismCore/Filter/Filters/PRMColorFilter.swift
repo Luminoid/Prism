@@ -1,69 +1,108 @@
 import CoreImage
 
-// MARK: - PRMBrightnessFilter
+// MARK: - Brightness
 
-/// Adjusts image brightness using CIColorControls.
-///
-/// - Parameter value: Brightness adjustment (-1.0 to 1.0, default 0.0).
-public final class PRMBrightnessFilter: PRMCameraFilter, @unchecked Sendable {
+/// Adjusts image brightness via CIColorControls.
+public struct PRMBrightnessFilter: PRMFilter {
     public let value: Float
 
     public init(value: Float = 0.0) {
         self.value = value
     }
 
-    public func render(image: CIImage) -> CIImage? {
+    public func render(_ image: CIImage) -> CIImage {
         image.applyingFilter("CIColorControls", parameters: [kCIInputBrightnessKey: value])
     }
 }
 
-// MARK: - PRMContrastFilter
+// MARK: - Contrast
 
-/// Adjusts image contrast using CIColorControls.
-///
-/// - Parameter value: Contrast multiplier (0.0 to 4.0, default 1.0).
-public final class PRMContrastFilter: PRMCameraFilter, @unchecked Sendable {
+/// Adjusts image contrast via CIColorControls.
+public struct PRMContrastFilter: PRMFilter {
     public let value: Float
 
     public init(value: Float = 1.0) {
         self.value = value
     }
 
-    public func render(image: CIImage) -> CIImage? {
+    public func render(_ image: CIImage) -> CIImage {
         image.applyingFilter("CIColorControls", parameters: [kCIInputContrastKey: value])
     }
 }
 
-// MARK: - PRMSaturationFilter
+// MARK: - Saturation
 
-/// Adjusts image color saturation using CIColorControls.
-///
-/// - Parameter value: Saturation multiplier (0.0 = grayscale, 1.0 = original, 2.0+ = oversaturated).
-public final class PRMSaturationFilter: PRMCameraFilter, @unchecked Sendable {
+/// Adjusts image saturation via CIColorControls.
+public struct PRMSaturationFilter: PRMFilter {
     public let value: Float
 
     public init(value: Float = 1.0) {
         self.value = value
     }
 
-    public func render(image: CIImage) -> CIImage? {
+    public func render(_ image: CIImage) -> CIImage {
         image.applyingFilter("CIColorControls", parameters: [kCIInputSaturationKey: value])
     }
 }
 
-// MARK: - PRMHueRotationFilter
+// MARK: - Hue Rotation
 
-/// Rotates image hue using CIHueAdjust.
-///
-/// - Parameter angle: Hue rotation in radians.
-public final class PRMHueRotationFilter: PRMCameraFilter, @unchecked Sendable {
+/// Rotates image hue via CIHueAdjust.
+public struct PRMHueRotationFilter: PRMFilter {
+    /// Rotation in radians.
     public let angle: Float
 
     public init(angle: Float = 0.0) {
         self.angle = angle
     }
 
-    public func render(image: CIImage) -> CIImage? {
+    public func render(_ image: CIImage) -> CIImage {
         image.applyingFilter("CIHueAdjust", parameters: [kCIInputAngleKey: angle])
+    }
+}
+
+// MARK: - Grayscale
+
+/// Desaturates the image (CIColorControls with saturation = 0).
+public struct PRMGrayscaleFilter: PRMFilter {
+    public init() {}
+
+    public func render(_ image: CIImage) -> CIImage {
+        image.applyingFilter("CIColorControls", parameters: [kCIInputSaturationKey: 0])
+    }
+}
+
+// MARK: - Sepia
+
+/// Applies a sepia tone via CISepiaTone.
+public struct PRMSepiaFilter: PRMFilter {
+    public let intensity: Float
+
+    public init(intensity: Float = 0.8) {
+        self.intensity = intensity
+    }
+
+    public func render(_ image: CIImage) -> CIImage {
+        image.applyingFilter("CISepiaTone", parameters: [kCIInputIntensityKey: intensity])
+    }
+}
+
+// MARK: - Vignette
+
+/// Darkens the edges of the frame via CIVignette.
+public struct PRMVignetteFilter: PRMFilter {
+    public let intensity: Float
+    public let radius: Float
+
+    public init(intensity: Float = 1.5, radius: Float = 2.0) {
+        self.intensity = intensity
+        self.radius = radius
+    }
+
+    public func render(_ image: CIImage) -> CIImage {
+        image.applyingFilter("CIVignette", parameters: [
+            kCIInputIntensityKey: intensity,
+            kCIInputRadiusKey: radius,
+        ])
     }
 }

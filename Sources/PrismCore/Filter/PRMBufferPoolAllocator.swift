@@ -1,169 +1,143 @@
 import CoreMedia
 import CoreVideo
-import os
 
-/// Allocates and manages `CVPixelBufferPool` instances for the filter pipeline.
-///
-/// Extracted from AnimalVision's free-function approach into static methods
-/// for better namespacing and discoverability.
+/// Allocates `CVPixelBufferPool` instances for the filter pipeline.
 public enum PRMBufferPoolAllocator: Sendable {
-    /// The result of a successful buffer pool allocation.
-    public struct AllocationResult: @unchecked Sendable {
-        /// The allocated pixel buffer pool.
+    /// Result of a successful pool allocation.
+    public struct Allocation: @unchecked Sendable {
         public let bufferPool: CVPixelBufferPool
-        /// The color space derived from the input format.
         public let colorSpace: CGColorSpace
-        /// The format description of buffers created by this pool.
         public let formatDescription: CMFormatDescription
     }
 
-    /// Allocates an output buffer pool matching the given input format.
-    ///
-    /// - Parameters:
-    ///   - inputFormatDescription: The format of incoming pixel buffers (must be 32BGRA).
-    ///   - retainedBufferCountHint: The minimum number of buffers to keep in the pool.
-    /// - Returns: An `AllocationResult`, or `nil` if allocation fails.
-    public static func allocateOutputBufferPool(
+    /// Allocates an output pool matching the given input format (must be 32BGRA).
+    public static func allocate(
         with inputFormatDescription: CMFormatDescription,
-        retainedBufferCountHint: Int,
-    ) -> AllocationResult? {
-        let inputMediaSubType = CMFormatDescriptionGetMediaSubType(inputFormatDescription)
-        guard inputMediaSubType == kCVPixelFormatType_32BGRA else {
-            PRMLogger.filter.error("Invalid input pixel buffer type: \(inputMediaSubType)")
+        retainedBufferCountHint: Int
+    ) -> Allocation? {
+        let mediaSubType = CMFormatDescriptionGetMediaSubType(inputFormatDescription)
+        guard mediaSubType == kCVPixelFormatType_32BGRA else {
+            PRMLogger.filter.error("Invalid input pixel buffer type: \(mediaSubType)")
             return nil
         }
 
-        let inputDimensions = CMVideoFormatDescriptionGetDimensions(inputFormatDescription)
+        let dimensions = CMVideoFormatDescriptionGetDimensions(inputFormatDescription)
         var pixelBufferAttributes: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: UInt(inputMediaSubType),
-            kCVPixelBufferWidthKey as String: Int(inputDimensions.width),
-            kCVPixelBufferHeightKey as String: Int(inputDimensions.height),
+            kCVPixelBufferPixelFormatTypeKey as String: UInt(mediaSubType),
+            kCVPixelBufferWidthKey as String: Int(dimensions.width),
+            kCVPixelBufferHeightKey as String: Int(dimensions.height),
             kCVPixelBufferIOSurfacePropertiesKey as String: [:] as [String: Any],
         ]
 
-        // Extract color space from input format description
-        let cgColorSpace = extractColorSpace(
+        let colorSpace = extractColorSpace(
             from: inputFormatDescription,
-            pixelBufferAttributes: &pixelBufferAttributes,
+            pixelBufferAttributes: &pixelBufferAttributes
         )
 
-        // Create the pool
-        let poolAttributes = [kCVPixelBufferPoolMinimumBufferCountKey as String: retainedBufferCountHint]
-        var cvPixelBufferPool: CVPixelBufferPool?
+        let poolAttributes = [
+            kCVPixelBufferPoolMinimumBufferCountKey as String: retainedBufferCountHint,
+        ]
+        var pool: CVPixelBufferPool?
         CVPixelBufferPoolCreate(
             kCFAllocatorDefault,
             poolAttributes as NSDictionary?,
             pixelBufferAttributes as NSDictionary?,
-            &cvPixelBufferPool,
+            &pool
         )
 
-        guard let pixelBufferPool = cvPixelBufferPool else {
+        guard let pool else {
             PRMLogger.filter.error("Failed to create pixel buffer pool")
             return nil
         }
 
-        preallocateBuffers(pool: pixelBufferPool, allocationThreshold: retainedBufferCountHint)
+        preallocate(pool: pool, threshold: retainedBufferCountHint)
 
-        // Derive output format description from the pool
-        guard let outputFormatDescription = outputFormatDescription(
-            from: pixelBufferPool,
-            retainedBufferCountHint: retainedBufferCountHint,
-        ) else {
+        guard let outputFormat = deriveFormat(from: pool, threshold: retainedBufferCountHint) else {
             PRMLogger.filter.error("Failed to derive output format description")
             return nil
         }
 
-        return AllocationResult(
-            bufferPool: pixelBufferPool,
-            colorSpace: cgColorSpace,
-            formatDescription: outputFormatDescription,
-        )
+        return Allocation(bufferPool: pool, colorSpace: colorSpace, formatDescription: outputFormat)
     }
 
     // MARK: - Private
 
     private static func extractColorSpace(
         from formatDescription: CMFormatDescription,
-        pixelBufferAttributes: inout [String: Any],
+        pixelBufferAttributes: inout [String: Any]
     ) -> CGColorSpace {
-        var cgColorSpace = CGColorSpaceCreateDeviceRGB()
+        var colorSpace = CGColorSpaceCreateDeviceRGB()
 
-        guard let extensions = CMFormatDescriptionGetExtensions(formatDescription) as Dictionary? else {
-            return cgColorSpace
-        }
+        guard let extensions = CMFormatDescriptionGetExtensions(formatDescription) as Dictionary?
+        else { return colorSpace }
 
         let colorPrimaries = extensions[kCVImageBufferColorPrimariesKey]
-
         if let colorPrimaries {
-            var colorSpaceProperties: [String: AnyObject] = [
+            var properties: [String: AnyObject] = [
                 kCVImageBufferColorPrimariesKey as String: colorPrimaries,
             ]
-            if let yCbCrMatrix = extensions[kCVImageBufferYCbCrMatrixKey] {
-                colorSpaceProperties[kCVImageBufferYCbCrMatrixKey as String] = yCbCrMatrix
+            if let ycbcr = extensions[kCVImageBufferYCbCrMatrixKey] {
+                properties[kCVImageBufferYCbCrMatrixKey as String] = ycbcr
             }
-            if let transferFunction = extensions[kCVImageBufferTransferFunctionKey] {
-                colorSpaceProperties[kCVImageBufferTransferFunctionKey as String] = transferFunction
+            if let transferFn = extensions[kCVImageBufferTransferFunctionKey] {
+                properties[kCVImageBufferTransferFunctionKey as String] = transferFn
             }
-            pixelBufferAttributes[kCVBufferPropagatedAttachmentsKey as String] = colorSpaceProperties
+            pixelBufferAttributes[kCVBufferPropagatedAttachmentsKey as String] = properties
         }
 
-        if let cvColorspace = extensions[kCVImageBufferCGColorSpaceKey] {
-            // CGColorSpace is a CFType; bridge via CFTypeRef
-            cgColorSpace = (cvColorspace as! CGColorSpace)  // swiftlint:disable:this force_cast
+        // CoreVideo stores the color space as a CGColorSpace CFType under this key. Swift
+        // bridges CGColorSpace via `as` unconditionally (the cast always succeeds because the
+        // CF bridge is checked at runtime, hence the compiler's "downcast to CoreFoundation
+        // type will always succeed" warning). We still guard with `CFGetTypeID` so a malformed
+        // format description (wrong CFType under this key) falls through to deviceRGB instead
+        // of crashing somewhere downstream when the wrong type is used as a color space.
+        if let cvColorSpace = extensions[kCVImageBufferCGColorSpaceKey] {
+            if CFGetTypeID(cvColorSpace as CFTypeRef) == CGColorSpace.typeID {
+                colorSpace = cvColorSpace as! CGColorSpace // swiftlint:disable:this force_cast
+            } else {
+                PRMLogger.filter.error(
+                    "kCVImageBufferCGColorSpaceKey present but is not a CGColorSpace (typeID mismatch); falling back to deviceRGB"
+                )
+            }
         } else if (colorPrimaries as? String) == (kCVImageBufferColorPrimaries_P3_D65 as String),
                   let displayP3 = CGColorSpace(name: CGColorSpace.displayP3) {
-            cgColorSpace = displayP3
+            colorSpace = displayP3
         }
 
-        return cgColorSpace
+        return colorSpace
     }
 
-    private static func preallocateBuffers(pool: CVPixelBufferPool, allocationThreshold: Int) {
-        var pixelBuffers: [CVPixelBuffer] = []
-        let auxAttributes = [
-            kCVPixelBufferPoolAllocationThresholdKey as String: allocationThreshold,
-        ] as NSDictionary
+    private static func preallocate(pool: CVPixelBufferPool, threshold: Int) {
+        var buffers: [CVPixelBuffer] = []
+        let aux = [kCVPixelBufferPoolAllocationThresholdKey as String: threshold] as NSDictionary
 
-        var error: CVReturn = kCVReturnSuccess
-        while error == kCVReturnSuccess {
-            var pixelBuffer: CVPixelBuffer?
-            error = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
-                kCFAllocatorDefault,
-                pool,
-                auxAttributes,
-                &pixelBuffer,
+        var result: CVReturn = kCVReturnSuccess
+        while result == kCVReturnSuccess {
+            var buffer: CVPixelBuffer?
+            result = CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
+                kCFAllocatorDefault, pool, aux, &buffer
             )
-            if let pixelBuffer {
-                pixelBuffers.append(pixelBuffer)
-            }
+            if let buffer { buffers.append(buffer) }
         }
-        pixelBuffers.removeAll()
+        buffers.removeAll()
     }
 
-    private static func outputFormatDescription(
+    private static func deriveFormat(
         from pool: CVPixelBufferPool,
-        retainedBufferCountHint: Int,
+        threshold: Int
     ) -> CMFormatDescription? {
-        let auxAttributes = [
-            kCVPixelBufferPoolAllocationThresholdKey as String: retainedBufferCountHint,
-        ] as NSDictionary
-
-        var pixelBuffer: CVPixelBuffer?
+        let aux = [kCVPixelBufferPoolAllocationThresholdKey as String: threshold] as NSDictionary
+        var buffer: CVPixelBuffer?
         CVPixelBufferPoolCreatePixelBufferWithAuxAttributes(
-            kCFAllocatorDefault,
-            pool,
-            auxAttributes,
-            &pixelBuffer,
+            kCFAllocatorDefault, pool, aux, &buffer
         )
-
-        guard let pixelBuffer else { return nil }
-
-        var formatDescription: CMFormatDescription?
+        guard let buffer else { return nil }
+        var format: CMFormatDescription?
         CMVideoFormatDescriptionCreateForImageBuffer(
             allocator: kCFAllocatorDefault,
-            imageBuffer: pixelBuffer,
-            formatDescriptionOut: &formatDescription,
+            imageBuffer: buffer,
+            formatDescriptionOut: &format
         )
-        return formatDescription
+        return format
     }
 }
