@@ -1,6 +1,5 @@
 #if canImport(UIKit) && canImport(CoreMotion)
     import CoreMotion
-    import SnapKit
     import UIKit
 
     // MARK: - PRMLevelIndicatorView
@@ -13,8 +12,16 @@
     /// ```swift
     /// let level = PRMLevelIndicatorView()
     /// cameraView.addSubview(level)
+    /// level.snp.makeConstraints { make in
+    ///     make.center.equalToSuperview()
+    ///     make.width.height.equalTo(140)
+    /// }
     /// level.isActive = true  // Starts motion updates
     /// ```
+    ///
+    /// The view does not install its own size or position constraints — the caller is
+    /// responsible. The line is drawn centered in `bounds` and scales with
+    /// `lineLengthRatio`, so any square (or rectangular) frame works.
     public final class PRMLevelIndicatorView: UIView {
         // MARK: - Configuration
 
@@ -59,7 +66,7 @@
             }
         }
 
-        /// The current roll angle in degrees (read-only).
+        /// The current roll angle in degrees (read-only). Range is `(-180, 180]`.
         public private(set) var currentRollDegrees: Double = 0
 
         /// Whether the device is currently within the level threshold (read-only).
@@ -146,16 +153,6 @@
 
         // MARK: - Layout
 
-        override public func didMoveToSuperview() {
-            super.didMoveToSuperview()
-            guard superview != nil else { return }
-            snp.makeConstraints { make in
-                make.center.equalToSuperview()
-                make.width.equalToSuperview()
-                make.height.equalTo(snp.width)
-            }
-        }
-
         override public func layoutSubviews() {
             super.layoutSubviews()
             // Use bounds + position instead of frame — setting frame on a
@@ -179,8 +176,8 @@
                     guard let motion else { return }
                     // Use gravity vector instead of attitude.roll — Euler angles
                     // suffer from gimbal lock near vertical, causing wild values.
-                    // atan2(gx, -gy) projects gravity onto the screen plane and
-                    // returns 0 when level, regardless of device pitch.
+                    // atan2(-gx, -gy) projects gravity onto the screen plane and
+                    // returns 0 when level in portrait, ±π/2 in landscape, ±π upside-down.
                     let gx = motion.gravity.x
                     let gy = motion.gravity.y
                     let rawRollRadians = atan2(-gx, -gy)
@@ -195,17 +192,29 @@
                         let rollDegrees = self.filteredRollRadians * 180.0 / .pi
                         self.currentRollDegrees = rollDegrees
 
+                        // Highlight whenever the device is near any cardinal orientation
+                        // (portrait, landscape-left, landscape-right, upside-down). Deviation
+                        // from the nearest 90° multiple is wrapped to (-45°, 45°].
+                        var deviationRadians = self.filteredRollRadians
+                            .truncatingRemainder(dividingBy: .pi / 2)
+                        if deviationRadians > .pi / 4 { deviationRadians -= .pi / 2 }
+                        if deviationRadians < -.pi / 4 { deviationRadians += .pi / 2 }
+                        let absDeviationDegrees = abs(deviationRadians) * 180.0 / .pi
+
                         // Hysteresis: harder to exit level state than to enter it.
-                        let absDegrees = abs(rollDegrees)
                         let leveled = if self.isLevel {
-                            absDegrees <= self.levelThreshold + self.hysteresisMargin
+                            absDeviationDegrees <= self.levelThreshold + self.hysteresisMargin
                         } else {
-                            absDegrees <= self.levelThreshold
+                            absDeviationDegrees <= self.levelThreshold
                         }
                         self.isLevel = leveled
 
-                        // Snap-to-zero: show perfectly level when within threshold.
-                        let displayRadians = leveled ? 0 : self.filteredRollRadians
+                        // Snap-to-cardinal: when leveled, subtract the residual deviation so
+                        // the line aligns with the nearest 90° multiple (perfectly horizontal
+                        // in portrait/upside-down, perfectly vertical in landscape).
+                        let displayRadians = leveled
+                            ? self.filteredRollRadians - deviationRadians
+                            : self.filteredRollRadians
                         self.applyRotation(radians: displayRadians)
 
                         // Only update color and accessibility on state transitions.

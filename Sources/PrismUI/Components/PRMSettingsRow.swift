@@ -55,7 +55,7 @@
             symbolName: String,
             title: String,
             valueText: String? = nil,
-            isExpanded: Bool = false,
+            isExpanded: Bool = true,
             content: UIView
         ) {
             self.symbolName = symbolName
@@ -137,7 +137,7 @@
             }
             contentContainer.addSubview(contentView)
             contentView.snp.makeConstraints {
-                $0.leading.equalToSuperview().offset(44)
+                $0.leading.equalToSuperview().offset(12)
                 $0.trailing.equalToSuperview().offset(-12)
                 $0.top.equalToSuperview().offset(2)
                 $0.bottom.equalToSuperview().offset(-10)

@@ -5,17 +5,28 @@ import UIKit
 @MainActor
 struct PRMSettingsRowTests {
     @Test
-    func `Initial state is collapsed`() {
+    func `Initial state is expanded by default`() {
         let row = PRMSettingsRow(
             symbolName: "gear",
             title: "Gear",
             valueText: "off",
             content: UIView()
         )
-        #expect(row.isExpanded == false)
+        #expect(row.isExpanded == true)
         #expect(row.title == "Gear")
         #expect(row.valueText == "off")
         #expect(row.symbolName == "gear")
+    }
+
+    @Test
+    func `Caller can opt into collapsed state`() {
+        let row = PRMSettingsRow(
+            symbolName: "gear",
+            title: "Gear",
+            isExpanded: false,
+            content: UIView()
+        )
+        #expect(row.isExpanded == false)
     }
 
     @Test

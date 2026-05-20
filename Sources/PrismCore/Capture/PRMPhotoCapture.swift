@@ -119,29 +119,27 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
 
     /// Captures a burst of `count` photos in rapid succession. Returns when every photo
     /// finishes. Use sparingly — large bursts hold many AVCapturePhotos in memory.
+    ///
+    /// Captures are issued sequentially: `AVCapturePhotoOutput` does not support
+    /// concurrent `capturePhoto(with:delegate:)` calls and throws `NSInvalidArgumentException`
+    /// ("Settings may not be re-used") when two captures overlap. Enable
+    /// `PRMCameraConfiguration.enableResponsiveCapture` to minimize per-shot latency.
     public func captureBurst(
         count: Int,
         settings: PRMPhotoSettings = PRMPhotoSettings(),
         willCapture: (@Sendable () -> Void)? = nil
     ) async throws -> [PRMPhoto] {
         guard count > 0 else { return [] }
-        return try await withThrowingTaskGroup(of: (Int, PRMPhoto).self) { group in
-            for index in 0 ..< count {
-                group.addTask {
-                    let photo = try await self.capturePhoto(
-                        settings: settings,
-                        willCapture: index == 0 ? willCapture : nil
-                    )
-                    return (index, photo)
-                }
-            }
-            var results: [(Int, PRMPhoto)] = []
-            for try await pair in group {
-                results.append(pair)
-            }
-            results.sort { $0.0 < $1.0 }
-            return results.map(\.1)
+        var results: [PRMPhoto] = []
+        results.reserveCapacity(count)
+        for index in 0 ..< count {
+            let photo = try await capturePhoto(
+                settings: settings,
+                willCapture: index == 0 ? willCapture : nil
+            )
+            results.append(photo)
         }
+        return results
     }
 
     // MARK: - Pending tracker

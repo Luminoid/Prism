@@ -37,7 +37,7 @@ final class StudioViewController: UIViewController {
     private let topBar = UIStackView()
     private let telemetryLabel = PaddedLabel()
     private let lensStrip = UIStackView()
-    private let modeStrip = ModePillStrip()
+    private let modePicker = ModePicker()
     private let shutter = PRMShutterButton()
     private let switchCameraButton = UIButton(type: .system)
     private let gridOverlay = PRMGridView()
@@ -46,11 +46,10 @@ final class StudioViewController: UIViewController {
     private let focusIndicator = PRMFocusIndicatorView()
     private let recordingTimerLabel = PaddedLabel()
     private let countdownLabel = UILabel()
-    private let torchButton = ToolbarChip(symbol: "bolt.slash.fill")
+    private let flashButton = ToolbarChip(symbol: "bolt.badge.a.fill")
     private let gridButton = ToolbarChip(symbol: "grid")
     private let aspectButton = ToolbarChip(symbol: "aspectratio")
     private let timerButton = ToolbarChip(symbol: "timer")
-    private let burstButton = ToolbarChip(symbol: "square.stack.3d.down.right")
     private let settingsButton = ToolbarChip(symbol: "slider.horizontal.3")
     private let drawer = PRMSettingsDrawerView(title: "Camera Settings")
 
@@ -80,9 +79,35 @@ final class StudioViewController: UIViewController {
     private let aspectCycle: [PRMAspectRatioMaskView.AspectRatio] = [.full, .ratio4x3, .ratio16x9, .ratio1x1]
 
     private var gridIndex = 0
-    private let gridCycle: [PRMGridView.GridType?] = [nil, .ruleOfThirds, .phi, .fibonacci]
+    private let gridCycle: [PRMGridView.GridType?] = [nil, .ruleOfThirds]
 
-    private var torchOn = false
+    private enum FlashSetting {
+        case auto, on, off
+
+        var next: Self {
+            switch self {
+            case .auto: .on
+            case .on: .off
+            case .off: .auto
+            }
+        }
+
+        var symbol: String {
+            switch self {
+            case .auto: "bolt.badge.a.fill"
+            case .on: "bolt.fill"
+            case .off: "bolt.slash.fill"
+            }
+        }
+
+        var avMode: AVCaptureDevice.FlashMode {
+            switch self {
+            case .auto: .auto
+            case .on: .on
+            case .off: .off
+            }
+        }
+    }
 
     private enum TimerSetting: Int, CaseIterable {
         case off = 0, three = 3, ten = 10
@@ -104,6 +129,7 @@ final class StudioViewController: UIViewController {
         }
     }
 
+    private var flashSetting: FlashSetting = .auto
     private var timerSetting: TimerSetting = .off
     private var burstEnabled = false
 
@@ -168,7 +194,9 @@ final class StudioViewController: UIViewController {
     private func setupLayout() {
         view.addSubview(previewView)
         previewView.snp.makeConstraints { $0.edges.equalToSuperview() }
-        previewView.rotation = .rotate90
+        // Preview frames arrive pre-rotated via the data-output connection's
+        // `videoRotationAngle`, set from `PRMRotationCoordinator` in `bootCamera()`.
+        // MTKView itself renders identity.
 
         view.addSubview(aspectMask)
         aspectMask.snp.makeConstraints { $0.edges.equalToSuperview() }
@@ -199,18 +227,18 @@ final class StudioViewController: UIViewController {
             $0.trailing.equalToSuperview().offset(-16)
             $0.height.equalTo(40)
         }
-        torchButton.onTap = { [weak self] in self?.toggleTorch() }
+        flashButton.onTap = { [weak self] in self?.cycleFlash() }
         gridButton.onTap = { [weak self] in self?.cycleGrid() }
         aspectButton.onTap = { [weak self] in self?.cycleAspect() }
         timerButton.onTap = { [weak self] in self?.cycleTimer() }
-        burstButton.onTap = { [weak self] in self?.toggleBurst() }
         settingsButton.onTap = { [weak self] in self?.toggleDrawer() }
-        topBar.addArrangedSubview(torchButton)
+        topBar.addArrangedSubview(flashButton)
         topBar.addArrangedSubview(gridButton)
         topBar.addArrangedSubview(aspectButton)
         topBar.addArrangedSubview(timerButton)
-        topBar.addArrangedSubview(burstButton)
-        topBar.addArrangedSubview(UIView())  // spacer
+        let topBarSpacer = UIView()
+        topBarSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        topBar.addArrangedSubview(topBarSpacer)
         topBar.addArrangedSubview(settingsButton)
 
         recordingTimerLabel.isHidden = true
@@ -244,17 +272,20 @@ final class StudioViewController: UIViewController {
         lensStrip.distribution = .equalSpacing
         view.addSubview(lensStrip)
 
-        view.addSubview(modeStrip)
-        modeStrip.onSelect = { [weak self] index in
-            self?.applyModeFromIndex(index)
+        view.addSubview(modePicker)
+        modePicker.onChange = { [weak self] primary, variant in
+            self?.applyModeChange(primary: primary, variant: variant)
         }
 
         view.addSubview(shutter)
         view.addSubview(switchCameraButton)
-        switchCameraButton.setImage(UIImage(systemName: "arrow.triangle.2.circlepath.camera"), for: .normal)
+        let flipSymbol = UIImage(
+            systemName: "arrow.triangle.2.circlepath.camera",
+            withConfiguration: UIImage.SymbolConfiguration(pointSize: 22, weight: .regular)
+        )
+        switchCameraButton.setImage(flipSymbol, for: .normal)
         switchCameraButton.tintColor = .white
-        switchCameraButton.contentVerticalAlignment = .fill
-        switchCameraButton.contentHorizontalAlignment = .fill
+        switchCameraButton.imageView?.contentMode = .scaleAspectFit
         switchCameraButton.addAction(UIAction { [weak self] _ in
             Task { await self?.flipCamera() }
         }, for: .touchUpInside)
@@ -274,17 +305,15 @@ final class StudioViewController: UIViewController {
             $0.size.equalTo(CGSize(width: 32, height: 32))
         }
 
-        modeStrip.snp.makeConstraints {
-            $0.centerX.equalToSuperview()
-            $0.leading.greaterThanOrEqualToSuperview().offset(16)
-            $0.trailing.lessThanOrEqualToSuperview().offset(-16)
+        modePicker.snp.makeConstraints {
+            $0.leading.equalToSuperview().offset(16)
+            $0.trailing.equalToSuperview().offset(-16)
             $0.bottom.equalTo(shutter.snp.top).offset(-14)
-            $0.height.equalTo(34)
         }
 
         lensStrip.snp.makeConstraints {
             $0.centerX.equalToSuperview()
-            $0.bottom.equalTo(modeStrip.snp.top).offset(-12)
+            $0.bottom.equalTo(modePicker.snp.top).offset(-12)
             $0.height.equalTo(36)
         }
 
@@ -333,6 +362,15 @@ final class StudioViewController: UIViewController {
             showAlert(title: "Cannot start camera", message: error.localizedDescription)
             return
         }
+
+        // Portrait baseline. `PRMRotationCoordinator` only updates this on real devices —
+        // the simulator has no gyroscope (CoreMotion is unavailable), so
+        // `videoRotationAngleForHorizonLevelPreview` would stay at 0 (raw sensor
+        // landscape) and the preview would look 90° CCW rotated in portrait. Seeding 90°
+        // here pre-rotates every CVPixelBuffer to gravity-aligned portrait so MTKView
+        // can render identity; on real hardware the coordinator stream overrides this
+        // as the device tilts.
+        await applyConnectionRotation(90)
 
         pipeline.isEnabled = true
         await camera.session.setVideoDataOutputDelegate(pipeline)
@@ -386,26 +424,58 @@ final class StudioViewController: UIViewController {
             }
         }
 
-        // PRMRotationCoordinator — replaces the hard-coded `.rotate90` so the preview
-        // stays gravity-aligned across device orientations.
-        if let device = await camera.session.videoDevice {
-            let coordinator = PRMRotationCoordinator(device: device, previewLayer: nil)
-            rotationCoordinator = coordinator
-            rotationStreamTask = Task { [weak self] in
-                for await angle in coordinator.previewRotationAngles() {
-                    guard !Task.isCancelled else { break }
-                    await MainActor.run {
-                        self?.previewView.rotation = PRMPreviewView.Rotation(angle: angle)
-                    }
-                }
-            }
-        }
+        await rebindRotationCoordinator()
 
         await camera.start()
     }
 
-    /// Holds the rotation coordinator so it can be torn down on disappear.
+    /// Holds the current rotation coordinator so it can be torn down + replaced on
+    /// camera switch. Reassigning to a new coordinator (in `rebindRotationCoordinator`)
+    /// drops the previous one — its KVO observations stop, its continuations finish, and
+    /// the old rotation stream task exits.
     private var rotationCoordinator: PRMRotationCoordinator?
+
+    /// Tears down the previous coordinator + stream task and binds a fresh
+    /// `PRMRotationCoordinator` to the *current* `camera.session.videoDevice`. Each
+    /// emitted angle gets applied to the data-output connection's `videoRotationAngle`
+    /// — AVFoundation then pre-rotates every CVPixelBuffer so MTKView can render
+    /// identity. Same path `AVCaptureVideoPreviewLayer` takes internally. Call after
+    /// the device changes (initial boot, `flipCamera`).
+    ///
+    /// On the simulator the coordinator emits 0 (no gyroscope), so the explicit
+    /// `applyConnectionRotation(90)` baseline at boot keeps the preview upright.
+    private func rebindRotationCoordinator() async {
+        rotationStreamTask?.cancel()
+        rotationStreamTask = nil
+        rotationCoordinator = nil
+
+        guard let device = await camera.session.videoDevice else { return }
+        let coordinator = PRMRotationCoordinator(device: device, previewLayer: nil)
+        rotationCoordinator = coordinator
+        rotationStreamTask = Task { [weak self] in
+            for await angle in coordinator.previewRotationAngles() {
+                guard !Task.isCancelled, let self else { break }
+                // Coordinator returns 0 on the simulator (no CoreMotion). Don't let it
+                // overwrite the 90° portrait baseline seeded at configure time.
+                guard angle != 0 else { continue }
+                await applyConnectionRotation(angle)
+            }
+        }
+    }
+
+    /// Sets `videoRotationAngle` on the video-data-output connection inside a
+    /// `beginConfiguration`/`commitConfiguration` block (the Apple-recommended pattern).
+    /// Hop through `PRMCameraActor` since `AVCaptureSession` mutations must serialize there.
+    private func applyConnectionRotation(_ angle: CGFloat) async {
+        let session = camera.session
+        await PRMCameraActor.shared.run {
+            guard let connection = await session.videoDataOutput?.connection(with: .video) else { return }
+            guard connection.isVideoRotationAngleSupported(angle) else { return }
+            session.session.beginConfiguration()
+            connection.videoRotationAngle = angle
+            session.session.commitConfiguration()
+        }
+    }
 
     // MARK: - Lens strip
 
@@ -422,26 +492,33 @@ final class StudioViewController: UIViewController {
         }
     }
 
-    // MARK: - Mode strip
+    // MARK: - Mode picker
 
     private func populateModeStrip() {
-        let device = camera.device
-        var modes: [Mode] = [.photo, .live, .portrait, .pano, .video]
-        if device?.supportsSlowMotion == true {
-            modes.append(.slowMo)
-        }
-        modes.append(.night)
-        modeStrip.setModes(modes.map(\.label))
-        modeStrip.selectedIndex = 0
+        modePicker.supportsSlowMotion = camera.device?.supportsSlowMotion == true
+        modePicker.select(primary: .photo, variant: .standard)
+        applyModeChange(primary: .photo, variant: .standard)
     }
 
-    private func applyModeFromIndex(_ index: Int) {
-        let modes: [Mode] = [.photo, .live, .portrait, .pano, .video]
-        var all = modes
-        if camera.device?.supportsSlowMotion == true { all.append(.slowMo) }
-        all.append(.night)
-        guard index >= 0, index < all.count else { return }
-        mode = all[index]
+    /// Translates a picker (primary, variant) selection into the `Mode` enum the rest of the
+    /// controller already understands. Burst is folded into `.photo` via `burstEnabled`.
+    private func applyModeChange(primary: ModePicker.Primary, variant: ModePicker.Variant) {
+        burstEnabled = (primary == .photo && variant == .burst)
+        switch primary {
+        case .photo:
+            switch variant {
+            case .live: mode = .live
+            case .portrait: mode = .portrait
+            case .standard, .burst: mode = .photo
+            case .slowMo: mode = .photo
+            }
+        case .video:
+            mode = variant == .slowMo ? .slowMo : .video
+        case .night:
+            mode = .night
+        case .pano:
+            mode = .pano
+        }
     }
 
     private func applyModeChange() {
@@ -512,7 +589,7 @@ final class StudioViewController: UIViewController {
 
     private func capturePhoto() {
         guard let photoCapture else { return }
-        let settings = makePhotoSettings(flash: torchOn ? .on : .auto, quality: .quality)
+        let settings = makePhotoSettings(flash: flashSetting.avMode, quality: .quality)
 
         flashOverlay()
         Task {
@@ -538,7 +615,7 @@ final class StudioViewController: UIViewController {
 
     private func captureBurst() {
         guard let photoCapture else { return }
-        let settings = makePhotoSettings(flash: torchOn ? .on : .auto, quality: .speed)
+        let settings = makePhotoSettings(flash: flashSetting.avMode, quality: .speed)
         flashOverlay()
         Task {
             do {
@@ -629,10 +706,7 @@ final class StudioViewController: UIViewController {
     private func saveToPhotoLibrary(data: Data, silent: Bool = false) async {
         guard await ensurePhotoLibraryAccess() else { return }
         do {
-            try await PHPhotoLibrary.shared().performChanges {
-                let request = PHAssetCreationRequest.forAsset()
-                request.addResource(with: .photo, data: data, options: PHAssetResourceCreationOptions())
-            }
+            try await Self.writePhoto(data: data)
             if !silent { showToast("Saved to Photos") }
         } catch {
             showToast("Save failed: \(error.localizedDescription)")
@@ -641,19 +715,43 @@ final class StudioViewController: UIViewController {
 
     private func saveLivePhoto(_ live: PRMLivePhoto) async {
         guard await ensurePhotoLibraryAccess() else { return }
+        let photoData = live.photo.data
+        let movieURL = live.movieURL
         do {
-            try await PHPhotoLibrary.shared().performChanges {
-                let request = PHAssetCreationRequest.forAsset()
-                let photoOptions = PHAssetResourceCreationOptions()
-                let movieOptions = PHAssetResourceCreationOptions()
-                movieOptions.shouldMoveFile = true
-                request.addResource(with: .photo, data: live.photo.data, options: photoOptions)
-                request.addResource(with: .pairedVideo, fileURL: live.movieURL, options: movieOptions)
-            }
+            try await Self.writeLivePhoto(photoData: photoData, movieURL: movieURL)
             showToast("Saved Live Photo")
         } catch {
             showToast("Save failed: \(error.localizedDescription)")
-            PRMTempFile.remove(live.movieURL)
+            PRMTempFile.remove(movieURL)
+        }
+    }
+
+    /// PHPhotoLibrary.performChanges runs its closure on `com.apple.PHPhotoLibrary.changes`.
+    /// A closure created inside a `@MainActor` method inherits MainActor isolation and
+    /// crashes with `_dispatch_assert_queue_fail` under Swift 6 strict concurrency. The
+    /// `nonisolated static func` wrapper severs the isolation chain.
+    nonisolated static func writePhoto(data: Data) async throws {
+        try await PHPhotoLibrary.shared().performChanges {
+            let request = PHAssetCreationRequest.forAsset()
+            request.addResource(with: .photo, data: data, options: PHAssetResourceCreationOptions())
+        }
+    }
+
+    nonisolated static func writeLivePhoto(photoData: Data, movieURL: URL) async throws {
+        try await PHPhotoLibrary.shared().performChanges {
+            let request = PHAssetCreationRequest.forAsset()
+            let photoOptions = PHAssetResourceCreationOptions()
+            let movieOptions = PHAssetResourceCreationOptions()
+            movieOptions.shouldMoveFile = true
+            request.addResource(with: .photo, data: photoData, options: photoOptions)
+            request.addResource(with: .pairedVideo, fileURL: movieURL, options: movieOptions)
+        }
+    }
+
+    nonisolated static func writeVideo(url: URL) async throws {
+        try await PHPhotoLibrary.shared().performChanges {
+            let request = PHAssetCreationRequest.forAsset()
+            request.addResource(with: .video, fileURL: url, options: PHAssetResourceCreationOptions())
         }
     }
 
@@ -706,11 +804,9 @@ final class StudioViewController: UIViewController {
     }
 
     private func saveRecording(_ recording: PRMRecording) async {
+        let url = recording.url
         do {
-            try await PHPhotoLibrary.shared().performChanges {
-                let request = PHAssetCreationRequest.forAsset()
-                request.addResource(with: .video, fileURL: recording.url, options: PHAssetResourceCreationOptions())
-            }
+            try await Self.writeVideo(url: url)
             showToast("Saved video")
         } catch {
             showToast("Save failed: \(error.localizedDescription)")
@@ -754,8 +850,8 @@ final class StudioViewController: UIViewController {
     private func handleShutterLongPressBegan() {
         guard mode != .live, mode != .portrait, mode != .night, mode != .pano else { return }
         if mode == .photo {
-            mode = .video
-            modeStrip.selectedIndex = modeStrip.indexOf(label: Mode.video.label) ?? 0
+            modePicker.select(primary: .video, variant: .standard)
+            applyModeChange(primary: .video, variant: .standard)
         }
         if recordingStartedAt == nil {
             startRecording()
@@ -785,12 +881,9 @@ final class StudioViewController: UIViewController {
         }
     }
 
-    // MARK: - Top bar actions
-
-    private func toggleTorch() {
-        torchOn.toggle()
-        torchButton.setSymbol(torchOn ? "bolt.fill" : "bolt.slash.fill", active: torchOn)
-        Task { await camera.setTorch(torchOn ? .on(level: 1.0) : .off) }
+    private func cycleFlash() {
+        flashSetting = flashSetting.next
+        flashButton.setSymbol(flashSetting.symbol, active: flashSetting != FlashSetting.off)
     }
 
     private func cycleGrid() {
@@ -817,11 +910,6 @@ final class StudioViewController: UIViewController {
         timerButton.setSymbol(timerSetting.symbol, active: timerSetting != .off)
     }
 
-    private func toggleBurst() {
-        burstEnabled.toggle()
-        burstButton.setActive(burstEnabled)
-    }
-
     private func toggleDrawer() {
         drawer.isUserInteractionEnabled = true
         drawer.setOpen(!drawer.isOpen, animated: true)
@@ -845,6 +933,7 @@ final class StudioViewController: UIViewController {
             previewView.mirroring = (next == .front)
             rebuildLensStrip()
             populateModeStrip()
+            await rebindRotationCoordinator()
         } catch {
             showToast("Switch failed: \(error.localizedDescription)")
             pipeline.isEnabled = true
@@ -1098,16 +1187,30 @@ extension StudioViewController {
     }
 
     private func makeISORow(device: PRMCameraDevice) -> PRMSettingsRow {
+        let stack = UIStackView()
+        stack.axis = .horizontal
+        stack.spacing = 10
+        stack.alignment = .center
+
+        let autoChip = TextChip(title: "AUTO")
         let slider = UISlider()
         slider.minimumValue = device.isoRange.lowerBound
         slider.maximumValue = device.isoRange.upperBound
         slider.value = camera.state.iso
+        stack.addArrangedSubview(autoChip)
+        stack.addArrangedSubview(slider)
+        autoChip.snp.makeConstraints { $0.width.equalTo(54) }
+
         let row = PRMSettingsRow(
             symbolName: "camera.aperture",
             title: "ISO",
-            valueText: "\(Int(camera.state.iso))",
-            content: slider
+            valueText: "auto",
+            content: stack
         )
+        autoChip.onTap = { [weak self, weak row] in
+            row?.valueText = "auto"
+            Task { await self?.camera.setExposureMode(.continuousAutoExposure) }
+        }
         slider.addAction(UIAction { [weak self, weak row] _ in
             let iso = slider.value
             row?.valueText = "\(Int(iso))"
@@ -1488,9 +1591,17 @@ private final class ModePillStrip: UIView {
         scrollView.addSubview(stackView)
         stackView.axis = .horizontal
         stackView.spacing = 6
+        // Pin top/bottom to the content layout guide so the scroll view sizes its
+        // contentSize.height from the stack. Center horizontally inside the frame layout
+        // guide so short strips look centered; allow the stack to overflow the frame
+        // (negative leading/trailing) when there are too many pills — scroll view's
+        // content layout guide expands and the strip scrolls.
         stackView.snp.makeConstraints {
-            $0.edges.equalToSuperview()
-            $0.height.equalToSuperview()
+            $0.top.bottom.equalTo(scrollView.contentLayoutGuide)
+            $0.leading.greaterThanOrEqualTo(scrollView.contentLayoutGuide)
+            $0.trailing.lessThanOrEqualTo(scrollView.contentLayoutGuide)
+            $0.centerX.equalTo(scrollView.frameLayoutGuide)
+            $0.height.equalTo(scrollView.frameLayoutGuide)
         }
     }
 
@@ -1530,6 +1641,137 @@ private final class ModePillStrip: UIView {
                 ? UIColor.systemYellow
                 : UIColor.white.withAlphaComponent(0.10)
             (pill.subviews.first as? UILabel)?.textColor = active ? .black : .white
+        }
+    }
+}
+
+// MARK: - ModePicker
+
+/// Two-row capture-mode picker: primary capture style on top, optional variants underneath.
+///
+/// The primary row is always visible and switches between `PHOTO / VIDEO / NIGHT / PANO`.
+/// The variant row appears only when the current primary has variants (Photo → Live / Portrait / Burst;
+/// Video → Slo-Mo if supported) and collapses to zero-height otherwise.
+private final class ModePicker: UIView {
+    enum Primary: CaseIterable, Equatable {
+        case photo, video, night, pano
+
+        var label: String {
+            switch self {
+            case .photo: "PHOTO"
+            case .video: "VIDEO"
+            case .night: "NIGHT"
+            case .pano: "PANO"
+            }
+        }
+    }
+
+    enum Variant: Equatable {
+        case standard
+        case live
+        case portrait
+        case burst
+        case slowMo
+
+        var label: String {
+            switch self {
+            case .standard: "STANDARD"
+            case .live: "LIVE"
+            case .portrait: "PORTRAIT"
+            case .burst: "BURST"
+            case .slowMo: "SLO-MO"
+            }
+        }
+    }
+
+    var onChange: ((Primary, Variant) -> Void)?
+
+    /// Whether the slo-mo variant is offered under VIDEO. Driven by `device.supportsSlowMotion`.
+    var supportsSlowMotion: Bool = false {
+        didSet { rebuildVariants() }
+    }
+
+    private(set) var primary: Primary = .photo
+    private(set) var variant: Variant = .standard
+
+    private let primaryRow = ModePillStrip()
+    private let variantRow = ModePillStrip()
+    private let stack = UIStackView()
+
+    init() {
+        super.init(frame: .zero)
+        stack.axis = .vertical
+        stack.alignment = .fill
+        stack.spacing = 6
+        addSubview(stack)
+        stack.snp.makeConstraints { $0.edges.equalToSuperview() }
+
+        stack.addArrangedSubview(primaryRow)
+        stack.addArrangedSubview(variantRow)
+        primaryRow.snp.makeConstraints { $0.height.equalTo(34) }
+        variantRow.snp.makeConstraints { $0.height.equalTo(28) }
+
+        primaryRow.setModes(Primary.allCases.map(\.label))
+        primaryRow.selectedIndex = 0
+        primaryRow.onSelect = { [weak self] index in
+            guard let self, index >= 0, index < Primary.allCases.count else { return }
+            self.primary = Primary.allCases[index]
+            self.variant = .standard
+            self.rebuildVariants()
+            self.onChange?(self.primary, self.variant)
+        }
+
+        variantRow.onSelect = { [weak self] index in
+            guard let self else { return }
+            let variants = self.variants(for: self.primary)
+            guard index >= 0, index < variants.count else { return }
+            self.variant = variants[index]
+            self.onChange?(self.primary, self.variant)
+        }
+
+        rebuildVariants()
+    }
+
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) {
+        fatalError("Use init()")
+    }
+
+    /// Programmatically select a (primary, variant) pair — used by the long-press-shutter shortcut
+    /// to flip from photo into video without going through a tap.
+    func select(primary: Primary, variant: Variant) {
+        guard let primaryIndex = Primary.allCases.firstIndex(of: primary) else { return }
+        primaryRow.selectedIndex = primaryIndex
+        self.primary = primary
+        rebuildVariants()
+        let variants = self.variants(for: primary)
+        if let variantIndex = variants.firstIndex(of: variant) {
+            variantRow.selectedIndex = variantIndex
+            self.variant = variant
+        } else {
+            variantRow.selectedIndex = 0
+            self.variant = variants.first ?? .standard
+        }
+    }
+
+    private func variants(for primary: Primary) -> [Variant] {
+        switch primary {
+        case .photo: [.standard, .live, .portrait, .burst]
+        case .video: supportsSlowMotion ? [.standard, .slowMo] : []
+        case .night, .pano: []
+        }
+    }
+
+    private func rebuildVariants() {
+        let variants = self.variants(for: primary)
+        variantRow.setModes(variants.map(\.label))
+        variantRow.isHidden = variants.isEmpty
+        if !variants.isEmpty {
+            let index = variants.firstIndex(of: variant) ?? 0
+            variantRow.selectedIndex = index
+            variant = variants[index]
+        } else {
+            variant = .standard
         }
     }
 }

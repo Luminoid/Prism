@@ -112,6 +112,9 @@ private final class PermissionCard: UIView {
         topRow.spacing = 12
 
         symbolView.snp.makeConstraints { $0.size.equalTo(32) }
+        statusPill.snp.makeConstraints { $0.width.equalTo(100) }
+        statusPill.setContentHuggingPriority(.required, for: .horizontal)
+        statusPill.setContentCompressionResistancePriority(.required, for: .horizontal)
 
         let stack = UIStackView(arrangedSubviews: [topRow, requestButton])
         stack.axis = .vertical
@@ -145,7 +148,9 @@ private final class StatusPillView: UIView {
         addSubview(label)
         label.snp.makeConstraints {
             $0.top.bottom.equalToSuperview().inset(6)
-            $0.leading.trailing.equalToSuperview().inset(12)
+            $0.centerX.equalToSuperview()
+            $0.leading.greaterThanOrEqualToSuperview().offset(12)
+            $0.trailing.lessThanOrEqualToSuperview().offset(-12)
         }
     }
 
