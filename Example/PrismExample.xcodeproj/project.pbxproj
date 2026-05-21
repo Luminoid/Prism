@@ -15,14 +15,12 @@
 		809E5100B8DF68369F6CC812 /* FilterChainViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2309B42ACC42C5336112552E /* FilterChainViewController.swift */; };
 		93636A85D08729B0AF1FF66F /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9205AC2DEE68D93059206669 /* AppDelegate.swift */; };
 		B4DC424EC2415F532F95D72F /* StudioViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A393F4CE7D1B2A788030F14F /* StudioViewController.swift */; };
-		C75469ED895E11777CD2A1F9 /* BasicRendererViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0949686EC0103D5E2B2E1763 /* BasicRendererViewController.swift */; };
 		D81079311A19F1F0850894FD /* PrismUI in Frameworks */ = {isa = PBXBuildFile; productRef = 3C35934D9D337FA8B1F10B78 /* PrismUI */; };
 		EF1CD153FAB443912C2D6EE2 /* PermissionsViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B16B67D838E073419ABD2F17 /* PermissionsViewController.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		033F012A261FEFF4499FEB98 /* ConfigurationLabViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigurationLabViewController.swift; sourceTree = "<group>"; };
-		0949686EC0103D5E2B2E1763 /* BasicRendererViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BasicRendererViewController.swift; sourceTree = "<group>"; };
 		2309B42ACC42C5336112552E /* FilterChainViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilterChainViewController.swift; sourceTree = "<group>"; };
 		486B33EDCCB72EDE25192E3F /* PrismExample.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PrismExample.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		4F84EFBD24D61E5FF6AE4844 /* Prism */ = {isa = PBXFileReference; lastKnownFileType = folder; name = Prism; path = ..; sourceTree = SOURCE_ROOT; };
@@ -76,7 +74,6 @@
 			isa = PBXGroup;
 			children = (
 				9205AC2DEE68D93059206669 /* AppDelegate.swift */,
-				0949686EC0103D5E2B2E1763 /* BasicRendererViewController.swift */,
 				033F012A261FEFF4499FEB98 /* ConfigurationLabViewController.swift */,
 				A668D4255D7028246510B53E /* DepthInspectorViewController.swift */,
 				2309B42ACC42C5336112552E /* FilterChainViewController.swift */,
@@ -147,7 +144,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				93636A85D08729B0AF1FF66F /* AppDelegate.swift in Sources */,
-				C75469ED895E11777CD2A1F9 /* BasicRendererViewController.swift in Sources */,
 				168617B0DB22105D061CA978 /* ConfigurationLabViewController.swift in Sources */,
 				0838F9FBA10453582A8B0D00 /* DepthInspectorViewController.swift in Sources */,
 				809E5100B8DF68369F6CC812 /* FilterChainViewController.swift in Sources */,

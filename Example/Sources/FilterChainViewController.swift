@@ -1,5 +1,6 @@
-import AVFoundation
+@preconcurrency import AVFoundation
 import CoreImage
+import Photos
 import PrismCore
 import PrismUI
 import SnapKit
@@ -7,12 +8,17 @@ import UIKit
 
 // MARK: - FilterChainViewController
 
-/// Interactive filter chain editor.
+/// Interactive filter chain editor + filtered photo capture.
 ///
 /// - Top half: filtered preview.
 /// - Bottom half: chain editor (active filters + library to add).
 /// - Active filter pills can be reordered (long-press) or removed (swipe to remove).
 /// - Tap an active pill to open an intensity slider.
+/// - "Snap" captures a still photo with the *entire chain* baked in via
+///   ``PRMPhotoCapture/capturePhoto(settings:applyingChain:context:willCapture:)`` and
+///   saves it to the photo library with the original EXIF preserved.
+/// - Codec (JPEG / HEIC) and `maxPhotoDimensions` toggle exercise ``PRMPhotoSettings``
+///   the same way the (now-retired) BasicRenderer demo did.
 @MainActor
 final class FilterChainViewController: UIViewController {
     // MARK: - Filter catalog
@@ -71,6 +77,12 @@ final class FilterChainViewController: UIViewController {
 
     private lazy var previewView = PRMPreviewView(context: renderContext)
     private lazy var chain: PRMFilterChain = .init(context: renderContext, description: "ChainDemo")
+    private var photoCapture: PRMPhotoCapture?
+
+    /// Codec / maxDimensions toggles plumbed through `PRMPhotoSettings`. Defaults match
+    /// Apple Camera (HEIC, no cap).
+    private var preferredCodec: AVVideoCodecType = .hevc
+    private var capMaxDimensions: Bool = false
 
     // MARK: - UI
 
@@ -86,6 +98,14 @@ final class FilterChainViewController: UIViewController {
     private let clearButton = UIButton(type: .system)
     private let shuffleButton = UIButton(type: .system)
     private let randomizeButton = UIButton(type: .system)
+
+    /// Snap UI — captures a still with the full chain baked in via the new
+    /// `PRMPhotoCapture.capturePhoto(applyingChain:context:)` API. Migrated from the
+    /// retired BasicRenderer demo, which only supported a single filter at encode time.
+    private let snapButton = UIButton(type: .system)
+    private let codecSegmented = UISegmentedControl(items: ["JPEG", "HEIC"])
+    private let dimensionsToggle = UISwitch()
+    private let snapStatusLabel = UILabel()
 
     /// `frameStream()` telemetry — runs alongside `onFrame` to demonstrate dual delivery.
     private let fpsLabel = UILabel()
@@ -104,8 +124,216 @@ final class FilterChainViewController: UIViewController {
         overrideUserInterfaceStyle = .dark
         navigationItem.title = "Filter Chain"
         setupLayout()
+        wireSnapRow()
         rebuildLibrary()
         Task { await bootCamera() }
+    }
+
+    // MARK: - Snap row
+
+    /// Configures the Snap UI (codec picker, maxDimensions toggle, snap button, status).
+    /// Called from `viewDidLoad` after `setupLayout` lays out the chain editor — the
+    /// snap row hugs the top of the preview (right under the FPS chip) so it stays
+    /// reachable as the chain editor grows in the bottom half.
+    private func wireSnapRow() {
+        codecSegmented.selectedSegmentIndex = preferredCodec == .jpeg ? 0 : 1
+        codecSegmented.selectedSegmentTintColor = .systemYellow
+        codecSegmented.backgroundColor = UIColor.black.withAlphaComponent(0.55)
+        codecSegmented.setTitleTextAttributes(
+            [.foregroundColor: UIColor.white, .font: UIFont.systemFont(ofSize: 11, weight: .semibold)],
+            for: .normal
+        )
+        codecSegmented.setTitleTextAttributes(
+            [.foregroundColor: UIColor.black, .font: UIFont.systemFont(ofSize: 11, weight: .semibold)],
+            for: .selected
+        )
+        codecSegmented.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            preferredCodec = codecSegmented.selectedSegmentIndex == 0 ? .jpeg : .hevc
+        }, for: .valueChanged)
+
+        // Standalone UISwitch — `UISwitch.title` and `.preferredStyle = .checkbox` are
+        // both Mac Catalyst Mac-idiom-only and crash with
+        // `_UICatalystUnsupportedMacIdiomBehavior` on iPhone / iPad. Pair the switch with
+        // its own UILabel and let the stack view lay them out side-by-side.
+        dimensionsToggle.isOn = capMaxDimensions
+        dimensionsToggle.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            capMaxDimensions = dimensionsToggle.isOn
+        }, for: .valueChanged)
+        // Slim the switch so the row fits the preview's trailing margin on iPhone width.
+        dimensionsToggle.transform = CGAffineTransform(scaleX: 0.7, y: 0.7)
+
+        // "2K" toggles `PRMPhotoSettings.maxDimensions` to the largest supported photo
+        // dimensions ≤ 2K wide (~1920×1080-ish). The previous Implementation pinned to
+        // `output.maxPhotoDimensions` which IS the ceiling — a no-op, so toggling had no
+        // visible effect. The 2K cap actually reduces file size noticeably so the user
+        // can verify the setting works via Photos.app metadata. Toggle off → no cap,
+        // photo lands at the device's full native resolution.
+        let dimLabel = UILabel()
+        dimLabel.text = "2K"
+        dimLabel.textColor = UIColor.white.withAlphaComponent(0.85)
+        dimLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+        dimLabel.setContentHuggingPriority(.required, for: .horizontal)
+        dimLabel.isAccessibilityElement = true
+        dimLabel.accessibilityHint = "Caps capture to ~2K dimensions"
+        dimensionsToggle.accessibilityLabel = "Cap photo to 2K"
+
+        var snapConfig = UIButton.Configuration.filled()
+        snapConfig.title = "Snap"
+        snapConfig.baseBackgroundColor = .systemYellow
+        snapConfig.baseForegroundColor = .black
+        snapConfig.cornerStyle = .medium
+        snapConfig.titleTextAttributesTransformer = .init { input in
+            var attrs = input
+            attrs.font = .systemFont(ofSize: 13, weight: .bold)
+            return attrs
+        }
+        snapButton.configuration = snapConfig
+        snapButton.addAction(UIAction { [weak self] _ in self?.snap() }, for: .touchUpInside)
+
+        let row = UIStackView(arrangedSubviews: [codecSegmented, dimLabel, dimensionsToggle, snapButton])
+        row.axis = .horizontal
+        row.spacing = 6
+        row.alignment = .center
+        view.addSubview(row)
+        // Anchor below the FPS chip on the right side of the preview.
+        row.snp.makeConstraints {
+            $0.top.equalTo(fpsLabel.snp.bottom).offset(8)
+            $0.trailing.equalToSuperview().offset(-12)
+            $0.height.equalTo(30)
+        }
+        snapButton.snp.makeConstraints { $0.width.equalTo(70) }
+        codecSegmented.snp.makeConstraints { $0.width.equalTo(86) }
+
+        snapStatusLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+        snapStatusLabel.textColor = UIColor.white.withAlphaComponent(0.85)
+        snapStatusLabel.backgroundColor = UIColor.black.withAlphaComponent(0.45)
+        snapStatusLabel.layer.cornerRadius = 6
+        snapStatusLabel.layer.masksToBounds = true
+        snapStatusLabel.textAlignment = .center
+        snapStatusLabel.text = " Snap the chain "
+        view.addSubview(snapStatusLabel)
+        snapStatusLabel.snp.makeConstraints {
+            $0.top.equalTo(row.snp.bottom).offset(6)
+            $0.trailing.equalToSuperview().offset(-12)
+            $0.height.equalTo(20)
+            $0.width.greaterThanOrEqualTo(96)
+        }
+    }
+
+    /// Captures a still through the active chain. Empty chain → straight encode
+    /// (skips the CIImage round-trip). Non-empty → `PRMPhotoCapture.capturePhoto(applyingChain:context:)`
+    /// which bakes every filter with intensity blending — same math as the live preview.
+    private func snap() {
+        guard let photoCapture else { return }
+        let entries = activeEntries.map { entry in
+            PRMFilterChain.Entry(filter: entry.make(), intensity: entry.intensity)
+        }
+        let codecChoice = preferredCodec
+        let wantsCap = capMaxDimensions
+        snapStatusLabel.text = " Capturing… "
+        Task { [photoCapture, renderContext, weak self] in
+            guard let self else { return }
+            var settings = PRMPhotoSettings()
+                .flashMode(.off)
+                .qualityPrioritization(.quality)
+                .codec(codecChoice)
+            if wantsCap, let twoK = await twoKMaxDimensions() {
+                settings = settings.maxDimensions(twoK)
+            }
+            do {
+                let willCapture: (@Sendable () -> Void) = { [weak self] in
+                    Task { @MainActor [weak self] in
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        self?.snapStatusLabel.text = " Shutter open "
+                    }
+                }
+                let photo = entries.isEmpty
+                    ? try await photoCapture.capturePhoto(
+                        settings: settings,
+                        willCapture: willCapture
+                    )
+                    : try await photoCapture.capturePhoto(
+                        settings: settings,
+                        applyingChain: entries,
+                        context: renderContext,
+                        willCapture: willCapture
+                    )
+                await save(data: photo.data)
+            } catch {
+                await MainActor.run { [weak self] in
+                    self?.snapStatusLabel.text = " Capture failed "
+                }
+            }
+        }
+    }
+
+    private func save(data: Data) async {
+        let status = PHPhotoLibrary.authorizationStatus(for: .addOnly)
+        if status == .notDetermined {
+            _ = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+        }
+        let granted = PHPhotoLibrary.authorizationStatus(for: .addOnly)
+        guard granted == .authorized || granted == .limited else {
+            snapStatusLabel.text = " Photos denied "
+            return
+        }
+        do {
+            try await Self.writePhoto(data: data)
+            // Surface the actual encoded type so the user can verify Codec + Max actually
+            // took effect — JPEG and HEIC magic bytes are different in `data`.
+            let label = Self.codecLabel(for: data)
+            let sizeKB = data.count / 1024
+            snapStatusLabel.text = " Saved \(label) · \(sizeKB) KB "
+        } catch {
+            snapStatusLabel.text = " Save failed "
+        }
+    }
+
+    /// Detect the encoded container by peeking at the first few bytes. `0xFF 0xD8` is
+    /// the JPEG SOI marker; `ftyp...heic`/`mif1` is HEIF. Lets the snap status confirm
+    /// which encoder actually ran (the chain path may fall back to JPEG when the
+    /// device can't HEIF-encode — useful debug signal).
+    private static func codecLabel(for data: Data) -> String {
+        guard data.count >= 12 else { return "?" }
+        let bytes = [UInt8](data.prefix(12))
+        if bytes[0] == 0xFF, bytes[1] == 0xD8 { return "JPEG" }
+        // ISO base media: bytes 4..8 = "ftyp"
+        if bytes[4] == 0x66, bytes[5] == 0x74, bytes[6] == 0x79, bytes[7] == 0x70 {
+            return "HEIC"
+        }
+        return "?"
+    }
+
+    /// `PHPhotoLibrary.performChanges` runs its closure on Photos' private queue. When
+    /// the closure is created inside a `@MainActor` method it inherits MainActor
+    /// isolation, and the concurrency runtime then aborts with
+    /// `_dispatch_assert_queue_fail` when Photos tries to dispatch it. Wrapping the call
+    /// in a `nonisolated static func` fully severs that isolation inheritance so the
+    /// closure can run anywhere Photos wants to put it. Same pattern as the workspace
+    /// `PHPhotoLibrary` / `BGTaskScheduler` lessons.
+    private nonisolated static func writePhoto(data: Data) async throws {
+        try await PHPhotoLibrary.shared().performChanges {
+            let request = PHAssetCreationRequest.forAsset()
+            request.addResource(with: .photo, data: data, options: PHAssetResourceCreationOptions())
+        }
+    }
+
+    /// Picks the largest supported photo dimension whose width is ≤ ~2048 px from the
+    /// active format. `AVCapturePhotoOutput.maxPhotoDimensions` must be one of the values
+    /// in `activeFormat.supportedMaxPhotoDimensions` (set != arbitrary cap value), so
+    /// the actual file-size reduction comes from picking a small-enough entry from that
+    /// list. Returns `nil` when the device isn't ready or has no candidate ≤ 2K.
+    private func twoKMaxDimensions() async -> CMVideoDimensions? {
+        let session = camera.session
+        return await PRMCameraActor.shared.run {
+            guard let device = await session.videoDevice else { return CMVideoDimensions?.none }
+            let supported = device.activeFormat.supportedMaxPhotoDimensions
+            let candidates = supported.filter { $0.width <= 2048 }
+            return candidates.max(by: { $0.width < $1.width })
+                ?? supported.min(by: { $0.width < $1.width })
+        }
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -323,6 +551,16 @@ final class FilterChainViewController: UIViewController {
             }
         }
 
+        // Wire `PRMPhotoCapture` so the Snap button can capture stills with the chain
+        // baked in. The photoOutput lives on the camera actor; hop there to grab it,
+        // construct the capture facade, and hop back to MainActor to store it.
+        await PRMCameraActor.shared.run { [self] in
+            if let photoOutput = await camera.session.photoOutput {
+                let capture = PRMPhotoCapture(output: photoOutput)
+                await MainActor.run { self.photoCapture = capture }
+            }
+        }
+
         await camera.start()
     }
 
@@ -430,10 +668,8 @@ private final class ActivePill: UIControl {
     var onIntensityChanged: ((Float) -> Void)?
 
     private let titleLabel = UILabel()
-    private let intensityIndicator = UIView()
+    private let intensityLabel = UILabel()
     private var intensity: Float
-    private let slider = UISlider()
-    private var sliderHost: UIView?
 
     init(title: String, intensity: Float) {
         self.intensity = intensity
@@ -447,14 +683,39 @@ private final class ActivePill: UIControl {
         titleLabel.textColor = .systemYellow
         titleLabel.font = .systemFont(ofSize: 12, weight: .bold)
 
-        intensityIndicator.backgroundColor = .systemYellow
-        intensityIndicator.layer.cornerRadius = 2
+        // The chain applies a per-entry `intensity` (blend amount, 0–100 %) regardless of
+        // the underlying filter's own params, so every pill has a meaningful adjustment.
+        // Showing the current value inline makes it obvious that tapping the pill opens a
+        // knob — without it the pill looks like a static chip. Format matches the
+        // intensity sheet's label so the number doesn't jump on open / close.
+        intensityLabel.text = "\(Int(round(intensity * 100)))%"
+        intensityLabel.textColor = UIColor.systemYellow.withAlphaComponent(0.75)
+        intensityLabel.font = .monospacedSystemFont(ofSize: 10, weight: .semibold)
 
-        let stack = UIStackView(arrangedSubviews: [titleLabel])
+        // Slider glyph hints that the pill is tappable for adjustment, distinguishing
+        // this from the inert library pills below.
+        let knobIcon = UIImageView(image: UIImage(systemName: "slider.horizontal.below.rectangle"))
+        knobIcon.tintColor = UIColor.systemYellow.withAlphaComponent(0.75)
+        knobIcon.contentMode = .scaleAspectFit
+        knobIcon.snp.makeConstraints { $0.size.equalTo(11) }
+
+        let stack = UIStackView(arrangedSubviews: [titleLabel, knobIcon, intensityLabel])
         stack.axis = .horizontal
         stack.alignment = .center
+        stack.spacing = 4
+        // UIStackView defaults to `isUserInteractionEnabled = true`. Even though its
+        // children (UILabel/UIImageView) all default to interaction off, the stack
+        // itself swallows hit-tests inside its frame because UIKit returns the deepest
+        // interactive view at the touch — and that's the stack. The parent ActivePill
+        // UIControl never sees the touch, so `.touchUpInside` doesn't fire and the
+        // intensity sheet won't open. Switching it off makes the whole pill (minus the
+        // trailing close hit area) report taps as expected.
+        stack.isUserInteractionEnabled = false
         addSubview(stack)
-        stack.snp.makeConstraints { $0.edges.equalToSuperview().inset(UIEdgeInsets(top: 8, left: 14, bottom: 8, right: 28)) }
+        // Reserve trailing space for the close button — it's now 28×28 (covers the
+        // 44 pt HIG tap target across the contentInset). The number on the right reads
+        // as "I'm at X%, tap to change."
+        stack.snp.makeConstraints { $0.edges.equalToSuperview().inset(UIEdgeInsets(top: 8, left: 14, bottom: 8, right: 36)) }
 
         // Tap → toggle intensity slider sheet.
         addTarget(self, action: #selector(handleTap), for: .touchUpInside)
@@ -463,18 +724,34 @@ private final class ActivePill: UIControl {
         let longPress = UILongPressGestureRecognizer(target: self, action: #selector(handleLongPress(_:)))
         addGestureRecognizer(longPress)
 
-        // Trailing × button overlay.
-        let close = UIImageView(image: UIImage(systemName: "xmark.circle.fill"))
-        close.tintColor = .systemYellow
+        // Trailing × button. Old version was 14×14 — way under the 44 pt HIG target —
+        // and tapping it more often dismissed the keyboard / fell through to the pill's
+        // own tap handler than removed the filter. Now a 28×28 visual glyph in a 36 pt
+        // padded UIControl, so the hit area is comfortably ≥ 36 pt in both axes.
+        let close = UIControl()
+        let closeImage = UIImageView(image: UIImage(systemName: "xmark.circle.fill"))
+        closeImage.tintColor = .systemYellow
+        closeImage.contentMode = .scaleAspectFit
+        closeImage.isUserInteractionEnabled = false
+        close.addSubview(closeImage)
+        closeImage.snp.makeConstraints {
+            $0.center.equalToSuperview()
+            $0.size.equalTo(20)
+        }
         addSubview(close)
         close.snp.makeConstraints {
-            $0.trailing.equalToSuperview().inset(6)
-            $0.centerY.equalToSuperview()
-            $0.size.equalTo(14)
+            $0.trailing.equalToSuperview()
+            $0.top.bottom.equalToSuperview()
+            $0.width.equalTo(36)
         }
-        let closeTap = UITapGestureRecognizer(target: self, action: #selector(handleClose))
-        close.isUserInteractionEnabled = true
-        close.addGestureRecognizer(closeTap)
+        close.addAction(UIAction { [weak self] _ in self?.handleClose() }, for: .touchUpInside)
+    }
+
+    /// Re-render the intensity readout — the host VC calls this when toolbar actions
+    /// (Random Intensity, Shuffle) rebuild the chain so the pill text stays in sync.
+    func setIntensity(_ value: Float) {
+        intensity = value
+        intensityLabel.text = "\(Int(round(value * 100)))%"
     }
 
     @available(*, unavailable)
@@ -501,8 +778,9 @@ private final class ActivePill: UIControl {
         guard let owner = window?.rootViewController else { return }
         let sheet = UIAlertController(title: titleLabel.text, message: "Intensity", preferredStyle: .actionSheet)
         let sliderHost = IntensitySliderView(initial: intensity) { [weak self] new in
-            self?.intensity = new
-            self?.onIntensityChanged?(new)
+            guard let self else { return }
+            setIntensity(new)
+            onIntensityChanged?(new)
         }
         sheet.view.addSubview(sliderHost)
         sliderHost.snp.makeConstraints {

@@ -192,36 +192,7 @@ public final class PRMFilterChain: PRMFilterRenderer, @unchecked Sendable {
         guard !entriesSnapshot.isEmpty else { return pixelBuffer }
 
         let sourceImage = CIImage(cvImageBuffer: pixelBuffer)
-        var currentImage = sourceImage
-
-        for entry in entriesSnapshot {
-            let filtered = entry.filter.render(currentImage)
-
-            switch entry.intensity {
-            case let intensity where intensity <= 0.0:
-                // 0 = no effect; carry previous step forward unchanged.
-                continue
-            case let intensity where intensity >= 1.0:
-                currentImage = filtered
-            case let intensity:
-                // Correct intensity blend: mix(currentImage, filtered, intensity).
-                //
-                // Build a constant-luminance grayscale mask at value `intensity` then use
-                // CIBlendWithMask, which returns mask·image + (1−mask)·background. Cropping the
-                // mask to the filtered image's extent matches CoreImage's infinite-extent semantics.
-                let maskColor = CIColor(
-                    red: CGFloat(intensity),
-                    green: CGFloat(intensity),
-                    blue: CGFloat(intensity),
-                    alpha: 1.0
-                )
-                let mask = CIImage(color: maskColor).cropped(to: filtered.extent)
-                currentImage = filtered.applyingFilter("CIBlendWithMask", parameters: [
-                    kCIInputBackgroundImageKey: currentImage,
-                    kCIInputMaskImageKey: mask,
-                ])
-            }
-        }
+        let currentImage = Self.apply(entriesSnapshot, to: sourceImage)
 
         var output: CVPixelBuffer?
         CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &output)
@@ -237,5 +208,47 @@ public final class PRMFilterChain: PRMFilterRenderer, @unchecked Sendable {
             colorSpace: colorSpace
         )
         return outputPixelBuffer
+    }
+
+    /// Apply a snapshot of chain entries to a CIImage, returning the blended result.
+    /// Pure CoreImage in/out — no pixel buffer pool, no GPU render — so the same code
+    /// path can drive both the live preview's `render(pixelBuffer:)` and the still
+    /// capture's filter encode (``PRMPhotoCapture/capturePhoto(settings:applyingChain:context:willCapture:)``).
+    /// Empty entries returns the source unchanged.
+    ///
+    /// Intensity semantics:
+    /// - `≤ 0`: skip the entry, carry previous step forward.
+    /// - `≥ 1`: replace previous step with filtered output.
+    /// - in between: `CIBlendWithMask` against the previous step using a
+    ///   constant-luminance grayscale mask — i.e. `mix(prev, filtered, intensity)`.
+    public static func apply(_ entries: [Entry], to source: CIImage) -> CIImage {
+        guard !entries.isEmpty else { return source }
+        var currentImage = source
+        for entry in entries {
+            let filtered = entry.filter.render(currentImage)
+            switch entry.intensity {
+            case let intensity where intensity <= 0.0:
+                continue
+            case let intensity where intensity >= 1.0:
+                currentImage = filtered
+            case let intensity:
+                // Build a constant-luminance grayscale mask at value `intensity` then use
+                // CIBlendWithMask, which returns mask·image + (1−mask)·background. Cropping
+                // the mask to the filtered image's extent matches CoreImage's
+                // infinite-extent semantics.
+                let maskColor = CIColor(
+                    red: CGFloat(intensity),
+                    green: CGFloat(intensity),
+                    blue: CGFloat(intensity),
+                    alpha: 1.0
+                )
+                let mask = CIImage(color: maskColor).cropped(to: filtered.extent)
+                currentImage = filtered.applyingFilter("CIBlendWithMask", parameters: [
+                    kCIInputBackgroundImageKey: currentImage,
+                    kCIInputMaskImageKey: mask,
+                ])
+            }
+        }
+        return currentImage
     }
 }

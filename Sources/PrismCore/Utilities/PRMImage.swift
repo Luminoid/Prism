@@ -59,6 +59,45 @@ public enum PRMImage: Sendable {
         context: PRMRenderContext
     ) -> Data? {
         let colorSpace = filteredImage.colorSpace ?? CGColorSpaceCreateDeviceRGB()
+        let options = Self.representationOptions(
+            from: originalProperties,
+            compressionQuality: compressionQuality
+        )
+        return context.ciContext.jpegRepresentation(
+            of: filteredImage,
+            colorSpace: colorSpace,
+            options: options
+        )
+    }
+
+    /// HEIF/HEIC equivalent of ``jpegDataPreservingMetadata(from:originalProperties:compressionQuality:context:)``.
+    /// Used by ``PRMPhotoCapture``'s filter-encode path when the user requested an HEIC
+    /// `AVVideoCodecType` on `PRMPhotoSettings`. Returns `nil` when the device's CIContext
+    /// cannot encode HEIF (older simulators, missing HEVC encoder); callers should fall
+    /// back to JPEG in that case.
+    public static func heifDataPreservingMetadata(
+        from filteredImage: CIImage,
+        originalProperties: [String: Any],
+        compressionQuality: CGFloat = 0.9,
+        context: PRMRenderContext
+    ) -> Data? {
+        let colorSpace = filteredImage.colorSpace ?? CGColorSpaceCreateDeviceRGB()
+        let options = Self.representationOptions(
+            from: originalProperties,
+            compressionQuality: compressionQuality
+        )
+        return context.ciContext.heifRepresentation(
+            of: filteredImage,
+            format: .RGBA8,
+            colorSpace: colorSpace,
+            options: options
+        )
+    }
+
+    private static func representationOptions(
+        from originalProperties: [String: Any],
+        compressionQuality: CGFloat
+    ) -> [CIImageRepresentationOption: Any] {
         var options: [CIImageRepresentationOption: Any] = [
             kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: compressionQuality,
         ]
@@ -68,10 +107,6 @@ public enum PRMImage: Sendable {
         if let tiff = originalProperties[kCGImagePropertyTIFFDictionary as String] {
             options[CIImageRepresentationOption(rawValue: kCGImagePropertyTIFFDictionary as String)] = tiff
         }
-        return context.ciContext.jpegRepresentation(
-            of: filteredImage,
-            colorSpace: colorSpace,
-            options: options
-        )
+        return options
     }
 }

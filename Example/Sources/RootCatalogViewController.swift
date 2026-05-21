@@ -3,12 +3,15 @@ import UIKit
 
 // MARK: - RootCatalogViewController
 
-/// Three-demo catalog for the Prism example app.
+/// Five-demo catalog for the Prism example app.
 ///
 /// 1. **Permissions** — camera / mic status, request flow.
 /// 2. **Studio** — DSLR-grade camera app combining preview, lens switching, device controls,
 ///    photo capture, and video recording.
-/// 3. **Filter Chain** — multi-filter pipeline editor with intensity sliders.
+/// 3. **Filter Chain** — multi-filter pipeline editor with intensity sliders + filtered photo
+///    capture (Snap button writes the chain-baked still to Photos).
+/// 4. **Depth Inspector** — live depth map · PRMDepthCapture + filtering.
+/// 5. **Configuration Lab** — every PRMCameraConfiguration knob exposed.
 final class RootCatalogViewController: UIViewController {
     private struct Demo {
         let title: String
@@ -32,15 +35,9 @@ final class RootCatalogViewController: UIViewController {
         ),
         Demo(
             title: "Filter Chain",
-            subtitle: "Multi-filter chain · reorder · intensity blending",
+            subtitle: "Chain editor + intensity blending + filtered photo capture",
             symbol: "wand.and.rays",
             make: { FilterChainViewController() }
-        ),
-        Demo(
-            title: "Basic Renderer",
-            subtitle: "Single-filter pipeline + filtered photo capture",
-            symbol: "camera.macro",
-            make: { BasicRendererViewController() }
         ),
         Demo(
             title: "Depth Inspector",

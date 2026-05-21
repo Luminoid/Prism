@@ -28,14 +28,24 @@ public extension AVCaptureDevice {
 
     /// Sets manual exposure with specific duration and ISO. Both are clamped to the active
     /// format's supported ranges.
+    ///
+    /// `AVCaptureDevice.currentExposureDuration` and `AVCaptureDevice.currentISO` are
+    /// sentinels AVFoundation recognizes as "keep current"; they're passed through
+    /// untouched so callers (e.g. `prm_setISO` setting only ISO, `prm_setShutterSpeed`
+    /// setting only duration) actually get the keep-current semantics they ask for.
+    /// Clamping them would either NaN-poison the duration or peg ISO to maxISO.
     func prm_setCustomExposure(
         duration: CMTime,
         iso: Float,
         completion: (@Sendable (CMTime) -> Void)? = nil
     ) throws {
         guard isExposureModeSupported(.custom) else { return }
-        let clampedISO = min(max(iso, activeFormat.minISO), activeFormat.maxISO)
-        let clampedDuration = Self.clampDuration(duration, for: self)
+        let clampedISO: Float = (iso == AVCaptureDevice.currentISO)
+            ? AVCaptureDevice.currentISO
+            : min(max(iso, activeFormat.minISO), activeFormat.maxISO)
+        let clampedDuration: CMTime = (duration.isValid && duration != AVCaptureDevice.currentExposureDuration)
+            ? Self.clampDuration(duration, for: self)
+            : duration
         try lockForConfiguration()
         defer { unlockForConfiguration() }
         setExposureModeCustom(duration: clampedDuration, iso: clampedISO) { time in completion?(time) }

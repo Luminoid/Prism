@@ -111,6 +111,14 @@ public final class PRMCamera {
         try await session.setMovieFileOutputAttached(attached)
     }
 
+    /// Runtime toggle for Live Photo capability on the photo output. See
+    /// ``PRMCameraSession/setLivePhotoCaptureEnabled(_:)`` — flip this off before
+    /// entering manual exposure (custom ISO / shutter / WB lock) and back on when the
+    /// user returns to auto exposure with Live Photo capture intended.
+    public func setLivePhotoCaptureEnabled(_ enabled: Bool) async {
+        await session.setLivePhotoCaptureEnabled(enabled)
+    }
+
     // MARK: - Device controls (forward to AVCaptureDevice extensions on actor)
 
     public func setZoom(_ factor: CGFloat) async {
@@ -414,6 +422,19 @@ public final class PRMCamera {
         // no observable behavior change — `[weak self]` ensures the task no-ops if the camera
         // has deinited, and the underlying observers are invalidated in `deinit` so no new tasks
         // are spawned after teardown.
+        //
+        // Re-entrant: a follow-up `configure(_:)` call re-runs this method. Drop the
+        // previous observers first so we don't end up with duplicates yielding the same
+        // state twice per change (and re-adding them on every Apply tap in the
+        // ConfigurationLab example).
+        for obs in keyValueObservations {
+            obs.invalidate()
+        }
+        keyValueObservations.removeAll()
+        for obs in notificationObservers {
+            NotificationCenter.default.removeObserver(obs)
+        }
+        notificationObservers.removeAll()
         let underlyingSession = session.session
 
         let runningObservation = underlyingSession.observe(\.isRunning, options: .new) { [weak self] _, change in

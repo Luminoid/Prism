@@ -42,6 +42,13 @@ public struct PRMCameraDevice: Sendable, Equatable {
     /// Supported ISO range for the active format.
     public let isoRange: ClosedRange<Float>
 
+    /// Supported shutter speed range (in seconds) for the active format. Bounds are
+    /// `minExposureDuration … maxExposureDuration` evaluated at snapshot time — the
+    /// default `.photo` preset typically caps out around 1/3s on most iPhones, so the
+    /// upper bound is small. Re-snapshot after a format change (slo-mo, video) to pick
+    /// up the new range.
+    public let shutterRange: ClosedRange<Double>
+
     /// Whether the device supports locking white balance with custom temperature/tint.
     public let supportsCustomWhiteBalance: Bool
 
@@ -64,6 +71,7 @@ public struct PRMCameraDevice: Sendable, Equatable {
         hasFlash: Bool,
         exposureBiasRange: ClosedRange<Float>,
         isoRange: ClosedRange<Float>,
+        shutterRange: ClosedRange<Double>,
         supportsCustomWhiteBalance: Bool,
         supportsSlowMotion: Bool,
         maxFrameRate: Float64
@@ -80,6 +88,7 @@ public struct PRMCameraDevice: Sendable, Equatable {
         self.hasFlash = hasFlash
         self.exposureBiasRange = exposureBiasRange
         self.isoRange = isoRange
+        self.shutterRange = shutterRange
         self.supportsCustomWhiteBalance = supportsCustomWhiteBalance
         self.supportsSlowMotion = supportsSlowMotion
         self.maxFrameRate = maxFrameRate
@@ -100,6 +109,7 @@ public struct PRMCameraDevice: Sendable, Equatable {
         hasFlash = device.hasFlash
         exposureBiasRange = device.minExposureTargetBias ... device.maxExposureTargetBias
         isoRange = device.activeFormat.minISO ... device.activeFormat.maxISO
+        shutterRange = device.prm_shutterSpeedRange()
         supportsCustomWhiteBalance = device.isLockingWhiteBalanceWithCustomDeviceGainsSupported
         supportsSlowMotion = device.formats.contains { format in
             format.videoSupportedFrameRateRanges.contains { $0.maxFrameRate >= 120 }

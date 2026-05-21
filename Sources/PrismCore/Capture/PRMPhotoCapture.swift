@@ -52,12 +52,56 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         context: PRMRenderContext? = nil,
         willCapture: (@Sendable () -> Void)? = nil
     ) async throws -> PRMPhoto {
+        try await capturePhoto(
+            settings: settings,
+            filterRecipe: filter.map { .single($0, context: context) } ?? .none,
+            willCapture: willCapture
+        )
+    }
+
+    /// Captures a photo and re-encodes it through every entry in `chainEntries`, with
+    /// per-entry intensity blending (the same blend math used by ``PRMFilterChain``
+    /// during live preview). Use this when you want the still capture to match what the
+    /// user sees in a chain-driven preview.
+    ///
+    /// Pass a snapshot of the chain's `entries` — the array is iterated once at encode
+    /// time, so mutating the chain after this call returns has no effect on the result.
+    ///
+    /// - Parameters:
+    ///   - settings: Builder for `AVCapturePhotoSettings`.
+    ///   - chainEntries: Filter chain entries to apply in order. Empty array re-encodes
+    ///     the original frame unchanged (still pays the round-trip through `PRMImage` —
+    ///     prefer the no-filter overload if no filtering is intended).
+    ///   - context: Render context for the filter encode. Required.
+    ///   - willCapture: Called the moment the shutter fires (for animation).
+    /// - Returns: A ``PRMPhoto`` with encoded data + metadata.
+    public func capturePhoto(
+        settings: PRMPhotoSettings = PRMPhotoSettings(),
+        applyingChain chainEntries: [PRMFilterChain.Entry],
+        context: PRMRenderContext,
+        willCapture: (@Sendable () -> Void)? = nil
+    ) async throws -> PRMPhoto {
+        try await capturePhoto(
+            settings: settings,
+            filterRecipe: .chain(chainEntries, context: context),
+            willCapture: willCapture
+        )
+    }
+
+    /// Internal common path shared by both `applying:` and `applyingChain:` overloads.
+    /// Both forms produce the same delegate / continuation plumbing — only the filter
+    /// recipe differs at encode time.
+    private func capturePhoto(
+        settings: PRMPhotoSettings,
+        filterRecipe: FilterRecipe,
+        willCapture: (@Sendable () -> Void)?
+    ) async throws -> PRMPhoto {
         let avSettings = settings.makeAVSettings()
         clampFlashMode(on: avSettings)
         let pending = PendingCapture(
             kind: .single,
-            filter: filter,
-            context: context,
+            filterRecipe: filterRecipe,
+            filterCodec: settings.codec,
             willCapture: willCapture
         )
 
@@ -120,8 +164,7 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
 
             let pending = PendingCapture(
                 kind: .live(movieURL: movieURL),
-                filter: nil,
-                context: nil,
+                filterRecipe: .none,
                 willCapture: willCapture
             )
 
@@ -171,10 +214,24 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         case live(movieURL: URL)
     }
 
+    /// Encoder-time recipe for the optional filter pass: nothing, one filter, or a chain
+    /// snapshot. Both shapes share the same render context requirement, so threading the
+    /// context through the case payloads keeps the encode-time call site exhaustive.
+    enum FilterRecipe {
+        case none
+        case single(any PRMFilter, context: PRMRenderContext?)
+        case chain([PRMFilterChain.Entry], context: PRMRenderContext)
+    }
+
     final class PendingCapture {
         let kind: PendingKind
-        let filter: (any PRMFilter)?
-        let context: PRMRenderContext?
+        let filterRecipe: FilterRecipe
+        /// Encoder choice for the filter pass. `nil` means "no filter pass" — the original
+        /// AVFoundation-encoded payload is used verbatim. Otherwise the encode honors the
+        /// codec the caller requested on `PRMPhotoSettings` so HEIC selections actually
+        /// produce HEIC output (the filter pass re-encodes from scratch via CoreImage —
+        /// AVFoundation's codec choice only applies to the *original* photo data).
+        let filterCodec: AVVideoCodecType?
         let willCapture: (@Sendable () -> Void)?
         var singleContinuation: CheckedContinuation<PRMPhoto, Error>?
         var liveContinuation: CheckedContinuation<PRMLivePhoto, Error>?
@@ -185,13 +242,13 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
 
         init(
             kind: PendingKind,
-            filter: (any PRMFilter)?,
-            context: PRMRenderContext?,
+            filterRecipe: FilterRecipe,
+            filterCodec: AVVideoCodecType? = nil,
             willCapture: (@Sendable () -> Void)?
         ) {
             self.kind = kind
-            self.filter = filter
-            self.context = context
+            self.filterRecipe = filterRecipe
+            self.filterCodec = filterCodec
             self.willCapture = willCapture
         }
     }
@@ -218,18 +275,69 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
     ) -> PRMPhoto {
         let metadata = photo.metadata
         let finalData: Data
-        if let filter = pending.filter, let context = pending.context, let sourceImage = CIImage(data: originalData) {
+
+        switch pending.filterRecipe {
+        case .none:
+            finalData = originalData
+
+        case let .single(filter, context):
+            guard let context, let sourceImage = CIImage(data: originalData) else {
+                finalData = originalData
+                break
+            }
             let filtered = filter.render(sourceImage)
             let preservedProperties = sourceImage.properties.merging(metadata) { _, new in new }
-            finalData = PRMImage.jpegDataPreservingMetadata(
-                from: filtered,
-                originalProperties: preservedProperties,
+            finalData = Self.encodeFilteredImage(
+                filtered,
+                preservedProperties: preservedProperties,
+                codec: pending.filterCodec,
                 context: context
             ) ?? originalData
-        } else {
-            finalData = originalData
+
+        case let .chain(entries, context):
+            guard let sourceImage = CIImage(data: originalData) else {
+                finalData = originalData
+                break
+            }
+            // Reuse the chain's own static helper so the still-capture output matches
+            // the live preview pixel-for-pixel (same intensity-blend math, same order).
+            let blended = PRMFilterChain.apply(entries, to: sourceImage)
+            let preservedProperties = sourceImage.properties.merging(metadata) { _, new in new }
+            finalData = Self.encodeFilteredImage(
+                blended,
+                preservedProperties: preservedProperties,
+                codec: pending.filterCodec,
+                context: context
+            ) ?? originalData
         }
         return PRMPhoto(data: finalData, underlyingPhoto: photo, metadata: metadata)
+    }
+
+    /// Route the filtered CIImage to the codec the caller asked for on `PRMPhotoSettings`.
+    /// `.hevc` (or anything HEIC-family) maps to ``PRMImage/heifDataPreservingMetadata``;
+    /// everything else falls back to JPEG so callers that don't care about codec still get
+    /// usable output. Falls back to JPEG if HEIF encode returns `nil` (older sims with no
+    /// HEVC encoder).
+    private static func encodeFilteredImage(
+        _ image: CIImage,
+        preservedProperties: [String: Any],
+        codec: AVVideoCodecType?,
+        context: PRMRenderContext
+    ) -> Data? {
+        if codec == .hevc || codec == .hevcWithAlpha {
+            if let heif = PRMImage.heifDataPreservingMetadata(
+                from: image,
+                originalProperties: preservedProperties,
+                context: context
+            ) {
+                return heif
+            }
+        }
+        return PRMImage.jpegDataPreservingMetadata(
+            from: image,
+            originalProperties: preservedProperties,
+            context: context
+        )
     }
 }
 

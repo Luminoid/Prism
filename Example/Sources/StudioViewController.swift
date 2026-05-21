@@ -217,6 +217,40 @@ final class StudioViewController: UIViewController {
 
     private var lastDevice: PRMCameraDevice?
 
+    // MARK: - Drawer row handles
+
+    //
+    // Kept so sliders / segmented controls can be cross-synced from `updateTelemetry` and
+    // from each other — e.g. dragging ISO promotes the exposure-mode segmented to "Custom",
+    // picking the Day/Indoor/Night preset updates the ISO + shutter sliders, the state-
+    // stream tick keeps every widget aligned with AVFoundation's actual mode after
+    // auto-mode drift.
+
+    private var exposureModeSegmented: UISegmentedControl?
+    private var evRow: PRMSettingsRow?
+    private var evSlider: UISlider?
+    private var isoRow: PRMSettingsRow?
+    private var isoSlider: UISlider?
+    private var shutterRow: PRMSettingsRow?
+    private var shutterSlider: UISlider?
+    /// User-facing stops, in seconds. Filled in by `makeShutterRow` to match the active
+    /// format's supported range so the slider can't land on a value the device will
+    /// silently clamp out from under us.
+    private var shutterStops: [Double] = []
+    private var customExposureSegmented: UISegmentedControl?
+    private var wbModeSegmented: UISegmentedControl?
+    private var wbRow: PRMSettingsRow?
+    private var wbKelvinSlider: UISlider?
+    private var focusModeSegmented: UISegmentedControl?
+    private var focusRow: PRMSettingsRow?
+    private var lensSlider: UISlider?
+
+    /// Set while a programmatic slider / segmented update is in flight so the
+    /// `.valueChanged` action doesn't re-fire the underlying camera setter. Prevents a
+    /// feedback loop when the state-stream sync writes back into the same control that
+    /// originated the change.
+    private var isApplyingExternalUpdate = false
+
     /// Drives `PRMCamera.rampZoom` / `.cancelZoomRamp` — smooth 1.0×→2.0× ramp at rate 1.0.
     fileprivate var isZoomRamping = false
 
@@ -908,6 +942,15 @@ final class StudioViewController: UIViewController {
                 reportError(error, context: "Mode switch")
             }
 
+            // Live Photo capability has to be *off* in every non-Live mode. Leaving it on
+            // makes AVFoundation silently revert manual exposure (custom ISO/shutter) and
+            // WB lock back to auto within a frame or two — the photo output requires the
+            // sensor in a continuous-auto pipeline to be able to retroactively bracket
+            // the Live Photo movie. Manual sliders only behave when the photo output
+            // isn't advertising Live Photo. Apple Camera's own UX matches: Live mode auto-
+            // enables Live Photo, switching away disables it. Studio mirrors that.
+            await camera.setLivePhotoCaptureEnabled(mode == .live)
+
             // Pro iPhones expose 120/240 fps slo-mo formats only on the physical wide
             // camera, not on the virtual triple. Hop devices on slo-mo entry / exit so
             // `setFrameRate(120)` actually has a format to lock onto. The triple→wide
@@ -1548,6 +1591,17 @@ final class StudioViewController: UIViewController {
             previewView.mirroring = (next == .front)
             rebuildLensStrip()
             populateModeStrip()
+            // Swapping the video input recreates the data-output connection, which
+            // resets `videoRotationAngle` to 0 (raw sensor landscape). Without a
+            // baseline, the preview shows landscape until the new rotation coordinator
+            // emits a non-zero angle — which is gated on CoreMotion samples and can lag
+            // visibly, especially on the front camera where the user is now staring
+            // directly at the sideways preview. Apply 90° immediately so the preview is
+            // portrait from frame 1; the coordinator's first emission then refines it as
+            // the device tilts. Same angle works for both cameras — AVFoundation
+            // absorbs the sensor-orientation difference, and the front-camera mirror is
+            // handled separately in `PRMPreviewView.mirroring`.
+            await applyConnectionRotation(90)
             await rebindRotationCoordinator()
             await applyDefaultFocalLength()
         } catch {
@@ -1559,9 +1613,14 @@ final class StudioViewController: UIViewController {
     // MARK: - Gestures
 
     @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
-        let viewPoint = gesture.location(in: previewView)
-        let devicePoint = previewView.texturePoint(fromViewPoint: viewPoint)
-        focusIndicator.show(at: viewPoint, in: view)
+        // The gesture is attached to `previewView` so `location(in: previewView)` is the
+        // correct origin for device-coord conversion. Showing the indicator in `previewView`
+        // (not `view`) means it lands under the user's finger — passing `in: view` while
+        // the point is still in `previewView` coords offsets the indicator by the
+        // preview's top inset (the chrome above it), which is the visible bug.
+        let previewPoint = gesture.location(in: previewView)
+        let devicePoint = previewView.texturePoint(fromViewPoint: previewPoint)
+        focusIndicator.show(at: previewPoint, in: previewView)
         Task {
             await camera.setFocusAndExposure(
                 focusMode: .autoFocus,
@@ -1657,6 +1716,16 @@ final class StudioViewController: UIViewController {
             makeMaxDimensionsRow(),
             makeRedEyeRow(),
         ])
+
+        // Wire the disabled-state toast handler on every row that can flip into the
+        // disabled state. The handler itself is stable across the row's lifetime; only
+        // the `disabledMessage` changes per state-stream tick.
+        let toast: (String) -> Void = { [weak self] message in self?.showToast(message) }
+        evRow?.onDisabledTap = toast
+        isoRow?.onDisabledTap = toast
+        shutterRow?.onDisabledTap = toast
+        wbRow?.onDisabledTap = toast
+        focusRow?.onDisabledTap = toast
     }
 }
 
@@ -1664,7 +1733,13 @@ final class StudioViewController: UIViewController {
 
 extension StudioViewController {
     private func makeExposureModeRow() -> PRMSettingsRow {
-        let segmented = UISegmentedControl(items: ["Locked", "Auto", "Cont"])
+        // 4-segment: Locked / Auto / Cont / Custom. The Custom segment is read-only —
+        // tapping it shows the user a toast pointing them to the ISO / Shutter sliders
+        // (or the Custom Exposure preset row) since `.custom` only takes effect via a
+        // duration+iso pair, not a bare mode set. The segmented control reflects the
+        // active mode from the state stream so dragging ISO / Shutter (which promotes
+        // to `.custom` under the hood) keeps this UI truthful.
+        let segmented = UISegmentedControl(items: ["Locked", "Auto", "Cont", "Custom"])
         segmented.selectedSegmentIndex = 1
         let row = PRMSettingsRow(
             symbolName: "lock.shield",
@@ -1673,14 +1748,27 @@ extension StudioViewController {
             content: segmented
         )
         segmented.addAction(UIAction { [weak self, weak row] _ in
-            let mode: AVCaptureDevice.ExposureMode
+            guard let self, !isApplyingExternalUpdate else { return }
             switch segmented.selectedSegmentIndex {
-            case 0: mode = .locked; row?.valueText = "locked"
-            case 1: mode = .autoExpose; row?.valueText = "auto"
-            default: mode = .continuousAutoExposure; row?.valueText = "continuous"
+            case 0:
+                row?.valueText = "locked"
+                Task { await self.camera.setExposureMode(.locked) }
+            case 1:
+                row?.valueText = "auto"
+                Task { await self.camera.setExposureMode(.autoExpose) }
+            case 2:
+                row?.valueText = "continuous"
+                Task { await self.camera.setExposureMode(.continuousAutoExposure) }
+            case 3:
+                // `.custom` requires a (duration, iso) pair. Don't apply it from a bare
+                // segment tap — the API call would no-op. Roll the segmented back to the
+                // current mode and prompt the user toward the sliders.
+                showToast("Drag ISO or Shutter to enter Custom")
+                applyExposureModeUI(self.camera.state.exposureMode, to: segmented, row: row)
+            default: break
             }
-            Task { await self?.camera.setExposureMode(mode) }
         }, for: .valueChanged)
+        exposureModeSegmented = segmented
         return row
     }
 
@@ -1694,15 +1782,23 @@ extension StudioViewController {
             content: segmented
         )
         segmented.addAction(UIAction { [weak self, weak row] _ in
-            guard let self else { return }
+            guard let self, !isApplyingExternalUpdate else { return }
             let (duration, iso, label): (CMTime, Float, String) = switch segmented.selectedSegmentIndex {
-            case 0: (CMTime(value: 1, timescale: 500), max(50, device.isoRange.lowerBound), "1/500 · ISO \(Int(device.isoRange.lowerBound))")
-            case 1: (CMTime(value: 1, timescale: 60), min(400, device.isoRange.upperBound), "1/60 · ISO 400")
-            default: (CMTime(value: 1, timescale: 30), min(1600, device.isoRange.upperBound), "1/30 · ISO 1600")
+            case 0:
+                (CMTime(value: 1, timescale: 500), max(50, device.isoRange.lowerBound), "1/500 · ISO \(Int(max(50, device.isoRange.lowerBound)))")
+            case 1:
+                (CMTime(value: 1, timescale: 60), min(400, device.isoRange.upperBound), "1/60 · ISO \(Int(min(400, device.isoRange.upperBound)))")
+            default:
+                (CMTime(value: 1, timescale: 30), min(1600, device.isoRange.upperBound), "1/30 · ISO \(Int(min(1600, device.isoRange.upperBound)))")
             }
             row?.valueText = label
+            // Reflect the preset into the ISO + Shutter sliders so the user can see and
+            // continue dragging from the preset's values. Mode follows on the next state
+            // tick (`setCustomExposure` promotes to `.custom`).
+            syncManualExposureControls(durationSeconds: CMTimeGetSeconds(duration), iso: iso)
             Task { await camera.setCustomExposure(duration: duration, iso: iso) }
         }, for: .valueChanged)
+        customExposureSegmented = segmented
         return row
     }
 
@@ -1716,14 +1812,16 @@ extension StudioViewController {
             content: segmented
         )
         segmented.addAction(UIAction { [weak self, weak row] _ in
+            guard let self, !isApplyingExternalUpdate else { return }
             let mode: AVCaptureDevice.WhiteBalanceMode
             switch segmented.selectedSegmentIndex {
             case 0: mode = .locked; row?.valueText = "locked"
             case 1: mode = .autoWhiteBalance; row?.valueText = "auto"
             default: mode = .continuousAutoWhiteBalance; row?.valueText = "continuous"
             }
-            Task { await self?.camera.setWhiteBalanceMode(mode) }
+            Task { await self.camera.setWhiteBalanceMode(mode) }
         }, for: .valueChanged)
+        wbModeSegmented = segmented
         return row
     }
 
@@ -1737,32 +1835,47 @@ extension StudioViewController {
             content: segmented
         )
         segmented.addAction(UIAction { [weak self, weak row] _ in
+            guard let self, !isApplyingExternalUpdate else { return }
             let mode: AVCaptureDevice.FocusMode
             switch segmented.selectedSegmentIndex {
             case 0: mode = .locked; row?.valueText = "locked"
             case 1: mode = .autoFocus; row?.valueText = "auto"
             default: mode = .continuousAutoFocus; row?.valueText = "continuous"
             }
-            guard let self else { return }
             let session = camera.session
             Task { @PRMCameraActor in
                 guard let device = session.videoDevice else { return }
                 try? device.prm_setFocusMode(mode)
             }
+            Task { @MainActor [weak self] in
+                // Bare focus-mode set doesn't go through `PRMCamera`, so refresh state
+                // manually to drive `updateTelemetry` and the downstream UI sync.
+                await self?.camera.refreshState()
+            }
         }, for: .valueChanged)
+        focusModeSegmented = segmented
         return row
     }
 
     private func makeZoomRampRow(device: PRMCameraDevice) -> PRMSettingsRow {
         let button = UIButton(type: .system)
-        button.setTitle("Ramp →", for: .normal)
+        button.setTitle("Ramp", for: .normal)
         button.setTitleColor(.systemYellow, for: .normal)
         button.titleLabel?.font = .systemFont(ofSize: 13, weight: .semibold)
-        let target: CGFloat = min(2.0, device.maxZoomFactor)
+        // Label the ramp targets with the actual 35mm-equivalent focal lengths users
+        // already read in the telemetry strip, instead of raw zoom factors. On a
+        // triple-camera iPhone "1× ↔ 2×" is "24mm ↔ 48mm" (wide → wide sensor crop),
+        // matching what users say when they zoom Apple Camera.
+        let idleLabel = "\(Int(focalLength35mm(forZoom: 1.0).rounded()))mm ↔ \(Int(focalLength35mm(forZoom: 2.0).rounded()))mm"
         let row = PRMSettingsRow(
             symbolName: "arrow.up.right.and.arrow.down.left.rectangle",
             title: "Smooth Ramp",
-            valueText: "→ \(String(format: "%.1f×", target))",
+            // Pick a meaningful target each tap: ping-pong between the wide lens at 1×
+            // and 2×. Hardcoding `2×` (the previous behavior) was a no-op whenever the
+            // user had already pinched to 2× and tapped Ramp — same source and target,
+            // AVFoundation returned immediately, the user saw the button flip to
+            // "Cancel" but no zoom motion.
+            valueText: idleLabel,
             content: button
         )
         button.addAction(UIAction { [weak self, weak row] _ in
@@ -1770,16 +1883,62 @@ extension StudioViewController {
             if isZoomRamping {
                 Task { await self.camera.cancelZoomRamp() }
                 isZoomRamping = false
-                row?.valueText = "→ \(String(format: "%.1f×", target))"
-                button.setTitle("Ramp →", for: .normal)
-            } else {
-                Task { await self.camera.rampZoom(to: target, rate: 1.0) }
-                isZoomRamping = true
-                row?.valueText = "ramping…"
-                button.setTitle("Cancel", for: .normal)
+                row?.valueText = idleLabel
+                button.setTitle("Ramp", for: .normal)
+                return
+            }
+            // Pick the target that's furthest from the current zoom so the ramp is
+            // always visible. Clamp to the device's range — on iPhones with no 2×
+            // available (e.g. the front camera maxes at ~1× on most models), fall back
+            // to half the max range.
+            let current = camera.state.zoomFactor
+            let candidate: CGFloat = (current < 1.5) ? 2.0 : 1.0
+            let target = min(max(candidate, device.minZoomFactor), device.maxZoomFactor)
+            guard abs(target - current) > 0.05 else {
+                showToast("Already at \(Int(focalLength35mm(forZoom: target).rounded()))mm")
+                return
+            }
+            isZoomRamping = true
+            row?.valueText = "ramping → \(Int(focalLength35mm(forZoom: target).rounded()))mm…"
+            button.setTitle("Cancel", for: .normal)
+            // Kick off the ramp and a watcher that flips the UI back to idle once
+            // AVFoundation reports the ramp finished. Rate 1.0 = `pow(2, t)` factor
+            // per second; the watcher polls at 100 ms which is well below human-visible
+            // ramp completion lag (~1 s for a 1× → 2× ramp).
+            Task { [weak self, weak row, weak button] in
+                guard let self else { return }
+                await camera.rampZoom(to: target, rate: 1.0)
+                // Poll at ~30Hz during the ramp so `refreshState`'s state-stream tick
+                // pulls the live `videoZoomFactor` smoothly into telemetry — without
+                // this, the focal-length readout only resamples every 500ms (the idle
+                // telemetry tick) so the user sees the focal length jump from one
+                // discrete sample to the next, then a final big jump as the ramp lands.
+                // 30Hz feels continuous and is well under the actor-hop overhead.
+                while !Task.isCancelled, await self.isDeviceRamping() {
+                    await self.camera.refreshState()
+                    try? await Task.sleep(for: .milliseconds(33))
+                }
+                // Final pull after AVFoundation reports the ramp finished, so the
+                // telemetry settles on the exact landed `videoZoomFactor` (the last
+                // 30Hz pull during the loop captured an in-flight value, not the
+                // committed end value).
+                await self.camera.refreshState()
+                isZoomRamping = false
+                row?.valueText = idleLabel
+                button?.setTitle("Ramp", for: .normal)
             }
         }, for: .touchUpInside)
         return row
+    }
+
+    /// Reads `device.isRampingVideoZoom` on the camera actor — used by the Ramp row to
+    /// auto-flip its button back to "Ramp" when AVFoundation reports the smooth ramp
+    /// has completed.
+    private func isDeviceRamping() async -> Bool {
+        let session = camera.session
+        return await PRMCameraActor.shared.run {
+            await session.videoDevice?.isRampingVideoZoom ?? false
+        }
     }
 
     private func makeMaxDimensionsRow() -> PRMSettingsRow {
@@ -1828,10 +1987,13 @@ extension StudioViewController {
             content: slider
         )
         slider.addAction(UIAction { [weak self, weak row] _ in
+            guard let self, !isApplyingExternalUpdate else { return }
             let bias = slider.value
             row?.valueText = String(format: "%+0.1f", bias)
-            Task { await self?.camera.setExposureBias(bias) }
+            Task { await self.camera.setExposureBias(bias) }
         }, for: .valueChanged)
+        evRow = row
+        evSlider = slider
         return row
     }
 
@@ -1857,23 +2019,36 @@ extension StudioViewController {
             content: stack
         )
         autoChip.onTap = { [weak self, weak row] in
+            guard let self else { return }
             row?.valueText = "auto"
-            Task { await self?.camera.setExposureMode(.continuousAutoExposure) }
+            Task { await self.camera.setExposureMode(.continuousAutoExposure) }
         }
         slider.addAction(UIAction { [weak self, weak row] _ in
+            guard let self, !isApplyingExternalUpdate else { return }
             let iso = slider.value
             row?.valueText = "\(Int(iso))"
-            Task { await self?.camera.setISO(iso) }
+            // `PRMCamera.setISO` calls `prm_setCustomExposure` which switches mode to
+            // `.custom`. The next state-stream tick reflects that into the Exposure Mode
+            // segmented (Custom segment). Also reset the Custom Exposure preset to "—"
+            // since the user is now driving a free-form value, not one of the presets.
+            customExposureSegmented?.selectedSegmentIndex = UISegmentedControl.noSegment
+            Task { await self.camera.setISO(iso) }
         }, for: .valueChanged)
+        isoRow = row
+        isoSlider = slider
         return row
     }
 
-    private func makeShutterRow(device _: PRMCameraDevice) -> PRMSettingsRow {
+    private func makeShutterRow(device: PRMCameraDevice) -> PRMSettingsRow {
         let slider = UISlider()
         slider.minimumValue = 0
         slider.maximumValue = 1
         slider.value = 0.5
-        let stops: [Double] = [1.0 / 8000, 1.0 / 4000, 1.0 / 2000, 1.0 / 1000, 1.0 / 500, 1.0 / 250, 1.0 / 125, 1.0 / 60, 1.0 / 30, 1.0 / 15, 1.0 / 8, 1.0 / 4, 0.5, 1.0]
+        // Build the stop list from the active format's actual range, not a fixed array.
+        // The default `.photo` preset typically tops out around 1/3s — leaving the
+        // hardcoded 0.5s and 1.0s stops silently clamped, which made the slider feel
+        // dead at the long-exposure end. `device.shutterRange` is the live source of truth.
+        shutterStops = Self.shutterStops(in: device.shutterRange)
         let row = PRMSettingsRow(
             symbolName: "stopwatch",
             title: "Shutter",
@@ -1881,13 +2056,36 @@ extension StudioViewController {
             content: slider
         )
         slider.addAction(UIAction { [weak self, weak row] _ in
+            guard let self, !isApplyingExternalUpdate, !shutterStops.isEmpty else { return }
             let normalized = slider.value
-            let index = max(0, min(stops.count - 1, Int(round(Double(normalized) * Double(stops.count - 1)))))
-            let seconds = stops[index]
-            row?.valueText = "1/\(Int(round(1.0 / seconds)))"
-            Task { await self?.camera.setShutterSpeed(seconds: seconds) }
+            let index = max(0, min(shutterStops.count - 1, Int(round(Double(normalized) * Double(shutterStops.count - 1)))))
+            let seconds = shutterStops[index]
+            row?.valueText = Self.formatShutter(seconds)
+            customExposureSegmented?.selectedSegmentIndex = UISegmentedControl.noSegment
+            Task { await self.camera.setShutterSpeed(seconds: seconds) }
         }, for: .valueChanged)
+        shutterRow = row
+        shutterSlider = slider
         return row
+    }
+
+    /// Builds the user-facing shutter-speed stops clamped to the device's supported range.
+    /// Mirrors Apple Camera's stop pattern (`1/8000` → `1s`) but skips any stop outside
+    /// `[minExposureDuration, maxExposureDuration]` so the slider can't land on a value
+    /// the device will silently clamp out from under us.
+    private static func shutterStops(in range: ClosedRange<Double>) -> [Double] {
+        let candidates: [Double] = [
+            1.0 / 8000, 1.0 / 4000, 1.0 / 2000, 1.0 / 1000, 1.0 / 500, 1.0 / 250,
+            1.0 / 125, 1.0 / 60, 1.0 / 30, 1.0 / 15, 1.0 / 8, 1.0 / 4, 0.5, 1.0, 2.0,
+        ]
+        return candidates.filter { range.contains($0) }
+    }
+
+    private static func formatShutter(_ seconds: Double) -> String {
+        guard seconds > 0, seconds.isFinite else { return "n/a" }
+        return seconds >= 1.0
+            ? String(format: "%.1fs", seconds)
+            : "1/\(Int(round(1.0 / seconds)))s"
     }
 
     private func makeWhiteBalanceRow() -> PRMSettingsRow {
@@ -1917,20 +2115,28 @@ extension StudioViewController {
         for entry in presets {
             let chip = TextChip(title: entry.label)
             chip.onTap = { [weak self, weak row] in
+                guard let self else { return }
                 row?.valueText = "\(Int(entry.preset.temperature))K"
+                isApplyingExternalUpdate = true
                 kelvinSlider.value = entry.preset.temperature
-                Task { await self?.camera.lockWhiteBalance(preset: entry.preset) }
+                isApplyingExternalUpdate = false
+                // `lockWhiteBalance` flips the device into `.locked` mode under the hood —
+                // the next state-stream tick will sync the WB Mode segmented to "Locked".
+                Task { await self.camera.lockWhiteBalance(preset: entry.preset) }
             }
             chips.addArrangedSubview(chip)
         }
         kelvinSlider.addAction(UIAction { [weak self, weak row] _ in
+            guard let self, !isApplyingExternalUpdate else { return }
             let kelvin = kelvinSlider.value
             row?.valueText = "\(Int(kelvin))K"
             let values = AVCaptureDevice.PRMTemperatureAndTint(temperature: kelvin, tint: 0)
-            Task { await self?.camera.lockWhiteBalance(values) }
+            Task { await self.camera.lockWhiteBalance(values) }
         }, for: .valueChanged)
         stack.addArrangedSubview(kelvinSlider)
         stack.addArrangedSubview(chips)
+        wbRow = row
+        wbKelvinSlider = kelvinSlider
         return row
     }
 
@@ -1938,15 +2144,15 @@ extension StudioViewController {
         let stack = UIStackView()
         stack.axis = .vertical
         stack.spacing = 6
-        let lensSlider = UISlider()
-        lensSlider.minimumValue = 0
-        lensSlider.maximumValue = 1
-        lensSlider.value = camera.state.lensPosition
+        let slider = UISlider()
+        slider.minimumValue = 0
+        slider.maximumValue = 1
+        slider.value = camera.state.lensPosition
         let label = UILabel()
         label.textColor = UIColor.white.withAlphaComponent(0.6)
         label.font = .systemFont(ofSize: 11)
         label.text = "Drag to lock focus distance"
-        stack.addArrangedSubview(lensSlider)
+        stack.addArrangedSubview(slider)
         stack.addArrangedSubview(label)
         let row = PRMSettingsRow(
             symbolName: "scope",
@@ -1954,11 +2160,16 @@ extension StudioViewController {
             valueText: String(format: "%.2f", camera.state.lensPosition),
             content: stack
         )
-        lensSlider.addAction(UIAction { [weak self, weak row] _ in
-            let pos = lensSlider.value
+        slider.addAction(UIAction { [weak self, weak row] _ in
+            guard let self, !isApplyingExternalUpdate else { return }
+            let pos = slider.value
             row?.valueText = String(format: "%.2f", pos)
-            Task { await self?.camera.setLensPosition(pos) }
+            // `setLensPosition` switches the device into `.locked` focus mode — the
+            // next state-stream tick will sync the Focus Mode segmented to "Locked".
+            Task { await self.camera.setLensPosition(pos) }
         }, for: .valueChanged)
+        focusRow = row
+        lensSlider = slider
         return row
     }
 
@@ -2048,15 +2259,7 @@ extension StudioViewController {
     private func updateTelemetry(from state: PRMCameraState) {
         let zoom = "\(Int(focalLength35mm(forZoom: state.zoomFactor).rounded()))mm"
         let iso = "ISO \(Int(state.iso))"
-        // Apple Camera convention: shutter has an `s` suffix (`1/60s`) so it's visually
-        // distinct from frame-rate readings like `60fps`. Sub-second shutters render as
-        // reciprocal-of-seconds; whole-second exposures (night mode) render as `2.5s`.
-        let shutter = state.exposureDurationSeconds.map { duration -> String in
-            guard duration > 0 else { return "n/a" }
-            return duration >= 1.0
-                ? String(format: "%.1fs", duration)
-                : "1/\(Int(1.0 / duration))s"
-        } ?? "auto"
+        let shutter = state.exposureDurationSeconds.map(Self.formatShutter) ?? "auto"
         let ev = String(format: "EV %+0.1f", state.exposureBias)
         let temp = "\(Int(state.whiteBalanceTemperature))K"
         let fps = state.frameRate.map { "\(Int($0))fps" } ?? ""
@@ -2070,6 +2273,210 @@ extension StudioViewController {
         // Auto-recommend updates as light changes — only does work in Night mode.
         if mode == .night, nightDuration == .auto {
             refreshNightAutoLabel()
+        }
+
+        // Keep the drawer's widgets in sync with the camera's actual state and apply
+        // the compatibility / disable rules.
+        syncDrawerControls(from: state)
+    }
+
+    // MARK: - Drawer control sync
+
+    //
+    // AVFoundation's auto modes mutate ISO / shutter / WB temperature / lens position
+    // every frame without going through a setter; the drawer widgets must mirror that
+    // (so the value the user sees matches the value the device is actually using). The
+    // sliders / segmented controls used to drift out of sync because the row builders
+    // captured initial values but never observed the state stream.
+
+    /// Apply the camera's current state to every drawer widget.
+    ///
+    /// **Sliders only sync from state when their corresponding mode is the manual mode**
+    /// (ISO/Shutter → `.custom` exposure, Kelvin → `.locked` WB, Lens → `.locked` focus).
+    /// Under auto modes AVFoundation continuously mutates `state.iso` / `state.whiteBalanceTemperature` /
+    /// `state.lensPosition` to track the scene — overwriting the slider with those values
+    /// every 500ms made the slider "drift" away from where the user had dragged it. Worse,
+    /// it also made first-drag look like a no-op: the user releases at 800, the next 2 Hz
+    /// tick fires before AVFoundation has fully promoted to `.custom` (or before
+    /// `refreshState()` returns), and the slider snaps back to the auto-driven value just
+    /// as the camera was settling. By only syncing when explicitly in the manual mode, the
+    /// slider's drag stays sticky until the camera has actually adopted the manual value.
+    ///
+    /// The value-label text still mirrors live `state.iso` etc. (with an "(auto)" suffix
+    /// when in auto modes) so the user can see what AVFoundation is currently using even
+    /// when the slider is parked.
+    private func syncDrawerControls(from state: PRMCameraState) {
+        if let segmented = exposureModeSegmented {
+            applyExposureModeUI(state.exposureMode, to: segmented, row: nil)
+        }
+        if let evSlider, !evSlider.isTracking {
+            evSlider.value = state.exposureBias
+        }
+        evRow?.valueText = String(format: "%+0.1f", state.exposureBias)
+
+        // ISO + Shutter sliders: only follow `state` while in `.custom` exposure.
+        if state.exposureMode == .custom,
+           let isoSlider, !isoSlider.isTracking {
+            isoSlider.value = state.iso
+        }
+        isoRow?.valueText = (state.exposureMode == .custom)
+            ? "\(Int(state.iso))"
+            : "\(Int(state.iso)) (auto)"
+
+        if state.exposureMode == .custom,
+           let shutterSlider, !shutterSlider.isTracking,
+           !shutterStops.isEmpty,
+           let durationSec = state.exposureDurationSeconds {
+            let index = Self.nearestStopIndex(to: durationSec, in: shutterStops)
+            let denom = max(shutterStops.count - 1, 1)
+            shutterSlider.value = Float(Double(index) / Double(denom))
+        }
+        shutterRow?.valueText = state.exposureDurationSeconds
+            .map { (state.exposureMode == .custom) ? Self.formatShutter($0) : "\(Self.formatShutter($0)) (auto)" }
+            ?? "auto"
+
+        if let wbModeSegmented {
+            applyWBModeUI(state.whiteBalanceMode, to: wbModeSegmented)
+        }
+        // WB Kelvin slider: only follow `state` while WB is `.locked`.
+        if state.whiteBalanceMode == .locked,
+           let wbKelvinSlider, !wbKelvinSlider.isTracking {
+            wbKelvinSlider.value = state.whiteBalanceTemperature
+        }
+        let wbText = "\(Int(state.whiteBalanceTemperature))K"
+        wbRow?.valueText = (state.whiteBalanceMode == .locked) ? wbText : "\(wbText) (auto)"
+
+        if let focusModeSegmented {
+            applyFocusModeUI(state.focusMode, to: focusModeSegmented)
+        }
+        // Lens slider: only follow `state` while focus is `.locked`.
+        if state.focusMode == .locked,
+           let lensSlider, !lensSlider.isTracking {
+            lensSlider.value = state.lensPosition
+        }
+        let lensText = String(format: "%.2f", state.lensPosition)
+        focusRow?.valueText = (state.focusMode == .locked) ? lensText : "\(lensText) (auto)"
+
+        applyDisabledStates(from: state)
+    }
+
+    /// Drive the disabled-with-toast pattern from the current camera state. Each control
+    /// the user could touch has a single rule about when AVFoundation will ignore (or
+    /// silently fight back against) the change — encode it here and surface it via
+    /// `PRMSettingsRow.setDisabled(message:)` so the user gets a clear reason instead of
+    /// a no-op.
+    private func applyDisabledStates(from state: PRMCameraState) {
+        // EV bias has no effect under custom exposure (manual ISO/shutter is the only
+        // exposure path; bias is a pre-trim on the auto-exposure target).
+        evRow?.setDisabled(message: state.exposureMode == .custom
+            ? "EV bias is ignored under custom exposure"
+            : nil)
+
+        // The Custom Exposure preset doesn't apply while the device is mid-recording —
+        // changing exposure modes during an in-flight movie file output is allowed by
+        // AVFoundation but ends up clipped at the next sample boundary, which produces
+        // a visible flicker. The Night mode also drives its own custom exposure during
+        // long-exposure composition, so block during that capture path too. The preset
+        // row's content is the segmented directly (no `PRMSettingsRow` handle is stored)
+        // — using `isEnabled` + `alpha` on the segmented itself is sufficient. The user
+        // gets standard iOS disabled-segment styling and the segmented swallows taps.
+        let recording = recordingTimer != nil
+        let customExposureDisabled = recording || mode == .night
+        customExposureSegmented?.isEnabled = !customExposureDisabled
+        customExposureSegmented?.alpha = customExposureDisabled ? 0.45 : 1.0
+
+        // ISO + Shutter sliders work in any exposure mode (drag promotes to .custom under
+        // the hood), so they're never structurally disabled — but they're meaningless
+        // during a Night composite (long-exposure capture overrides). Same with WB and
+        // Focus lock sliders during recording: changes mid-record produce visible jumps.
+        if mode == .night, nightDuration != .auto {
+            isoRow?.setDisabled(message: "ISO is fixed during Night exposure")
+            shutterRow?.setDisabled(message: "Shutter is fixed during Night exposure")
+        } else {
+            isoRow?.setDisabled(message: nil)
+            shutterRow?.setDisabled(message: nil)
+        }
+
+        // WB Kelvin slider auto-promotes to .locked, so it works in any WB mode.
+        // Lens slider auto-promotes to .locked focus, so it works in any focus mode.
+        // The remaining disable cases are mid-recording (visible jumps).
+        let recordingMessage: String? = recording ? "Setting locked while recording" : nil
+        wbRow?.setDisabled(message: recordingMessage)
+        focusRow?.setDisabled(message: recordingMessage)
+    }
+
+    /// Find the stop index whose value is closest (in log-shutter space) to `seconds`.
+    /// Log-space comparison matches how photographers think about shutter stops —
+    /// `1/60` is "one stop" from `1/30`, not "half a stop."
+    private static func nearestStopIndex(to seconds: Double, in stops: [Double]) -> Int {
+        guard seconds > 0, !stops.isEmpty else { return 0 }
+        let target = log(seconds)
+        var bestIndex = 0
+        var bestDistance = Double.infinity
+        for (index, stop) in stops.enumerated() where stop > 0 {
+            let d = abs(log(stop) - target)
+            if d < bestDistance {
+                bestDistance = d
+                bestIndex = index
+            }
+        }
+        return bestIndex
+    }
+
+    /// Reflect `mode` into the 4-segment Exposure Mode picker (Locked / Auto / Cont /
+    /// Custom). `row` is optional so the same helper works from both the segmented's own
+    /// action handler (which has the row) and from `syncDrawerControls` (which doesn't —
+    /// it walks the segmented directly).
+    private func applyExposureModeUI(
+        _ mode: AVCaptureDevice.ExposureMode,
+        to segmented: UISegmentedControl,
+        row: PRMSettingsRow?
+    ) {
+        let index: Int
+        let label: String
+        switch mode {
+        case .locked: index = 0; label = "locked"
+        case .autoExpose: index = 1; label = "auto"
+        case .continuousAutoExposure: index = 2; label = "continuous"
+        case .custom: index = 3; label = "custom"
+        @unknown default: index = 1; label = "auto"
+        }
+        segmented.selectedSegmentIndex = index
+        row?.valueText = label
+    }
+
+    private func applyWBModeUI(_ mode: AVCaptureDevice.WhiteBalanceMode, to segmented: UISegmentedControl) {
+        switch mode {
+        case .locked: segmented.selectedSegmentIndex = 0
+        case .autoWhiteBalance: segmented.selectedSegmentIndex = 1
+        case .continuousAutoWhiteBalance: segmented.selectedSegmentIndex = 2
+        @unknown default: segmented.selectedSegmentIndex = 1
+        }
+    }
+
+    private func applyFocusModeUI(_ mode: AVCaptureDevice.FocusMode, to segmented: UISegmentedControl) {
+        switch mode {
+        case .locked: segmented.selectedSegmentIndex = 0
+        case .autoFocus: segmented.selectedSegmentIndex = 1
+        case .continuousAutoFocus: segmented.selectedSegmentIndex = 2
+        @unknown default: segmented.selectedSegmentIndex = 2
+        }
+    }
+
+    /// Push a (duration, iso) pair into the ISO + Shutter sliders without firing their
+    /// `.valueChanged` actions (which would re-call the camera setter).
+    private func syncManualExposureControls(durationSeconds: Double, iso: Float) {
+        isApplyingExternalUpdate = true
+        defer { isApplyingExternalUpdate = false }
+        if let isoSlider {
+            isoSlider.value = iso
+            isoRow?.valueText = "\(Int(iso))"
+        }
+        if let shutterSlider, !shutterStops.isEmpty {
+            let index = Self.nearestStopIndex(to: durationSeconds, in: shutterStops)
+            let denom = max(shutterStops.count - 1, 1)
+            shutterSlider.value = Float(Double(index) / Double(denom))
+            shutterRow?.valueText = Self.formatShutter(durationSeconds)
         }
     }
 

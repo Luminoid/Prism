@@ -66,11 +66,20 @@ public final class PRMCameraSession {
 
     /// Configures inputs and outputs for the given configuration.
     /// Throws ``PRMSessionError`` if any required resource cannot be added.
+    ///
+    /// Re-entrant: callers can `configure(_:)` on an already-running session to swap
+    /// camera position, device types, session preset, etc. The previous inputs and
+    /// outputs are torn down inside the same `beginConfiguration` block so the swap
+    /// is atomic from AVFoundation's perspective. (The original implementation only
+    /// added — calling it twice left two video inputs attached, with the second
+    /// `canAddInput` silently failing and the session stuck on the first device.)
     public func configure(_ configuration: PRMCameraConfiguration) throws {
         self.configuration = configuration
 
         session.beginConfiguration()
         defer { session.commitConfiguration() }
+
+        tearDownAttachments()
 
         session.sessionPreset = configuration.sessionPreset
 
@@ -117,6 +126,26 @@ public final class PRMCameraSession {
         if let connection = movieFileOutput?.connection(with: .video) {
             connection.prm_setStabilization(mode)
         }
+    }
+
+    /// Removes every input and output the session previously held and nils out the
+    /// cached handles so a follow-up `configure(_:)` starts from a clean slate. Called
+    /// inside `configure` while a `beginConfiguration`/`commitConfiguration` block is
+    /// open — AVFoundation batches the removals + the subsequent additions into a
+    /// single session commit, so the user doesn't see a transient empty preview.
+    private func tearDownAttachments() {
+        for input in session.inputs {
+            session.removeInput(input)
+        }
+        for output in session.outputs {
+            session.removeOutput(output)
+        }
+        videoDeviceInput = nil
+        videoDevice = nil
+        audioDeviceInput = nil
+        photoOutput = nil
+        videoDataOutput = nil
+        movieFileOutput = nil
     }
 
     // MARK: - Lifecycle
@@ -393,6 +422,31 @@ public final class PRMCameraSession {
     ///
     /// Wrapped in `beginConfiguration` / `commitConfiguration` so the session can stay
     /// running. The reconfigure typically takes 50-300 ms on real hardware.
+    /// Runtime toggle for `AVCapturePhotoOutput.isLivePhotoCaptureEnabled`. Off by default
+    /// after `configure(_:)` honors the initial `PRMCameraConfiguration.enableLivePhoto`
+    /// flag; callers flip this to opt into / out of Live Photo capability per-frame.
+    ///
+    /// Live Photo capability **interferes with manual exposure (custom mode) and WB lock**:
+    /// on iPhone, AVFoundation will silently revert `device.exposureMode = .custom` back
+    /// to a continuous-auto path within a frame or two if the photo output is still
+    /// advertising Live Photo. Studio-style apps that expose manual sliders need to flip
+    /// this off whenever the user enters Custom / Locked, and back on only when staying in
+    /// Live Photo mode with auto exposure.
+    ///
+    /// Wrapped in `beginConfiguration`/`commitConfiguration` so the change lands atomically.
+    /// No-op if Live Photo is not supported on this device / session combo, or if the
+    /// requested state is already in effect.
+    public func setLivePhotoCaptureEnabled(_ enabled: Bool) {
+        #if !os(macOS)
+            guard let photoOutput else { return }
+            guard photoOutput.isLivePhotoCaptureSupported else { return }
+            guard photoOutput.isLivePhotoCaptureEnabled != enabled else { return }
+            session.beginConfiguration()
+            defer { session.commitConfiguration() }
+            photoOutput.isLivePhotoCaptureEnabled = enabled
+        #endif
+    }
+
     public func setMovieFileOutputAttached(_ attached: Bool) throws {
         session.beginConfiguration()
         defer { session.commitConfiguration() }

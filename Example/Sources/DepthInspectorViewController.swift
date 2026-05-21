@@ -75,25 +75,35 @@ final class DepthInspectorViewController: UIViewController {
     // MARK: - Layout
 
     private func setupLayout() {
-        // Color preview — top half.
+        // Color + depth share the same rotation and contentFit so a feature at view
+        // coordinate (x, y) in the color preview lines up with the same coordinate in
+        // the depth preview. The previous setup used `.fill` for color and `.fit` for
+        // depth, which only matched if the screen happened to share the sensor's
+        // aspect ratio — on every iPhone with a different half-screen aspect the depth
+        // map would visibly slide vs. the color frame as the user moved the camera.
+        // Both use `.fit` (letterbox the full sensor frame) so the user can directly
+        // compare a point's depth against the corresponding color pixel.
+        // Both previews use identical sizing + contentFit so the depth tile spatially
+        // tracks the color tile. Equal heights (was 0.45 / 0.40 — slightly uneven) keep
+        // the rotated portrait frames the same physical size, so a point in the color
+        // preview lines up vertically with the same point in the depth preview.
         view.addSubview(colorPreview)
         colorPreview.rotation = .rotate90
-        colorPreview.contentFit = .fill
+        colorPreview.contentFit = .fit
         colorPreview.snp.makeConstraints {
             $0.top.equalTo(view.safeAreaLayoutGuide)
             $0.leading.trailing.equalToSuperview()
-            $0.height.equalToSuperview().multipliedBy(0.45)
+            $0.height.equalToSuperview().multipliedBy(0.42)
         }
         addLabel("COLOR", on: colorPreview)
 
-        // Depth preview — middle.
         view.addSubview(depthPreview)
         depthPreview.rotation = .rotate90
         depthPreview.contentFit = .fit
         depthPreview.snp.makeConstraints {
             $0.top.equalTo(colorPreview.snp.bottom)
             $0.leading.trailing.equalToSuperview()
-            $0.height.equalToSuperview().multipliedBy(0.40)
+            $0.height.equalTo(colorPreview)
         }
         addLabel("DEPTH", on: depthPreview)
 
@@ -109,7 +119,7 @@ final class DepthInspectorViewController: UIViewController {
             $0.trailing.equalToSuperview().offset(-16)
         }
 
-        enabledLabel.text = "Photo-output depth delivery"
+        enabledLabel.text = "Live depth preview"
         enabledLabel.textColor = .white
         enabledLabel.font = .systemFont(ofSize: 13)
         let enabledRow = UIStackView(arrangedSubviews: [enabledLabel, enabledSwitch])
@@ -118,7 +128,7 @@ final class DepthInspectorViewController: UIViewController {
         enabledRow.distribution = .equalSpacing
         enabledSwitch.addAction(UIAction { [weak self] _ in self?.toggleDepthEnabled() }, for: .valueChanged)
 
-        filteringLabel.text = "Live-depth temporal filtering"
+        filteringLabel.text = "Temporal smoothing (PRMDepthCapture.setFiltering)"
         filteringLabel.textColor = .white
         filteringLabel.font = .systemFont(ofSize: 13)
         let filteringRow = UIStackView(arrangedSubviews: [filteringLabel, filteringSwitch])
@@ -162,6 +172,13 @@ final class DepthInspectorViewController: UIViewController {
     private func wireDepthDelegate() {
         depthDelegate.context = depthContext
         depthDelegate.previewView = depthPreview
+        // The "Photo-output depth delivery" toggle drives a flag the live-depth delegate
+        // checks before painting. Without this the toggle had no visible effect: it only
+        // gated `AVCapturePhotoOutput.isDepthDataDeliveryEnabled`, which is photo-only,
+        // not the live preview. The live preview comes from a separately-attached
+        // `AVCaptureDepthDataOutput`, so we drop frames at the delegate level to mirror
+        // the photo gate's intent visually.
+        depthDelegate.isDeliveryEnabled = true
     }
 
     // MARK: - Boot
@@ -220,6 +237,17 @@ final class DepthInspectorViewController: UIViewController {
 
     private func toggleDepthEnabled() {
         let target = enabledSwitch.isOn
+        // Mirror the toggle into the live-preview gate so flipping it actually changes
+        // what the user sees on screen (otherwise it only affects photo capture). Off →
+        // fully hide the depth tile so the user gets unambiguous feedback that the
+        // toggle worked; on → restore full opacity and let the delegate push frames again.
+        depthDelegate.isDeliveryEnabled = target
+        UIView.animate(withDuration: 0.2) { [self] in
+            depthPreview.alpha = target ? 1.0 : 0.0
+        }
+        statusLabel.text = target
+            ? "Live depth preview on. Toggle smoothing to compare jitter."
+            : "Live depth preview off (photo-output delivery also off)."
         Task { @PRMCameraActor in
             guard let photoOutput = await camera.session.photoOutput else { return }
             PRMDepthCapture.setEnabled(target, on: photoOutput)
@@ -237,6 +265,12 @@ final class DepthInspectorViewController: UIViewController {
 private final class DepthDelegate: NSObject, AVCaptureDepthDataOutputDelegate, @unchecked Sendable {
     var context: PRMRenderContext?
     weak var previewView: PRMPreviewView?
+    /// Mirrors the "Photo-output depth delivery" toggle. When `false` the delegate drops
+    /// frames so the preview goes dark — mirrors the toggle's photo-side intent
+    /// visually. AVFoundation always streams from `AVCaptureDepthDataOutput` once
+    /// attached; we gate at the delegate instead of detaching the output (cheaper, no
+    /// session reconfig churn).
+    var isDeliveryEnabled: Bool = true
 
     func depthDataOutput(
         _ output: AVCaptureDepthDataOutput,
@@ -244,6 +278,7 @@ private final class DepthDelegate: NSObject, AVCaptureDepthDataOutputDelegate, @
         timestamp: CMTime,
         connection: AVCaptureConnection
     ) {
+        guard isDeliveryEnabled else { return }
         // Convert disparity to a normalized grayscale CIImage and push to the depth preview.
         let converted = depthData.depthDataType == kCVPixelFormatType_DisparityFloat32
             ? depthData
