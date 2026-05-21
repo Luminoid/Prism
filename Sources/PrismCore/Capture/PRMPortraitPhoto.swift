@@ -39,28 +39,34 @@ public extension PRMPhotoCapture {
         willCapture: (@Sendable () -> Void)? = nil
     ) async throws -> PRMPortraitPhoto {
         var portraitSettings = settings
+        // Force HEIC for Portrait. The iOS Photos.app's Portrait UI (badge + Edit-mode
+        // depth slider) only fires for HEIC files with Apple-written maker-note + depth
+        // aux. JPEG with embedded disparity aux is technically a valid depth photo
+        // (CGImageSourceCopyAuxiliaryDataInfoAtIndex round-trips it), but Photos.app
+        // treats it as a flat still — no badge, no slider. HEVC is available on every
+        // device that supports Portrait (iPhone 7+), so this is safe to force.
+        if portraitSettings.codec == nil, output.availablePhotoCodecTypes.contains(.hevc) {
+            portraitSettings = portraitSettings.codec(.hevc)
+        }
         if output.isDepthDataDeliveryEnabled {
+            // Embed depth into the HEIC payload so AVFoundation writes the Apple-format
+            // maker-note + aux tracks that Photos.app recognizes. The prior `false` path
+            // existed because the package re-encoded the photo through a CIImage bokeh
+            // filter (which strips aux) and read depth via the property path. We now
+            // save the original `fileDataRepresentation()` unchanged, so embedding is
+            // the right answer — and on iPhone Pro models the deferred-photo issue that
+            // motivated the false path is no longer triggered by this code path.
             portraitSettings = portraitSettings
                 .depthDataDelivery(true)
-                // Don't embed depth in the JPEG/HEIC payload — we re-encode the photo
-                // through our bokeh filter before saving, which would strip the embed
-                // anyway, and on iPhone Pro models leaving this true sometimes routes
-                // depth exclusively to the embed and leaves `AVCapturePhoto.depthData`
-                // with a null `depthDataMap`. Setting false guarantees the depth
-                // arrives via the property path we read.
-                .embedsDepthDataInPhoto(false)
+                .embedsDepthDataInPhoto(true)
         }
         if output.isPortraitEffectsMatteDeliveryEnabled {
+            // Matte embed requires depth embed (AVFoundation invariant: matte is derived
+            // from depth, and an embedded matte without embedded depth is rejected as
+            // invalid). Both are true together above.
             portraitSettings = portraitSettings
                 .portraitEffectsMatte(true)
-                // AVFoundation enforces: `embedsPortraitEffectsMatteInPhoto` cannot be
-                // true while `embedsDepthDataInPhoto` is false (matte is derived from
-                // depth; an embedded matte without embedded depth is rejected as
-                // invalid). We disable depth embed above, so we must also disable
-                // matte embed here — otherwise `capturePhotoWithSettings:` throws
-                // NSInvalidArgumentException at capture time. The matte still arrives
-                // via `AVCapturePhoto.portraitEffectsMatte`.
-                .embedsPortraitEffectsMatteInPhoto(false)
+                .embedsPortraitEffectsMatteInPhoto(true)
         }
         let photo = try await capturePhoto(
             settings: portraitSettings,

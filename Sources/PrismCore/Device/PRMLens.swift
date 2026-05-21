@@ -1,12 +1,25 @@
 import AVFoundation
 
-/// A lens descriptor for one physical camera in a virtual device.
+/// A lens descriptor for one physical camera in a virtual device — or a virtual
+/// "lens" representing a native-resolution sensor crop (e.g. 2× on iPhones with a
+/// 48MP main sensor).
 ///
 /// `displayZoomFactor` is normalized so the wide lens = 1× (matching Apple Camera convention).
 /// `focalLength35mm` is the raw 35mm-equivalent focal length computed from the format's field
 /// of view at this zoom factor — **unsnapped**. Use ``snapping(to:tolerance:)`` if you want
 /// to round to a marketing-friendly value.
 public struct PRMLens: Sendable, Equatable {
+    /// Distinguishes a real physical lens from a virtual sensor-crop entry.
+    public enum Kind: Sendable, Equatable {
+        /// One of the device's physical cameras (ultrawide, wide, telephoto, etc.).
+        case physical
+        /// A center-crop of the active sensor at native resolution — Apple's "2× on
+        /// 48MP" trick. The pipeline reads a smaller region from the same sensor, so
+        /// no upscaling, but it's not a separate lens. Surfaced via the format's
+        /// `secondaryNativeResolutionZoomFactors`.
+        case nativeResolutionCrop
+    }
+
     /// The raw `AVCaptureDevice.videoZoomFactor` to switch to this lens.
     public let zoomFactor: CGFloat
 
@@ -18,22 +31,28 @@ public struct PRMLens: Sendable, Equatable {
 
     /// The constituent device type this lens represents on a virtual (multi-lens)
     /// device: `.builtInUltraWideCamera`, `.builtInWideAngleCamera`, `.builtInTelephotoCamera`.
-    /// `nil` on single-lens devices or when the type isn't derivable from the available
-    /// AVFoundation metadata. Used to match against
-    /// `PRMCameraState.activePrimaryDeviceType` so UIs can highlight the lens AVFoundation
-    /// is actually feeding (which can differ from the user's selection in low light).
+    /// `nil` on single-lens devices, virtual `nativeResolutionCrop` entries, or when
+    /// the type isn't derivable from the available AVFoundation metadata. Used to match
+    /// against `PRMCameraState.activePrimaryDeviceType` so UIs can highlight the lens
+    /// AVFoundation is actually feeding (which can differ from the user's selection in
+    /// low light).
     public let deviceType: AVCaptureDevice.DeviceType?
+
+    /// Whether this entry is a physical lens or a sensor-crop.
+    public let kind: Kind
 
     public init(
         zoomFactor: CGFloat,
         displayZoomFactor: CGFloat,
         focalLength35mm: Double,
-        deviceType: AVCaptureDevice.DeviceType? = nil
+        deviceType: AVCaptureDevice.DeviceType? = nil,
+        kind: Kind = .physical
     ) {
         self.zoomFactor = zoomFactor
         self.displayZoomFactor = displayZoomFactor
         self.focalLength35mm = focalLength35mm
         self.deviceType = deviceType
+        self.kind = kind
     }
 
     /// Returns a new lens with `focalLength35mm` snapped to the lowest standard value within
@@ -52,7 +71,8 @@ public struct PRMLens: Sendable, Equatable {
             zoomFactor: zoomFactor,
             displayZoomFactor: displayZoomFactor,
             focalLength35mm: snapped,
-            deviceType: deviceType
+            deviceType: deviceType,
+            kind: kind
         )
     }
 

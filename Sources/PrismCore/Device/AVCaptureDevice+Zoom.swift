@@ -37,12 +37,16 @@ public extension AVCaptureDevice {
 
     // MARK: - Lens Descriptors
 
-    /// Returns lens descriptors for each physical camera in this virtual device.
+    /// Returns lens descriptors for each physical camera in this virtual device, plus
+    /// any virtual "lenses" exposed as native-resolution sensor crops (e.g. the 2× crop
+    /// on iPhones with a 48MP main sensor — Apple Camera surfaces this as a third chip
+    /// alongside the physical lenses, because at native resolution the crop yields a
+    /// 12MP image without upscaling).
     ///
-    /// Builds the zoom-factor list from `[minZoomFactor, switchOvers...]`, deduplicates,
-    /// sorts, and computes the raw 35mm-equivalent focal length at each. The first
-    /// switch-over is the wide lens — all `displayZoomFactor` values are normalized so the
-    /// wide lens equals 1× (Apple Camera convention).
+    /// Builds the zoom-factor list from `[minZoomFactor, switchOvers..., nativeCrops...]`,
+    /// deduplicates, sorts, and computes the raw 35mm-equivalent focal length at each.
+    /// The first switch-over is the wide lens — all `displayZoomFactor` values are
+    /// normalized so the wide lens equals 1× (Apple Camera convention).
     ///
     /// Returns an empty array on non-virtual devices.
     func prm_lenses() -> [PRMLens] {
@@ -53,25 +57,44 @@ public extension AVCaptureDevice {
         for value in switchOvers {
             factors.insert(value)
         }
+        // Pull the native-resolution crop points off the *active* format. iPhone 14/15/16
+        // base models surface `[2.0]` (2× crop of the 48MP main sensor → 48mm equiv at
+        // 12MP). iPhone 14/15/16 Pro additionally surface `[4.0]` for the 4× crop that
+        // lines up with the 3× telephoto's FOV. Some formats (low-resolution video,
+        // older devices) return an empty array — we just skip the extra chips then.
+        let nativeCrops = activeFormat.secondaryNativeResolutionZoomFactors
+        for value in nativeCrops {
+            factors.insert(value)
+        }
         let sorted = factors.sorted()
         let wideFactor = switchOvers[0]
 
-        // Pair each zoom-factor bucket with its physical constituent device. AVFoundation
-        // doesn't expose this mapping directly, but `constituentDevices` sorted by
-        // typical focal length (ultrawide < wide < telephoto1 < telephoto2) lines up
-        // index-for-index with `factors.sorted()` on every shipping iPhone — the lowest
-        // factor uses the widest-FOV lens, and each subsequent factor steps up.
+        // Pair each *physical* zoom-factor bucket with its constituent device.
+        // AVFoundation doesn't expose this mapping directly, but `constituentDevices`
+        // sorted by typical focal length (ultrawide < wide < telephoto1 < telephoto2)
+        // lines up index-for-index with the *switch-over* factors in order — the lowest
+        // factor uses the widest-FOV lens, and each subsequent factor steps up. Build a
+        // factor→deviceType lookup so native-crop factors mixed into `sorted` don't
+        // shift the indices and end up labeled with the wrong physical lens.
+        let physicalFactors = ([minAvailableVideoZoomFactor] + switchOvers).sorted()
         let constituents = constituentDevices
             .sorted { lhs, rhs in
                 deviceTypeRank(lhs.deviceType) < deviceTypeRank(rhs.deviceType)
             }
+        var deviceTypeByFactor: [CGFloat: AVCaptureDevice.DeviceType] = [:]
+        for (index, factor) in physicalFactors.enumerated() where index < constituents.count {
+            deviceTypeByFactor[factor] = constituents[index].deviceType
+        }
+        let nativeCropSet = Set(nativeCrops)
 
-        return sorted.enumerated().map { index, factor in
-            PRMLens(
+        return sorted.map { factor in
+            let isCrop = nativeCropSet.contains(factor) && deviceTypeByFactor[factor] == nil
+            return PRMLens(
                 zoomFactor: factor,
                 displayZoomFactor: factor / wideFactor,
                 focalLength35mm: prm_focalLength35mm(atZoomFactor: factor),
-                deviceType: index < constituents.count ? constituents[index].deviceType : nil
+                deviceType: deviceTypeByFactor[factor],
+                kind: isCrop ? .nativeResolutionCrop : .physical
             )
         }
     }

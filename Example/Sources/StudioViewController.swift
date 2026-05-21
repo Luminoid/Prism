@@ -204,6 +204,14 @@ final class StudioViewController: UIViewController {
     private var nightDuration: NightDuration = .auto
     private var videoFPS: VideoFPS = .fps30
     private var initialPinchZoom: CGFloat = 1.0
+    /// Latest zoom target the pinch handler wants. A single drain task picks up whichever
+    /// value is most recent, skipping intermediate values the finger has already pinched
+    /// past. Without coalescing, UIPinchGestureRecognizer fires `.changed` at ~60Hz and
+    /// each event enqueued its own actor hop — the actor processed them in order, so a
+    /// fast pinch produced visible stepping as stale targets fired before the newest
+    /// one. With coalescing, queue depth stays at 1.
+    private var pendingZoomTarget: CGFloat?
+    private var zoomDrainTask: Task<Void, Never>?
     private var recordingStartedAt: Date?
     private var recordingTimer: Timer?
 
@@ -649,7 +657,8 @@ final class StudioViewController: UIViewController {
                 title: "\(Int(snappedFocal))mm",
                 zoomFactor: lens.zoomFactor,
                 displayZoomFactor: lens.displayZoomFactor,
-                deviceType: lens.deviceType
+                deviceType: lens.deviceType,
+                kind: lens.kind
             )
             button.onTap = { [weak self, weak button] in
                 guard let self, let button else { return }
@@ -675,7 +684,13 @@ final class StudioViewController: UIViewController {
     private func selectLens(button: LensPill, zoomFactor: CGFloat) {
         let previouslyActive = (lensStrip.arrangedSubviews.compactMap { $0 as? LensPill })
             .first(where: \.isActive)
+        // Skip the overlay when either pill is a sensor crop — the physical lens isn't
+        // changing, so the "previous lens does digital zoom" artifact the overlay masks
+        // doesn't exist. Crossing a deviceType boundary only matters between physical
+        // lenses (e.g. wide → telephoto).
         let crossesLens = previouslyActive?.deviceType != button.deviceType
+            && previouslyActive?.kind == .physical
+            && button.kind == .physical
 
         pinnedActivePill = button
         pinnedActivePillUntil = Date().addingTimeInterval(1.0)
@@ -740,13 +755,26 @@ final class StudioViewController: UIViewController {
         pinnedActivePill = nil
         pinnedActivePillUntil = nil
 
-        let active: LensPill?
-        if let activeType = state.activePrimaryDeviceType,
-           let match = pills.first(where: { $0.deviceType == activeType }) {
-            active = match
-        } else {
-            let sorted = pills.sorted { $0.zoomFactor < $1.zoomFactor }
-            active = sorted.last { $0.zoomFactor <= state.zoomFactor + 0.001 } ?? sorted.first
+        // Resolve via the zoom-factor bucket first — this is the only way virtual
+        // sensor-crop chips (deviceType == nil, zoomFactor above the wide they crop
+        // from) can light up at 2× and beyond, since AVFoundation's
+        // `activePrimaryDeviceType` reports the underlying physical lens (wide) for
+        // both 1× and 2× on those devices. The sorted-bucket approach finds the
+        // highest-`zoomFactor` chip whose factor is ≤ current zoom.
+        //
+        // Then, on Pro devices with multiple physical lenses and a low-light fallback
+        // (user picks 5× telephoto, AVFoundation refuses and silently stays on wide
+        // with digital zoom), prefer the `activePrimaryDeviceType` match so the wide
+        // pill lights up instead of the telephoto — gives the user a visible signal
+        // that the requested switch didn't happen. The override only applies between
+        // *physical* chips; crops have no constituent device so they always win the
+        // zoom-bucket bid for their factor band.
+        let sorted = pills.sorted { $0.zoomFactor < $1.zoomFactor }
+        var active = sorted.last { $0.zoomFactor <= state.zoomFactor + 0.001 } ?? sorted.first
+        if let bucket = active, bucket.kind == .physical, let activeType = state.activePrimaryDeviceType,
+           activeType != bucket.deviceType,
+           let constituentMatch = pills.first(where: { $0.kind == .physical && $0.deviceType == activeType }) {
+            active = constituentMatch
         }
         for pill in pills {
             pill.setActive(pill === active)
@@ -905,6 +933,12 @@ final class StudioViewController: UIViewController {
                 if !activated {
                     logInfo("Portrait: no depth-capable format on the active device")
                 }
+                // Rebuild the chip strip after the format swap. `prm_lenses()` reads
+                // `activeFormat.secondaryNativeResolutionZoomFactors` and the device's
+                // `maxAvailableVideoZoomFactor`, both of which can shift when the depth
+                // format restricts the available constituent lenses (e.g. a wide-only
+                // depth format on a triple device would clip away the telephoto chip).
+                rebuildLensStrip()
             }
 
             switch mode {
@@ -918,6 +952,18 @@ final class StudioViewController: UIViewController {
                 let target: Float64 = (camera.device?.maxFrameRate ?? 30) >= 240 ? 240 : 120
                 await camera.setFrameRate(target)
                 shutter.setMode(.recording)
+            }
+
+            // Reset zoom on every real mode change. Without this, switching from
+            // (e.g.) Photo @ 5× telephoto to Portrait lands on the telephoto lens —
+            // the `applyDefaultFocalLength` startup call picks the wide lens via
+            // `selectLens`, which pins the 24mm chip highlight, but the actual
+            // `videoZoomFactor` stays at 5×, so the chip and the live preview
+            // disagree. Slo-mo entry/exit already does this for its own reasons
+            // (digital crop compounding the sensor crop); apply the same baseline
+            // to the photo-family modes too.
+            if oldMode != mode, mode != .slowMo {
+                await applyDefaultFocalLength()
             }
 
             // Seed the AUTO chip label so users see the resolved duration immediately
@@ -1148,90 +1194,25 @@ final class StudioViewController: UIViewController {
         Task {
             do {
                 let portrait = try await photoCapture.capturePortraitPhoto(settings: settings)
-                let finalData = renderPortrait(portrait)
-                await saveToPhotoLibrary(data: finalData)
+                // `PRMPhotoCapture.capturePortraitPhoto` forces HEIC + sets
+                // `embedsDepthDataInPhoto` + `embedsPortraitEffectsMatteInPhoto` to true,
+                // so `portrait.photo.data` (which comes from
+                // `AVCapturePhoto.fileDataRepresentation()`) already contains the depth,
+                // matte, and Apple maker-note signals Photos.app needs. Save the bytes
+                // unchanged — any CIImage / CGImageDestination round-trip would strip the
+                // maker-notes and Photos would treat it as a flat still.
+                //
+                // Skip the aspect crop for the same reason: re-encoding through CIImage
+                // drops the aux + maker-notes. Matches Apple Camera, which always saves
+                // Portrait at full sensor framing and lets the user crop in Photos.
+                if portrait.depthData == nil, portrait.portraitEffectsMatte == nil {
+                    showToast("Portrait depth unavailable for this lens — saved standard photo")
+                }
+                await saveToPhotoLibrary(data: portrait.photo.data, applyAspectCrop: false)
             } catch {
                 reportError(error, context: "Portrait")
             }
         }
-    }
-
-    /// Pick the best subject mask available for portrait bokeh and apply it.
-    ///
-    /// Portrait effects matte is the highest-quality mask but is only delivered on the
-    /// dual / triple / TrueDepth cameras at portrait-compatible zooms. Depth data is more
-    /// widely available — when matte is missing we derive a soft alpha mask from the
-    /// disparity buffer (near → opaque, far → transparent) and use that. When neither
-    /// is present we save the raw photo and toast so the user knows the bokeh was skipped.
-    private func renderPortrait(_ portrait: PRMPortraitPhoto) -> Data {
-        guard let source = CIImage(data: portrait.photo.data) else {
-            return portrait.photo.data
-        }
-
-        // Resolve a usable mask. The order is matte → depth → give up. Each step is
-        // guarded: AVFoundation can hand back ancillary objects whose pixel buffers
-        // are internally null (deferred-photo proxies, scenes the matte network rejected),
-        // and a non-nil mask wrapping a null buffer would crash PRMPortraitBokehFilter.
-        let matteImage: CIImage? = if let matte = portrait.portraitEffectsMatte,
-                                      let image = matteCIImage(from: matte) {
-            image
-        } else if let depth = portrait.depthData,
-                  let image = depthMask(from: depth, targetExtent: source.extent) {
-            image
-        } else {
-            nil
-        }
-
-        guard let matteImage else {
-            logInfo("Portrait bokeh unavailable: matte=\(portrait.portraitEffectsMatte == nil ? "nil" : "present-but-empty"), depth=\(portrait.depthData == nil ? "nil" : "present-but-empty")")
-            showToast("Portrait bokeh unavailable for this lens — saved standard photo")
-            return portrait.photo.data
-        }
-
-        let filter = PRMPortraitBokehFilter(matte: matteImage, radius: 18)
-        let blurred = filter.render(source)
-        let merged = source.properties.merging(portrait.photo.metadata) { _, new in new }
-        return PRMImage.jpegDataPreservingMetadata(
-            from: blurred,
-            originalProperties: merged,
-            context: renderContext
-        ) ?? portrait.photo.data
-    }
-
-    /// Builds a CIImage from `AVPortraitEffectsMatte.mattingImage`, returning `nil` if
-    /// the underlying buffer is internally null (which AVFoundation silently allows
-    /// even though the property is non-Optional). A nil-buffer CIImage has a `.zero`
-    /// extent and would propagate emptiness downstream, so reject it here.
-    private func matteCIImage(from matte: AVPortraitEffectsMatte) -> CIImage? {
-        let image = CIImage(cvPixelBuffer: matte.mattingImage)
-        return image.extent.isEmpty ? nil : image
-    }
-
-    /// Converts an AVDepthData buffer into a soft alpha mask sized to `targetExtent`.
-    /// Disparity (1/distance) is normalized into [0, 1] — near subjects stay opaque,
-    /// far background fades to transparent — and the result is scaled to match the
-    /// captured photo's resolution so `PRMPortraitBokehFilter` can blend cleanly.
-    /// Returns `nil` if the source disparity buffer ends up empty (depth format
-    /// conversion failed, or the device delivered a placeholder with no pixels).
-    private func depthMask(from depth: AVDepthData, targetExtent: CGRect) -> CIImage? {
-        // Normalize to disparity if the camera delivered raw depth (distance in meters).
-        let disparityDepth = depth.depthDataType == kCVPixelFormatType_DisparityFloat32
-            ? depth
-            : depth.converting(toDepthDataType: kCVPixelFormatType_DisparityFloat32)
-        let raw = CIImage(cvPixelBuffer: disparityDepth.depthDataMap)
-        // Reject empty buffers up front — scaling against a zero-extent CIImage would
-        // divide by zero and emit the runtime warning seen on iPhone 15 Pro Max when
-        // the LiDAR depth conversion returns an unfilled buffer.
-        guard !raw.extent.isEmpty, raw.extent.width > 0, raw.extent.height > 0 else {
-            return nil
-        }
-        let normalized = raw.applyingFilter("CIColorControls", parameters: [
-            kCIInputContrastKey: 2.0,
-            kCIInputBrightnessKey: 0.0,
-        ])
-        let scaleX = targetExtent.width / raw.extent.width
-        let scaleY = targetExtent.height / raw.extent.height
-        return normalized.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
     }
 
     private func captureNight() {
@@ -1280,9 +1261,11 @@ final class StudioViewController: UIViewController {
         }, completion: { _ in cover.removeFromSuperview() })
     }
 
-    private func saveToPhotoLibrary(data: Data, silent: Bool = false) async {
+    private func saveToPhotoLibrary(data: Data, silent: Bool = false, applyAspectCrop: Bool = true) async {
         guard await ensurePhotoLibraryAccess() else { return }
-        let cropped = croppedToActiveAspect(data: data)
+        // Portrait skips the CIImage-backed aspect crop because the re-encode strips
+        // depth + matte aux dictionaries, which Photos needs to render Portrait.
+        let cropped = applyAspectCrop ? croppedToActiveAspect(data: data) : data
         do {
             try await Self.writePhoto(data: cropped)
             if !silent { showToast("Saved to Photos") }
@@ -1307,15 +1290,25 @@ final class StudioViewController: UIViewController {
         }
     }
 
-    /// Crops JPEG/HEIC photo data to the currently-selected aspect ratio mask, centered
-    /// on the sensor frame. Returns the original bytes when the active ratio is `.full`
-    /// (no crop needed) or when decode fails. EXIF/TIFF metadata is preserved.
+    /// Crops JPEG/HEIC photo data to the currently-selected aspect ratio mask, in the
+    /// orientation the user sees in the preview. Returns the original bytes when the
+    /// active ratio is `.full` (no crop needed) or when decode fails. EXIF/TIFF metadata
+    /// is preserved aside from the orientation tag (forced to `1` because the output
+    /// pixels are upright after applying the source orientation).
+    ///
+    /// `CIImage(data:)` ignores EXIF orientation by default, so the prior implementation
+    /// cropped against the *sensor*-orientation extent (landscape 4032×3024 on iPhone)
+    /// then copied the original orientation tag back. For aspect ratios that match the
+    /// sensor (`.ratio4x3` on a 4:3 sensor) the crop was a no-op — the user sees the
+    /// preview cropped to 4:3 in portrait but the saved photo looks identical to `.full`.
+    /// Applying orientation first means we crop in the same coordinate space the user is
+    /// looking at, so every aspect ratio actually trims pixels.
     private func croppedToActiveAspect(data: Data) -> Data {
         guard aspectMask.aspectRatio != .full else { return data }
-        guard let source = CIImage(data: data) else { return data }
-        // `cropRect(in:)` is aspect-only, not coordinate-dependent — the returned rect is
-        // a centered subrect with the target aspect inside the supplied bounds. Passing
-        // the source image's full extent gives us the same crop applied in sensor space.
+        // `applyOrientationProperty: true` makes `CIImage(data:)` honor the EXIF
+        // orientation tag — the resulting `extent` is in display (upright) coordinates,
+        // matching what the user composed in the preview.
+        guard let source = CIImage(data: data, options: [.applyOrientationProperty: true]) else { return data }
         let cropRect = aspectMask.cropRect(in: source.extent)
         let cropped = source.cropped(to: cropRect)
         // `cropped(to:)` keeps the original extent's origin; translating back to (0,0)
@@ -1324,11 +1317,19 @@ final class StudioViewController: UIViewController {
         let translated = cropped.transformed(
             by: CGAffineTransform(translationX: -cropRect.origin.x, y: -cropRect.origin.y)
         )
-        // Preserve EXIF/TIFF so the saved photo retains the camera metadata.
-        let originalProperties = readImageProperties(from: data)
+        // Preserve EXIF/TIFF but override the orientation tag — our pixels are already
+        // upright, so leaving the original (e.g. `6` = rotate 90° CW for portrait) would
+        // make Photos rotate them again. Same fix in both the top-level TIFF dict and
+        // the EXIF sub-dict, since either can override the other depending on viewer.
+        var properties = readImageProperties(from: data)
+        properties[kCGImagePropertyOrientation as String] = 1
+        if var tiff = properties[kCGImagePropertyTIFFDictionary as String] as? [String: Any] {
+            tiff[kCGImagePropertyTIFFOrientation as String] = 1
+            properties[kCGImagePropertyTIFFDictionary as String] = tiff
+        }
         return PRMImage.jpegDataPreservingMetadata(
             from: translated,
-            originalProperties: originalProperties,
+            originalProperties: properties,
             context: renderContext
         ) ?? data
     }
@@ -1576,9 +1577,42 @@ final class StudioViewController: UIViewController {
         case .began:
             initialPinchZoom = camera.state.zoomFactor
         case .changed:
-            let target = initialPinchZoom * gesture.scale
-            Task { await camera.setZoom(target) }
+            // Map pinch.scale exponentially so the gesture feels uniform across the zoom
+            // range. Zoom is logarithmic in perceived FOV change — a 1.0→1.2× scale near
+            // 1× looks tiny, while the same 0.2 step near 5× is huge. The 1.5 exponent
+            // matches Apple Camera's gesture curve: slow pinches near 1× resolve fine
+            // 0.05× steps, fast pinches still hit 10× without effort. `gesture.scale`
+            // is ≥ 0 by definition.
+            let curved = pow(gesture.scale, 1.5)
+            pendingZoomTarget = initialPinchZoom * curved
+            startZoomDrainIfNeeded()
+        case .ended, .cancelled, .failed:
+            // Drain finishes naturally on the next iteration after pendingZoomTarget is
+            // consumed. No cancellation needed — the latest target is the right final
+            // value.
+            break
         default: break
+        }
+    }
+
+    /// Spawns the drain loop on demand. The loop consumes `pendingZoomTarget`, applies
+    /// it via `camera.setZoom`, then checks again — if a newer target arrived while the
+    /// actor hop was in flight, the next iteration picks up the latest value and skips
+    /// the stale ones. Exits when there's no pending target.
+    ///
+    /// The drain body is `@MainActor`-isolated so reading `pendingZoomTarget` and
+    /// clearing `zoomDrainTask` happen as ordinary MainActor sync work — no extra
+    /// `await MainActor.run` hops, no cleanup-race window where the gate is closed but
+    /// the task is about to exit. The only suspension point is `camera.setZoom`, which
+    /// hops to `@PRMCameraActor` and back.
+    private func startZoomDrainIfNeeded() {
+        guard zoomDrainTask == nil else { return }
+        zoomDrainTask = Task { @MainActor [weak self] in
+            while let self, let target = self.pendingZoomTarget {
+                self.pendingZoomTarget = nil
+                await self.camera.setZoom(target)
+            }
+            self?.zoomDrainTask = nil
         }
     }
 
@@ -2205,18 +2239,37 @@ private final class LensPill: UIControl {
     /// switchover bucket (e.g. low light forces a fallback to wide at 5× displayed).
     let deviceType: AVCaptureDevice.DeviceType?
 
+    /// Whether this pill represents a real lens or a virtual sensor crop (e.g. the 2×
+    /// crop on iPhones with a 48MP main sensor). Crops don't trigger the lens-switch
+    /// overlay since the physical lens doesn't change.
+    let kind: PRMLens.Kind
+
     private let label = UILabel()
+    /// Custom border layer so virtual sensor-crop chips can render dashed strokes
+    /// (signaling "not a real lens, just a digital crop"). `CALayer.borderWidth`
+    /// doesn't support dashed patterns, so we draw the border via a shape layer
+    /// instead. The shape layer's path is updated in `layoutSubviews` to match the
+    /// current capsule bounds.
+    private let borderShape = CAShapeLayer()
     private(set) var isActive: Bool = false
 
-    init(title: String, zoomFactor: CGFloat, displayZoomFactor: CGFloat, deviceType: AVCaptureDevice.DeviceType?) {
+    init(title: String, zoomFactor: CGFloat, displayZoomFactor: CGFloat, deviceType: AVCaptureDevice.DeviceType?, kind: PRMLens.Kind) {
         self.zoomFactor = zoomFactor
         self.displayZoomFactor = displayZoomFactor
         self.deviceType = deviceType
+        self.kind = kind
         super.init(frame: .zero)
         backgroundColor = UIColor.black.withAlphaComponent(0.45)
         layer.cornerCurve = .continuous
-        layer.borderColor = UIColor.white.withAlphaComponent(0.25).cgColor
-        layer.borderWidth = 0.5
+        borderShape.fillColor = nil
+        borderShape.strokeColor = UIColor.white.withAlphaComponent(0.25).cgColor
+        borderShape.lineWidth = 0.5
+        if kind == .nativeResolutionCrop {
+            // Dashed pattern for virtual chips. ~4pt dash + ~3pt gap reads clearly at the
+            // pill height and stays distinct from the solid physical-lens chips.
+            borderShape.lineDashPattern = [4, 3]
+        }
+        layer.addSublayer(borderShape)
         label.text = title
         label.textColor = .white
         label.font = .monospacedSystemFont(ofSize: 11, weight: .bold)
@@ -2228,10 +2281,16 @@ private final class LensPill: UIControl {
 
     /// Pill is a capsule (corner radius = half the height). Doing this in `layoutSubviews`
     /// keeps the shape correct across Dynamic Type changes since the height tracks the
-    /// label's intrinsic size.
+    /// label's intrinsic size. The border shape's path is rebuilt for the new bounds.
     override func layoutSubviews() {
         super.layoutSubviews()
-        layer.cornerRadius = bounds.height / 2
+        let radius = bounds.height / 2
+        layer.cornerRadius = radius
+        // Inset by half the stroke width so the stroke sits visually on the pill edge
+        // rather than half-clipped by the capsule mask.
+        let inset = borderShape.lineWidth / 2
+        let rect = bounds.insetBy(dx: inset, dy: inset)
+        borderShape.path = UIBezierPath(roundedRect: rect, cornerRadius: max(0, radius - inset)).cgPath
     }
 
     func setActive(_ active: Bool) {
@@ -2243,7 +2302,7 @@ private final class LensPill: UIControl {
         backgroundColor = active
             ? UIColor.systemYellow.withAlphaComponent(0.25)
             : UIColor.black.withAlphaComponent(0.45)
-        layer.borderColor = (active
+        borderShape.strokeColor = (active
             ? UIColor.systemYellow.withAlphaComponent(0.85)
             : UIColor.white.withAlphaComponent(0.25)).cgColor
         label.textColor = active ? .systemYellow : .white
