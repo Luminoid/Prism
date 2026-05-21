@@ -8,6 +8,10 @@ public enum PRMSessionError: Error, Sendable, Equatable {
     /// No video device is available for the requested camera position.
     case noVideoDevice(AVCaptureDevice.Position)
 
+    /// No video device of the requested type is available for the requested position
+    /// (e.g. asked for `.builtInWideAngleCamera` on a position that doesn't have one).
+    case noDeviceOfType(AVCaptureDevice.DeviceType, AVCaptureDevice.Position)
+
     /// Could not create an input from the discovered device.
     case cannotCreateDeviceInput(String)
 
@@ -31,6 +35,7 @@ public enum PRMSessionError: Error, Sendable, Equatable {
         case (.notAuthorized, .notAuthorized): true
         case (.cancelled, .cancelled): true
         case let (.noVideoDevice(a), .noVideoDevice(b)): a == b
+        case let (.noDeviceOfType(typeA, posA), .noDeviceOfType(typeB, posB)): typeA == typeB && posA == posB
         case let (.cannotCreateDeviceInput(a), .cannotCreateDeviceInput(b)): a == b
         case let (.cannotAttachToSession(a), .cannotAttachToSession(b)): a == b
         case let (.runtime(a), .runtime(b)): a.code == b.code
@@ -50,6 +55,8 @@ extension PRMSessionError: LocalizedError {
             "Camera access has not been granted."
         case let .noVideoDevice(position):
             "No video device available for camera position \(position.rawValue)."
+        case let .noDeviceOfType(type, position):
+            "No \(type.rawValue) device available at camera position \(position.rawValue)."
         case let .cannotCreateDeviceInput(reason):
             "Cannot create video input: \(reason)"
         case let .cannotAttachToSession(reason):

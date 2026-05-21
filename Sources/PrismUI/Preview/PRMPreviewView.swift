@@ -103,6 +103,13 @@ public final class PRMPreviewView: MTKView {
         enableSetNeedsDisplay = false
         preferredFramesPerSecond = 60
         autoResizeDrawable = true
+        // Cap in-flight drawables at 2 (default is 3). At 60fps camera + 60Hz display the
+        // queue tends to stay saturated, adding a 3rd buffered frame's worth of latency
+        // (~50ms) between camera and screen. With 2 drawables that worst case drops to
+        // ~33ms, and at 30fps there's still enough headroom to never starve the GPU.
+        // Visible as: at 60fps preview, fast camera pans look one frame behind the device
+        // motion. Saved video is unaffected — encoder uses its own path.
+        (layer as? CAMetalLayer)?.maximumDrawableCount = 2
     }
 
     private func configureMetal(commandQueue: (any MTLCommandQueue)?) {

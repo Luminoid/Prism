@@ -53,6 +53,7 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         willCapture: (@Sendable () -> Void)? = nil
     ) async throws -> PRMPhoto {
         let avSettings = settings.makeAVSettings()
+        clampFlashMode(on: avSettings)
         let pending = PendingCapture(
             kind: .single,
             filter: filter,
@@ -71,6 +72,26 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         } onCancel: { [weak self] in
             self?.markCancelled(avSettings.uniqueID)
         }
+    }
+
+    /// Force `AVCapturePhotoSettings.flashMode` into a value the current photo output
+    /// actually supports. `AVCapturePhotoOutput.supportedFlashModes` changes per device
+    /// (front camera has no flash hardware) and per session preset; setting `flashMode`
+    /// to a mode not in that list silently drops to `.off` with no warning, which makes
+    /// "Auto flash isn't firing" look like a Prism bug when it's really an unsupported
+    /// request. When `.auto` is unsupported we fall through to `.on` (closest behavioral
+    /// match — "fire flash when shutter opens"), then `.off` as a last resort.
+    private func clampFlashMode(on settings: AVCapturePhotoSettings) {
+        let supported = output.supportedFlashModes
+        guard !supported.contains(settings.flashMode) else { return }
+        let fallback: AVCaptureDevice.FlashMode = if supported.contains(.auto) {
+            .auto
+        } else if supported.contains(.on) {
+            .on
+        } else {
+            .off
+        }
+        settings.flashMode = fallback
     }
 
     /// Captures a Live Photo: still image + paired movie. Both must finish before this
@@ -93,6 +114,7 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
                 )
             }
             let liveSettings = settings.livePhoto(true).makeAVSettings()
+            clampFlashMode(on: liveSettings)
             let movieURL = PRMTempFile.url(withExtension: "mov")
             liveSettings.livePhotoMovieFileURL = movieURL
 
@@ -226,10 +248,42 @@ extension PRMPhotoCapture: AVCapturePhotoCaptureDelegate {
         didFinishProcessingPhoto photo: AVCapturePhoto,
         error: Error?
     ) {
+        finishCapture(photo: photo, error: error)
+    }
+
+    #if !os(macOS)
+        /// Required when `AVCapturePhotoOutput.isAutoDeferredPhotoDeliveryEnabled` is on.
+        /// AVFoundation throws `NSInvalidArgumentException` from `capturePhotoWithSettings:`
+        /// if the delegate doesn't respond to this selector while deferred delivery is
+        /// enabled — even when the *individual* capture wouldn't actually use it.
+        ///
+        /// `AVCaptureDeferredPhotoProxy` is a subclass of `AVCapturePhoto`, so the proxy
+        /// flows through the same outcome path as a regular photo. The proxy carries a
+        /// low-res preview plus enough metadata for the Photos framework to upgrade the
+        /// asset to full resolution later when written via `PHAssetResourceType.photoProxy`.
+        /// Callers that save through `addResource(with: .photo, ...)` will get only the
+        /// proxy bytes — see the type-level doc.
+        public func photoOutput(
+            _ output: AVCapturePhotoOutput,
+            didFinishCapturingDeferredPhotoProxy deferredPhotoProxy: AVCaptureDeferredPhotoProxy?,
+            error: Error?
+        ) {
+            guard let deferredPhotoProxy else {
+                // If AVFoundation reports a proxy callback with no proxy, there's no usable
+                // payload — the same capture will follow up with a normal
+                // `didFinishProcessingPhoto`, so do nothing here and let that path resolve.
+                return
+            }
+            finishCapture(photo: deferredPhotoProxy, error: error)
+        }
+    #endif
+
+    /// Shared resolution path for both the regular and deferred-proxy delegate callbacks.
+    /// Computes outcome under the lock; resumes continuations after unlock so user-visible
+    /// work never runs while holding the lock.
+    private func finishCapture(photo: AVCapturePhoto, error: Error?) {
         let id = photo.resolvedSettings.uniqueID
 
-        // Compute the outcome (and dequeue if final) under the lock; *resume* continuations
-        // after unlock so we never hold the lock across user-visible work.
         let outcome: PhotoOutcome = {
             lock.lock()
             defer { lock.unlock() }

@@ -91,6 +91,26 @@ public final class PRMCamera {
         await refreshState()
     }
 
+    /// Switches to a specific physical device type (optionally at a different position).
+    /// See ``PRMCameraSession/switchDevice(type:position:)`` for the rationale — primarily
+    /// hopping to `.builtInWideAngleCamera` to access slo-mo formats that the virtual
+    /// `.builtInTripleCamera` device doesn't expose.
+    public func switchDevice(
+        type: AVCaptureDevice.DeviceType,
+        position: AVCaptureDevice.Position? = nil
+    ) async throws {
+        _ = try await session.switchDevice(type: type, position: position)
+        await refreshDevice()
+        await refreshState()
+    }
+
+    /// Toggle the movie file output between video-recording mode (attached, Live Photo
+    /// unavailable) and Live-Photo-capable mode (detached). See
+    /// ``PRMCameraSession/setMovieFileOutputAttached(_:)`` for the rationale.
+    public func setMovieFileOutputAttached(_ attached: Bool) async throws {
+        try await session.setMovieFileOutputAttached(attached)
+    }
+
     // MARK: - Device controls (forward to AVCaptureDevice extensions on actor)
 
     public func setZoom(_ factor: CGFloat) async {
@@ -149,6 +169,58 @@ public final class PRMCamera {
     public func resetFrameRate() async {
         await runOnDevice { try? $0.prm_resetFrameRate() }
         await refreshState()
+    }
+
+    /// Switches `activeFormat` + `activeDepthDataFormat` to a depth-capable pair so
+    /// portrait/bokeh captures actually receive a populated depth buffer. Some session
+    /// presets (notably `.photo` on iPhone Pro models) pick a non-depth-streaming
+    /// format by default; without this call, depth ancillaries arrive with internally
+    /// null `depthDataMap` buffers. Returns `true` if a depth format is now active.
+    ///
+    /// There is intentionally no `disableDepthFormat()` counterpart. Setting
+    /// `activeDepthDataFormat = nil` while `AVCapturePhotoOutput.isDepthDataDeliveryEnabled`
+    /// is on (which it is for the whole session in our default configuration) throws
+    /// `NSInvalidArgumentException` at runtime. The cost of leaving depth streaming
+    /// enabled outside Portrait mode is small (one ISP channel, no measurable preview
+    /// impact), and the format change is sticky for the session — re-entering Portrait
+    /// is a cheap no-op after the first call.
+    @discardableResult
+    public func enableDepthFormat() async -> Bool {
+        let result = await PRMCameraActor.shared.run { [session] in
+            guard let device = await session.videoDevice else { return false }
+            // The format change must be wrapped in `beginConfiguration` /
+            // `commitConfiguration` at the session level — not just the device-lock —
+            // because the photo output validates its delivery flags (depth, portrait
+            // matte) against the active format at commit time. Without the session
+            // wrap, the output is left with stale validation and depth captures arrive
+            // as `AVDepthData` instances whose `depthDataMap` is internally null.
+            let avSession = session.session
+            avSession.beginConfiguration()
+            let didEnable = (try? device.prm_enableDepthFormat()) ?? false
+            // Re-toggle the photo output's delivery flags so it re-validates them
+            // against the now-current `activeFormat` + `activeDepthDataFormat`. Without
+            // this, the flags set at `attachPhotoOutput` time stay "enabled" but
+            // AVFoundation never actually wires depth to the photo capture path —
+            // captures complete with `depthData != nil` but a null `depthDataMap`.
+            // The toggle-off/toggle-on dance forces the re-validation; just leaving
+            // them on is not sufficient.
+            if didEnable, let photoOutput = await session.photoOutput {
+                #if !os(macOS)
+                    if photoOutput.isDepthDataDeliverySupported {
+                        photoOutput.isDepthDataDeliveryEnabled = false
+                        photoOutput.isDepthDataDeliveryEnabled = true
+                    }
+                    if photoOutput.isPortraitEffectsMatteDeliverySupported {
+                        photoOutput.isPortraitEffectsMatteDeliveryEnabled = false
+                        photoOutput.isPortraitEffectsMatteDeliveryEnabled = true
+                    }
+                #endif
+            }
+            avSession.commitConfiguration()
+            return didEnable
+        }
+        await refreshState()
+        return result
     }
 
     public func setFocusAndExposure(
@@ -301,6 +373,10 @@ public final class PRMCamera {
                 newState.activeStabilizationMode = connection.activeVideoStabilizationMode
             }
             newState.frameRate = device.prm_currentFrameRate()
+            // `activePrimaryConstituentDevice` is iOS 16+ and only meaningful on a virtual
+            // multi-lens device. On single-lens devices it returns `nil` (correct fallback)
+            // — the UI then falls back to the switchover-bucket heuristic.
+            newState.activePrimaryDeviceType = device.activePrimaryConstituent?.deviceType
             return newState
         }
         guard let snapshot else { return }

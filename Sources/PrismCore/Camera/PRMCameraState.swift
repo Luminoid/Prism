@@ -59,6 +59,15 @@ public struct PRMCameraState: Sendable, Equatable {
     /// Whether session is currently interrupted.
     public var isInterrupted: Bool
 
+    /// The physical lens AVFoundation is *currently* feeding frames from on a virtual
+    /// (multi-lens) device. iOS 16+ exposes this via
+    /// `AVCaptureDevice.activePrimaryConstituentDevice.deviceType`; on single-lens devices
+    /// (or when AVFoundation hasn't resolved a primary yet) this is `nil`. Use it to
+    /// match the active lens chip in the UI — at certain zooms AVFoundation falls back
+    /// to the wide lens with digital zoom even when the user picked the telephoto chip
+    /// (low light, close subject, etc.), and that override shows up here.
+    public var activePrimaryDeviceType: AVCaptureDevice.DeviceType?
+
     public init(
         isRunning: Bool = false,
         zoomFactor: CGFloat = 1.0,
@@ -77,7 +86,8 @@ public struct PRMCameraState: Sendable, Equatable {
         frameRate: Float64? = nil,
         isVideoHDREnabled: Bool = false,
         isLowLightBoostActive: Bool = false,
-        isInterrupted: Bool = false
+        isInterrupted: Bool = false,
+        activePrimaryDeviceType: AVCaptureDevice.DeviceType? = nil
     ) {
         self.isRunning = isRunning
         self.zoomFactor = zoomFactor
@@ -97,5 +107,6 @@ public struct PRMCameraState: Sendable, Equatable {
         self.isVideoHDREnabled = isVideoHDREnabled
         self.isLowLightBoostActive = isLowLightBoostActive
         self.isInterrupted = isInterrupted
+        self.activePrimaryDeviceType = activePrimaryDeviceType
     }
 }

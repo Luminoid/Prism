@@ -20,9 +20,13 @@ public extension AVCaptureDevice {
     ///
     /// - Parameters:
     ///   - fps: Target frames per second.
-    ///   - allowFormatChange: When `true` (default), the helper picks the highest-resolution
-    ///     format that supports the requested fps. When `false`, the call no-ops if the
-    ///     current format can't deliver the rate.
+    ///   - allowFormatChange: When `true` (default), the helper switches to a 1080p-class
+    ///     format if the current format can't deliver the requested fps. The target is the
+    ///     largest format whose width is ≤ 1920 — picking the highest-res available format
+    ///     would push 4K@60 (or higher) through the preview/Metal pipeline every frame,
+    ///     introducing visible motion latency. Callers that specifically want 4K@60 should
+    ///     set `activeFormat` directly. When `false`, the call no-ops if the current
+    ///     format can't deliver the rate.
     /// - Returns: A summary of what was actually applied.
     /// - Throws: If the device cannot be locked for configuration.
     @discardableResult
@@ -44,8 +48,24 @@ public extension AVCaptureDevice {
 
         guard allowFormatChange else { return nil }
 
-        var bestFormat: AVCaptureDevice.Format?
-        var bestPixels: Int32 = 0
+        // Format-selection policy depends on the requested fps:
+        //
+        // - Normal video (≤ 60 fps): target a 1080p-class format (largest with width
+        //   ≤ 1920). 4K@60 on modern iPhones would push every frame through the
+        //   preview/Metal pipeline at full resolution, killing motion latency.
+        // - Slo-mo (≥ 120 fps): pick the *largest* slo-mo format available. These
+        //   formats are already capped at 1080p or 720p on most devices (the sensor
+        //   read time at 120/240 fps doesn't allow more), so "largest" doesn't risk
+        //   the 4K overload, and a wider format gives the user the best field of
+        //   view — same trade-off Apple Camera makes for its slo-mo mode.
+        let preferLargest = fps >= 120
+        let targetMaxPixels: Int32 = 1920 * 1080
+        var bestSubHD: AVCaptureDevice.Format?
+        var bestSubHDPixels: Int32 = 0
+        var smallest: AVCaptureDevice.Format?
+        var smallestPixels: Int32 = .max
+        var largest: AVCaptureDevice.Format?
+        var largestPixels: Int32 = 0
         for format in formats {
             let supports = format.videoSupportedFrameRateRanges.contains {
                 $0.minFrameRate <= fps && $0.maxFrameRate >= fps
@@ -53,13 +73,26 @@ public extension AVCaptureDevice {
             guard supports else { continue }
             let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
             let pixels = dims.width * dims.height
-            if pixels > bestPixels {
-                bestFormat = format
-                bestPixels = pixels
+            if pixels <= targetMaxPixels, pixels > bestSubHDPixels {
+                bestSubHD = format
+                bestSubHDPixels = pixels
+            }
+            if pixels < smallestPixels {
+                smallest = format
+                smallestPixels = pixels
+            }
+            if pixels > largestPixels {
+                largest = format
+                largestPixels = pixels
             }
         }
 
-        guard let format = bestFormat else { return nil }
+        let format: AVCaptureDevice.Format? = if preferLargest {
+            largest ?? bestSubHD ?? smallest
+        } else {
+            bestSubHD ?? smallest
+        }
+        guard let format else { return nil }
 
         try lockForConfiguration()
         defer { unlockForConfiguration() }

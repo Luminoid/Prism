@@ -112,4 +112,32 @@ public struct PRMCameraDevice: Sendable, Equatable {
         }
         maxFrameRate = maxFPS
     }
+
+    /// Whether *any* discoverable device at `position` supports a format at ≥120 fps.
+    ///
+    /// Use this to gate UI affordances for slow motion when the currently-active device
+    /// might not directly expose ≥120 fps formats — on iPhone 15/16 Pro/Pro Max the
+    /// virtual `.builtInTripleCamera`'s `formats` list caps at 60 fps, but the physical
+    /// `.builtInWideAngleCamera` (a separately-discoverable device) does support 120/240.
+    /// Switch to it via ``PRMCamera/switchDevice(type:position:)`` when entering slo-mo.
+    public static func anyDeviceSupportsSlowMotion(at position: AVCaptureDevice.Position) -> Bool {
+        let types: [AVCaptureDevice.DeviceType] = [
+            .builtInWideAngleCamera,
+            .builtInUltraWideCamera,
+            .builtInTelephotoCamera,
+            .builtInDualCamera,
+            .builtInDualWideCamera,
+            .builtInTripleCamera,
+        ]
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: types,
+            mediaType: .video,
+            position: position
+        )
+        return discovery.devices.contains { device in
+            device.formats.contains { format in
+                format.videoSupportedFrameRateRanges.contains { $0.maxFrameRate >= 120 }
+            }
+        }
+    }
 }

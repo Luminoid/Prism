@@ -137,12 +137,10 @@ public final class PRMCameraSession {
 
     // MARK: - Camera switching
 
-    /// Switches the video input to the given position. Returns the new device.
+    /// Switches the video input to the best device at the given position, using the
+    /// configuration's `deviceTypes` priority list. Returns the new device.
     @discardableResult
     public func switchCamera(to position: AVCaptureDevice.Position) throws -> AVCaptureDevice {
-        guard let currentInput = videoDeviceInput else {
-            throw PRMSessionError.cannotAttachToSession("No current input to swap")
-        }
         guard let configuration else {
             throw PRMSessionError.cannotAttachToSession("Session not yet configured")
         }
@@ -151,6 +149,57 @@ public final class PRMCameraSession {
             types: configuration.deviceTypes
         ) else {
             throw PRMSessionError.noVideoDevice(position)
+        }
+        try swapInput(to: newDevice)
+        return newDevice
+    }
+
+    /// Switches the video input to a specific device type, keeping the current camera
+    /// position (or moving to `position` if specified). Returns the new device.
+    ///
+    /// Use this when the application needs a physical device handle that the current
+    /// virtual device doesn't expose — most commonly the wide camera for slo-mo on
+    /// iPhone Pro models, whose `.builtInTripleCamera` virtual device's `formats` list
+    /// excludes the 120/240 fps formats that exist on `.builtInWideAngleCamera`.
+    ///
+    /// ```swift
+    /// // Hop to the physical wide camera for slo-mo:
+    /// let wide = try await session.switchDevice(type: .builtInWideAngleCamera)
+    /// try await device.prm_setFrameRate(240)
+    ///
+    /// // Hop back to the triple camera:
+    /// let triple = try await session.switchDevice(type: .builtInTripleCamera)
+    /// ```
+    ///
+    /// No-ops if the current device already matches the requested type *and* position.
+    @discardableResult
+    public func switchDevice(
+        type: AVCaptureDevice.DeviceType,
+        position: AVCaptureDevice.Position? = nil
+    ) throws -> AVCaptureDevice {
+        let targetPosition = position ?? videoDevice?.position ?? .back
+        if let current = videoDevice, current.deviceType == type, current.position == targetPosition {
+            return current
+        }
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [type],
+            mediaType: .video,
+            position: targetPosition
+        )
+        guard let newDevice = discovery.devices.first else {
+            throw PRMSessionError.noDeviceOfType(type, targetPosition)
+        }
+        try swapInput(to: newDevice)
+        return newDevice
+    }
+
+    /// Removes the current video input (if any) and installs an input wrapping `newDevice`.
+    /// Wrapped in `beginConfiguration`/`commitConfiguration` so the session can stay running
+    /// across the swap. Restores the original input on failure so the session is never left
+    /// without a video input.
+    private func swapInput(to newDevice: AVCaptureDevice) throws {
+        guard let currentInput = videoDeviceInput else {
+            throw PRMSessionError.cannotAttachToSession("No current input to swap")
         }
         let newInput: AVCaptureDeviceInput
         do {
@@ -172,7 +221,6 @@ public final class PRMCameraSession {
             throw PRMSessionError.cannotAttachToSession("Cannot attach \(newDevice.localizedName)")
         }
         session.commitConfiguration()
-        return newDevice
     }
 
     // MARK: - Delegate installation
@@ -263,6 +311,17 @@ public final class PRMCameraSession {
     private func attachPhotoOutput(configuration: PRMCameraConfiguration) throws {
         let output = AVCapturePhotoOutput()
         output.maxPhotoQualityPrioritization = configuration.maxPhotoQualityPrioritization
+        // `isLivePhotoCaptureSupported` / `isDepthDataDeliverySupported` / etc. are
+        // session-configuration-aware: they only return meaningful values AFTER the
+        // output has been added to a session with a video device. Querying them before
+        // `addOutput` returns `false` for every feature, regardless of whether the
+        // device actually supports it. So: add first, configure features second.
+        guard session.canAddOutput(output) else {
+            throw PRMSessionError.cannotAttachToSession("Cannot add photo output")
+        }
+        session.addOutput(output)
+        photoOutput = output
+
         #if !os(macOS)
             applyPhotoOutputFeature(
                 "Live Photo",
@@ -295,11 +354,6 @@ public final class PRMCameraSession {
                 supported: output.isZeroShutterLagSupported
             ) { output.isZeroShutterLagEnabled = true }
         #endif
-        guard session.canAddOutput(output) else {
-            throw PRMSessionError.cannotAttachToSession("Cannot add photo output")
-        }
-        session.addOutput(output)
-        photoOutput = output
     }
 
     private func applyPhotoOutputFeature(
@@ -323,5 +377,47 @@ public final class PRMCameraSession {
         }
         session.addOutput(output)
         movieFileOutput = output
+    }
+
+    // MARK: - Live Photo / movie-output mutual exclusion
+
+    /// Dynamically attach or detach `AVCaptureMovieFileOutput`. Use this to switch the
+    /// session between *video-recording mode* (movie output attached, Live Photo
+    /// unavailable) and *Live-Photo-capable mode* (movie output detached, Live Photo
+    /// re-enabled if supported).
+    ///
+    /// `AVCapturePhotoOutput.isLivePhotoCaptureSupported` returns `false` whenever
+    /// `AVCaptureMovieFileOutput` is also in the session — Apple documents the two as
+    /// mutually exclusive. Apps that want both modes have to reconfigure when crossing
+    /// between them; this is the same trade-off the built-in Camera app makes.
+    ///
+    /// Wrapped in `beginConfiguration` / `commitConfiguration` so the session can stay
+    /// running. The reconfigure typically takes 50-300 ms on real hardware.
+    public func setMovieFileOutputAttached(_ attached: Bool) throws {
+        session.beginConfiguration()
+        defer { session.commitConfiguration() }
+
+        if attached {
+            if movieFileOutput == nil {
+                try attachMovieFileOutput()
+            }
+            // Movie output forces Live Photo off; flip the flag to stay consistent.
+            #if !os(macOS)
+                if let photoOutput, photoOutput.isLivePhotoCaptureEnabled {
+                    photoOutput.isLivePhotoCaptureEnabled = false
+                }
+            #endif
+        } else {
+            if let movieFileOutput {
+                session.removeOutput(movieFileOutput)
+                self.movieFileOutput = nil
+            }
+            #if !os(macOS)
+                guard let photoOutput, let configuration, configuration.enableLivePhoto else { return }
+                if photoOutput.isLivePhotoCaptureSupported, !photoOutput.isLivePhotoCaptureEnabled {
+                    photoOutput.isLivePhotoCaptureEnabled = true
+                }
+            #endif
+        }
     }
 }

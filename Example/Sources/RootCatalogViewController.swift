@@ -66,7 +66,9 @@ final class RootCatalogViewController: UIViewController {
 
         tableView.dataSource = self
         tableView.delegate = self
-        tableView.rowHeight = 80
+        // Self-sizing rows so the (up to two-line) subtitle decides the cell height.
+        tableView.rowHeight = UITableView.automaticDimension
+        tableView.estimatedRowHeight = 80
         tableView.register(UITableViewCell.self, forCellReuseIdentifier: "Cell")
         view.addSubview(tableView)
         tableView.snp.makeConstraints { $0.edges.equalToSuperview() }
@@ -84,6 +86,8 @@ extension RootCatalogViewController: UITableViewDataSource, UITableViewDelegate 
         var config = cell.defaultContentConfiguration()
         config.text = demo.title
         config.secondaryText = demo.subtitle
+        // Subtitles describe each demo at a glance and can wrap to two lines.
+        config.secondaryTextProperties.numberOfLines = 2
         config.image = UIImage(systemName: demo.symbol)
         config.imageProperties.tintColor = .systemYellow
         cell.contentConfiguration = config

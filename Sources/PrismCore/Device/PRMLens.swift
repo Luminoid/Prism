@@ -16,10 +16,24 @@ public struct PRMLens: Sendable, Equatable {
     /// Approximate 35mm-equivalent focal length in millimeters.
     public let focalLength35mm: Double
 
-    public init(zoomFactor: CGFloat, displayZoomFactor: CGFloat, focalLength35mm: Double) {
+    /// The constituent device type this lens represents on a virtual (multi-lens)
+    /// device: `.builtInUltraWideCamera`, `.builtInWideAngleCamera`, `.builtInTelephotoCamera`.
+    /// `nil` on single-lens devices or when the type isn't derivable from the available
+    /// AVFoundation metadata. Used to match against
+    /// `PRMCameraState.activePrimaryDeviceType` so UIs can highlight the lens AVFoundation
+    /// is actually feeding (which can differ from the user's selection in low light).
+    public let deviceType: AVCaptureDevice.DeviceType?
+
+    public init(
+        zoomFactor: CGFloat,
+        displayZoomFactor: CGFloat,
+        focalLength35mm: Double,
+        deviceType: AVCaptureDevice.DeviceType? = nil
+    ) {
         self.zoomFactor = zoomFactor
         self.displayZoomFactor = displayZoomFactor
         self.focalLength35mm = focalLength35mm
+        self.deviceType = deviceType
     }
 
     /// Returns a new lens with `focalLength35mm` snapped to the lowest standard value within
@@ -37,7 +51,8 @@ public struct PRMLens: Sendable, Equatable {
         return Self(
             zoomFactor: zoomFactor,
             displayZoomFactor: displayZoomFactor,
-            focalLength35mm: snapped
+            focalLength35mm: snapped,
+            deviceType: deviceType
         )
     }
 

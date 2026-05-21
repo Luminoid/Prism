@@ -40,10 +40,27 @@ public extension PRMPhotoCapture {
     ) async throws -> PRMPortraitPhoto {
         var portraitSettings = settings
         if output.isDepthDataDeliveryEnabled {
-            portraitSettings = portraitSettings.depthDataDelivery(true)
+            portraitSettings = portraitSettings
+                .depthDataDelivery(true)
+                // Don't embed depth in the JPEG/HEIC payload — we re-encode the photo
+                // through our bokeh filter before saving, which would strip the embed
+                // anyway, and on iPhone Pro models leaving this true sometimes routes
+                // depth exclusively to the embed and leaves `AVCapturePhoto.depthData`
+                // with a null `depthDataMap`. Setting false guarantees the depth
+                // arrives via the property path we read.
+                .embedsDepthDataInPhoto(false)
         }
         if output.isPortraitEffectsMatteDeliveryEnabled {
-            portraitSettings = portraitSettings.portraitEffectsMatte(true)
+            portraitSettings = portraitSettings
+                .portraitEffectsMatte(true)
+                // AVFoundation enforces: `embedsPortraitEffectsMatteInPhoto` cannot be
+                // true while `embedsDepthDataInPhoto` is false (matte is derived from
+                // depth; an embedded matte without embedded depth is rejected as
+                // invalid). We disable depth embed above, so we must also disable
+                // matte embed here — otherwise `capturePhotoWithSettings:` throws
+                // NSInvalidArgumentException at capture time. The matte still arrives
+                // via `AVCapturePhoto.portraitEffectsMatte`.
+                .embedsPortraitEffectsMatteInPhoto(false)
         }
         let photo = try await capturePhoto(
             settings: portraitSettings,

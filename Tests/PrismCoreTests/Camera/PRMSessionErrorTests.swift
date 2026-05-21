@@ -9,6 +9,18 @@ struct PRMSessionErrorTests {
         #expect(PRMSessionError.cancelled == PRMSessionError.cancelled)
         #expect(PRMSessionError.noVideoDevice(.back) == PRMSessionError.noVideoDevice(.back))
         #expect(PRMSessionError.noVideoDevice(.back) != PRMSessionError.noVideoDevice(.front))
+        #expect(
+            PRMSessionError.noDeviceOfType(.builtInWideAngleCamera, .back)
+                == PRMSessionError.noDeviceOfType(.builtInWideAngleCamera, .back)
+        )
+        #expect(
+            PRMSessionError.noDeviceOfType(.builtInWideAngleCamera, .back)
+                != PRMSessionError.noDeviceOfType(.builtInTripleCamera, .back)
+        )
+        #expect(
+            PRMSessionError.noDeviceOfType(.builtInWideAngleCamera, .back)
+                != PRMSessionError.noDeviceOfType(.builtInWideAngleCamera, .front)
+        )
     }
 
     @Test
@@ -16,6 +28,7 @@ struct PRMSessionErrorTests {
         let cases: [PRMSessionError] = [
             .notAuthorized,
             .noVideoDevice(.back),
+            .noDeviceOfType(.builtInWideAngleCamera, .back),
             .cannotCreateDeviceInput("test"),
             .cannotAttachToSession("test"),
             .photoCaptureFailed("test"),

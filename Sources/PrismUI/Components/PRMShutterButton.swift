@@ -15,11 +15,11 @@
         // MARK: - Mode
 
         public enum Mode: Sendable, Equatable {
-            /// White-filled circle.
+            /// White ring + white-filled circle. Photo / Live / Portrait / Night / Pano.
             case photo
-            /// Red ring + smaller filled red rounded square.
+            /// White ring + smaller red filled circle. Video / Slo-Mo, idle (ready to record).
             case recording
-            /// Pulsing red — used while actively recording.
+            /// White ring + smaller red rounded square, pulsing. Actively recording.
             case recordingActive
         }
 
@@ -97,9 +97,13 @@
             ringView.layer.borderColor = ringColor.cgColor
             ringView.backgroundColor = .clear
 
+            // `innerView` is always centered within the ring at the *photo* size; the
+            // `recording*` modes apply a `transform` to shrink it to ~46% of the inner
+            // box (Apple Camera's red dot/square sits well inside the ring).
             let inset = ringWidth + gapWidth
             let innerSize = size - inset * 2
-            innerView.frame = CGRect(x: inset, y: inset, width: innerSize, height: innerSize)
+            innerView.bounds = CGRect(x: 0, y: 0, width: innerSize, height: innerSize)
+            innerView.center = CGPoint(x: bounds.midX, y: bounds.midY)
             applyMode(animated: false)
         }
 
@@ -114,20 +118,39 @@
         private func applyMode(animated: Bool) {
             stopPulse()
             let innerSize = innerView.bounds.size
+            // Apple-Camera proportions: inner dot/square is ~46% of the full inner box
+            // when in either recording state. Photo state fills the inner box.
+            let recordingScale: CGFloat = 0.46
             let block: () -> Void = { [self] in
                 switch mode {
                 case .photo:
                     innerView.backgroundColor = photoFillColor
                     innerView.layer.cornerRadius = innerSize.width / 2
+                    innerView.transform = .identity
                     ringView.layer.borderColor = ringColor.cgColor
-                case .recording, .recordingActive:
+                case .recording:
                     innerView.backgroundColor = recordingFillColor
-                    innerView.layer.cornerRadius = innerSize.width * 0.2
-                    ringView.layer.borderColor = recordingFillColor.cgColor
+                    // Round circle when idle — "ready to record" affordance.
+                    innerView.layer.cornerRadius = innerSize.width / 2
+                    innerView.transform = CGAffineTransform(scaleX: recordingScale, y: recordingScale)
+                    ringView.layer.borderColor = ringColor.cgColor
+                case .recordingActive:
+                    innerView.backgroundColor = recordingFillColor
+                    // Rounded square while actively recording — "tap to stop" affordance.
+                    innerView.layer.cornerRadius = innerSize.width * 0.12
+                    innerView.transform = CGAffineTransform(scaleX: recordingScale, y: recordingScale)
+                    ringView.layer.borderColor = ringColor.cgColor
                 }
             }
             if animated, !UIAccessibility.isReduceMotionEnabled {
-                UIView.animate(withDuration: 0.22, delay: 0, options: .curveEaseOut, animations: block)
+                UIView.animate(
+                    withDuration: 0.28,
+                    delay: 0,
+                    usingSpringWithDamping: 0.75,
+                    initialSpringVelocity: 0.4,
+                    options: .curveEaseOut,
+                    animations: block
+                )
             } else {
                 block()
             }
@@ -183,13 +206,19 @@
         }
 
         private func animatePress(_ pressed: Bool) {
-            let scale: CGFloat = pressed ? 0.9 : 1.0
+            // Press feedback composes with the mode scale (1.0 for photo, 0.46 for
+            // recording states) so the recording dot doesn't briefly jump to full size
+            // while the user is pressing the button.
+            let baseScale: CGFloat = (mode == .photo) ? 1.0 : 0.46
+            let pressScale: CGFloat = pressed ? 0.9 : 1.0
+            let composed = baseScale * pressScale
+            let block = { [self] in
+                innerView.transform = CGAffineTransform(scaleX: composed, y: composed)
+            }
             if UIAccessibility.isReduceMotionEnabled {
-                innerView.transform = CGAffineTransform(scaleX: scale, y: scale)
+                block()
             } else {
-                UIView.animate(withDuration: 0.1) { [self] in
-                    innerView.transform = CGAffineTransform(scaleX: scale, y: scale)
-                }
+                UIView.animate(withDuration: 0.1, animations: block)
             }
         }
     }

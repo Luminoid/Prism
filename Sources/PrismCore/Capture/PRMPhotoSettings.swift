@@ -23,6 +23,19 @@ public struct PRMPhotoSettings: Sendable {
     public var maxDimensions: CMVideoDimensions?
     public var autoRedEyeReduction: Bool?
     public var depthDataDelivery: Bool?
+    /// When true (default), embed the depth map into the photo's file representation
+    /// (JPEG/HEIC sidecar). When false, the depth is delivered ONLY via
+    /// `AVCapturePhoto.depthData` and not embedded in the file — required for the
+    /// photo bokeh path in this package, which re-encodes the photo data without
+    /// depth metadata. Some configurations (notably iPhone Pro with deferred-photo
+    /// delivery on) only populate `AVCapturePhoto.depthData` when this is false.
+    public var embedsDepthDataInPhoto: Bool?
+    /// When true (default), embed the portrait effects matte into the photo file.
+    /// AVFoundation enforces an invariant: if this is true, `embedsDepthDataInPhoto`
+    /// must also be true — embedding the matte without depth throws
+    /// `NSInvalidArgumentException` at capture time. Pair with `embedsDepthDataInPhoto`
+    /// (both true together for embed, both false for property-only delivery).
+    public var embedsPortraitEffectsMatteInPhoto: Bool?
     /// When true, request a paired Live Photo movie alongside the still image.
     /// Requires `enableLivePhoto` on ``PRMCameraConfiguration``. The movie sidecar URL is
     /// supplied automatically by ``PRMPhotoCapture/captureLivePhoto(settings:willCapture:)``.
@@ -71,6 +84,18 @@ public struct PRMPhotoSettings: Sendable {
         return copy
     }
 
+    public func embedsDepthDataInPhoto(_ enabled: Bool) -> Self {
+        var copy = self
+        copy.embedsDepthDataInPhoto = enabled
+        return copy
+    }
+
+    public func embedsPortraitEffectsMatteInPhoto(_ enabled: Bool) -> Self {
+        var copy = self
+        copy.embedsPortraitEffectsMatteInPhoto = enabled
+        return copy
+    }
+
     public func livePhoto(_ enabled: Bool) -> Self {
         var copy = self
         copy.livePhoto = enabled
@@ -103,8 +128,14 @@ public struct PRMPhotoSettings: Sendable {
         if let depthDataDelivery {
             settings.isDepthDataDeliveryEnabled = depthDataDelivery
         }
+        if let embedsDepthDataInPhoto {
+            settings.embedsDepthDataInPhoto = embedsDepthDataInPhoto
+        }
         if let portraitEffectsMatte {
             settings.isPortraitEffectsMatteDeliveryEnabled = portraitEffectsMatte
+        }
+        if let embedsPortraitEffectsMatteInPhoto {
+            settings.embedsPortraitEffectsMatteInPhoto = embedsPortraitEffectsMatteInPhoto
         }
         return settings
     }

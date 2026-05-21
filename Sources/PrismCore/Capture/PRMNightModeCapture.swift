@@ -9,15 +9,22 @@ import Foundation
 /// with `CIAdditionCompositing` + a brightness scale to keep the result in `[0, 1]`.
 ///
 /// Designed for the photo-output path: the camera should already be running, and the
-/// device's exposure mode is temporarily switched to `.custom` with a long shutter while
-/// captures are in flight. Caller restores the prior mode after this returns.
+/// caller is responsible for switching the device into `.custom` exposure with the
+/// configured per-frame shutter + ISO before calling
+/// ``capture(frameCount:perFrameDuration:iso:didCaptureFrame:)`` and restoring the prior
+/// exposure mode afterwards. ``PRMCamera/setCustomExposure(duration:iso:)`` paired with
+/// ``PRMCamera/setExposureMode(_:)`` is the recommended path (it stays on the camera
+/// actor and threads through clamping).
 ///
 /// ```swift
-/// let night = PRMNightModeCapture(capture: photoCapture, context: renderContext)
+/// let duration = CMTimeMakeWithSeconds(0.5, preferredTimescale: 1_000_000)
+/// await camera.setCustomExposure(duration: duration, iso: 800)
+/// defer { Task { await camera.setExposureMode(.continuousAutoExposure) } }
 /// let photo = try await night.capture(
 ///     frameCount: 8,
 ///     perFrameDuration: 0.5,
-///     iso: 100
+///     iso: 800,
+///     didCaptureFrame: { index, total in print("frame \(index + 1)/\(total)") }
 /// )
 /// ```
 public final class PRMNightModeCapture: @unchecked Sendable {
@@ -35,34 +42,34 @@ public final class PRMNightModeCapture: @unchecked Sendable {
     ///
     /// - Parameters:
     ///   - frameCount: Number of frames to stack. 4-12 is a sensible range. Must be ≥ 1.
-    ///   - perFrameDuration: Per-frame shutter in seconds (caller must ensure the active
-    ///     format supports it; ``AVCaptureDevice/prm_shutterSpeedRange()`` gives the limits).
-    ///   - iso: ISO used per frame.
-    ///   - willCapture: Fires once per frame just before the shutter.
+    ///   - perFrameDuration: Per-frame shutter in seconds. Informational — the caller is
+    ///     responsible for putting the device into custom exposure with this duration
+    ///     before invoking. The value is recorded into the returned photo's metadata.
+    ///   - iso: ISO used per frame. Same caller-responsibility note as `perFrameDuration`.
+    ///   - didCaptureFrame: Fires once after each frame finishes capturing. Receives the
+    ///     zero-based frame index and the total `frameCount`, suitable for driving a
+    ///     "frame N/total" progress indicator.
     /// - Returns: A composited ``PRMPhoto``; underlying photo is the last frame's
     ///   `AVCapturePhoto`, metadata is the last frame's metadata with the per-frame shutter
     ///   recorded in `ExposureTime`.
     public func capture(
         frameCount: Int,
-        perFrameDuration: Double,
-        iso: Float,
-        willCapture: (@Sendable (Int) -> Void)? = nil
+        perFrameDuration _: Double,
+        iso _: Float,
+        didCaptureFrame: (@Sendable (Int, Int) -> Void)? = nil
     ) async throws -> PRMPhoto {
         guard frameCount >= 1 else {
             throw PRMSessionError.photoCaptureFailed("Night mode requires frameCount >= 1")
         }
+
         var frames: [PRMPhoto] = []
         let settings = PRMPhotoSettings()
             .qualityPrioritization(.quality)
             .flashMode(.off)
         for index in 0 ..< frameCount {
-            let photo = try await capture.capturePhoto(
-                settings: settings,
-                willCapture: willCapture.map { perFrame in
-                    { @Sendable in perFrame(index) }
-                }
-            )
+            let photo = try await capture.capturePhoto(settings: settings)
             frames.append(photo)
+            didCaptureFrame?(index, frameCount)
         }
         guard let composited = Self.average(frames: frames, context: context) else {
             // If averaging fails (decode error, empty extent), fall back to the last frame.

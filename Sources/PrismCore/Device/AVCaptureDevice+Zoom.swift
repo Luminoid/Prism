@@ -56,12 +56,35 @@ public extension AVCaptureDevice {
         let sorted = factors.sorted()
         let wideFactor = switchOvers[0]
 
-        return sorted.map { factor in
+        // Pair each zoom-factor bucket with its physical constituent device. AVFoundation
+        // doesn't expose this mapping directly, but `constituentDevices` sorted by
+        // typical focal length (ultrawide < wide < telephoto1 < telephoto2) lines up
+        // index-for-index with `factors.sorted()` on every shipping iPhone — the lowest
+        // factor uses the widest-FOV lens, and each subsequent factor steps up.
+        let constituents = constituentDevices
+            .sorted { lhs, rhs in
+                deviceTypeRank(lhs.deviceType) < deviceTypeRank(rhs.deviceType)
+            }
+
+        return sorted.enumerated().map { index, factor in
             PRMLens(
                 zoomFactor: factor,
                 displayZoomFactor: factor / wideFactor,
-                focalLength35mm: prm_focalLength35mm(atZoomFactor: factor)
+                focalLength35mm: prm_focalLength35mm(atZoomFactor: factor),
+                deviceType: index < constituents.count ? constituents[index].deviceType : nil
             )
+        }
+    }
+
+    /// Sort key for arranging constituent devices ultrawide → wide → telephoto. Higher
+    /// values = narrower field of view (more zoomed in). Unknown device types sink to
+    /// the bottom so they don't pre-empt known ones.
+    private func deviceTypeRank(_ type: AVCaptureDevice.DeviceType) -> Int {
+        switch type {
+        case .builtInUltraWideCamera: 0
+        case .builtInWideAngleCamera: 1
+        case .builtInTelephotoCamera: 2
+        default: 99
         }
     }
 
