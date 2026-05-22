@@ -165,18 +165,31 @@ extension PRMFilterPipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
         guard let videoBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
               let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) else { return }
 
-        // Detect mid-session format changes (e.g. `device.activeFormat` swap when
-        // toggling Max Dimensions — 12MP → 48MP changes the connection dimensions
-        // even though `videoDataOutput.videoSettings` keeps the pixel format
-        // stable). Without this, the prepared renderer's `outputPixelBufferPool`
-        // stays sized to the OLD format, and new frames either fail to render or
-        // produce visually wrong output: classic symptoms are "two preview frames
-        // stacked vertically" (the renderer overflowing into a wrong-sized pool
-        // and the GPU sampling beyond the texture bounds) and "weird colors" (the
-        // BGRA pool sized for HxW now receives W'xH' bytes and the sampler reads
-        // misaligned pixels). Comparing format dimensions catches the swap; we
-        // also compare the previous format description to catch color-space /
-        // FOV changes that don't change pixel dimensions.
+        // Detect mid-session format changes triggered by any of:
+        //   - `device.activeFormat` swap (Max Dimensions toggle: 12MP → 48MP)
+        //   - pixel-format change (auto-AE re-coupling to a depth-streaming format
+        //     after entering manual exposure can flip the videoDataOutput's
+        //     connection between BGRA and YUV variants even though
+        //     `videoDataOutput.videoSettings` keeps the requested format stable
+        //     — AVFoundation routes through a transitional buffer during
+        //     reconfiguration that doesn't honor the override)
+        //   - color-space / extension change (HDR off→on, color primaries swap)
+        //
+        // Without this, the prepared renderer's `outputPixelBufferPool` stays
+        // sized + formatted to the OLD format. New frames either fail to render
+        // or produce visually wrong output:
+        //   - **two stacked previews vertically**: pool sized to old WxH but new
+        //     frame is W'xH' (different dimensions) → renderer overflows and the
+        //     GPU samples beyond the texture bounds.
+        //   - **two stacked previews horizontally** + **weird color**: pool sized
+        //     correctly but the source CVPixelBuffer is now YUV biplanar where
+        //     the renderer / Metal texture cache reads it as single-plane BGRA →
+        //     the two Y/UV planes get sampled side-by-side as if they were one
+        //     contiguous BGRA texture. This is the post-Max-Dimensions-off →
+        //     custom-exposure failure mode on iPhone 15 Pro Max wide.
+        //
+        // Comparing the full `CMFormatDescription` (dimensions + media subtype +
+        // extension keys via `CMFormatDescriptionEqual`) catches all three cases.
         let previousFormatDescription: CMFormatDescription?
         stateLock.lock()
         previousFormatDescription = _currentFormatDescription
@@ -185,9 +198,11 @@ extension PRMFilterPipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
 
         let formatChanged: Bool = {
             guard let previousFormatDescription else { return false }
-            let newDims = CMVideoFormatDescriptionGetDimensions(formatDescription)
-            let oldDims = CMVideoFormatDescriptionGetDimensions(previousFormatDescription)
-            return newDims.width != oldDims.width || newDims.height != oldDims.height
+            // `CMFormatDescriptionEqual` compares media type + subtype +
+            // dimensions + every extension key (color primaries, transfer
+            // function, YCbCr matrix, etc.). Returns true if equal — we want
+            // the inverse for the change signal.
+            return !CMFormatDescriptionEqual(formatDescription, otherFormatDescription: previousFormatDescription)
         }()
 
         let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
@@ -199,8 +214,10 @@ extension PRMFilterPipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
                     // Tear down the old pool before re-preparing — keeping it would
                     // leak the prior format's buffers across the swap.
                     renderer.reset()
+                    let newDims = CMVideoFormatDescriptionGetDimensions(formatDescription)
+                    let newSubType = CMFormatDescriptionGetMediaSubType(formatDescription)
                     PRMLogger.filter.notice(
-                        "Reconfiguring renderer for new format (dimensions changed across session)"
+                        "Reconfiguring renderer for new format (dims=\(newDims.width, privacy: .public)×\(newDims.height, privacy: .public), subType=\(newSubType, privacy: .public))"
                     )
                 }
                 renderer.prepare(with: formatDescription, outputRetainedBufferCountHint: 3)

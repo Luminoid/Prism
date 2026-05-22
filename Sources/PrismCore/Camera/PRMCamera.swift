@@ -135,6 +135,7 @@ public final class PRMCamera {
 
     /// Configures the session and refreshes ``device`` + ``state``.
     public func configure(_ configuration: PRMCameraConfiguration) async throws {
+        PRMLogger.trace(.session, "PRMCamera.configure")
         // Reconfigure clears any per-session manual-exposure / WB intents — the
         // new session starts in `.continuousAuto` for both axes, and we don't
         // want a stale intent from before configure to keep overriding the read.
@@ -147,18 +148,21 @@ public final class PRMCamera {
 
     /// Starts the session. Idempotent.
     public func start() async {
+        PRMLogger.trace(.session, "PRMCamera.start")
         await session.start()
         await refreshState()
     }
 
     /// Stops the session. Idempotent.
     public func stop() async {
+        PRMLogger.trace(.session, "PRMCamera.stop")
         await session.stop()
         await refreshState()
     }
 
     /// Switches the camera position and refreshes ``device``.
     public func switchCamera(to position: AVCaptureDevice.Position) async throws {
+        PRMLogger.trace(.session, "PRMCamera.switchCamera(\(position.rawValue))")
         // The new physical device starts in `.continuousAuto` — drop intents so
         // the override doesn't keep painting the old custom state on the new lens.
         clearIntendedState()
@@ -175,6 +179,7 @@ public final class PRMCamera {
         type: AVCaptureDevice.DeviceType,
         position: AVCaptureDevice.Position? = nil
     ) async throws {
+        PRMLogger.trace(.session, "PRMCamera.switchDevice(type=\(type.rawValue), pos=\(position?.rawValue.description ?? "nil"))")
         clearIntendedState()
         _ = try await session.switchDevice(type: type, position: position)
         await refreshDevice()
@@ -185,6 +190,7 @@ public final class PRMCamera {
     /// unavailable) and Live-Photo-capable mode (detached). See
     /// ``PRMCameraSession/setMovieFileOutputAttached(_:)`` for the rationale.
     public func setMovieFileOutputAttached(_ attached: Bool) async throws {
+        PRMLogger.trace(.session, "PRMCamera.setMovieFileOutputAttached(\(attached))")
         try await session.setMovieFileOutputAttached(attached)
     }
 
@@ -193,6 +199,7 @@ public final class PRMCamera {
     /// entering manual exposure (custom ISO / shutter / WB lock) and back on when the
     /// user returns to auto exposure with Live Photo capture intended.
     public func setLivePhotoCaptureEnabled(_ enabled: Bool) async {
+        PRMLogger.trace(.session, "PRMCamera.setLivePhotoCaptureEnabled(\(enabled))")
         await session.setLivePhotoCaptureEnabled(enabled)
     }
 
@@ -209,6 +216,7 @@ public final class PRMCamera {
     /// devices cap at 12MP regardless of format selection. Swap to
     /// `.builtInWideAngleCamera` via ``switchDevice(type:position:)`` first.
     public func setHighResolutionPhotoFormat(_ enabled: Bool) async {
+        PRMLogger.trace(.session, "PRMCamera.setHighResolutionPhotoFormat(\(enabled))")
         await PRMCameraActor.shared.run { [session] in
             if enabled {
                 await session.applyHighResolutionPhotoFormat()
@@ -246,6 +254,7 @@ public final class PRMCamera {
     }
 
     public func setExposureMode(_ mode: AVCaptureDevice.ExposureMode) async {
+        PRMLogger.trace(.session, "PRMCamera.setExposureMode(\(mode.rawValue))")
         // User explicitly picked a mode — drop any prior manual-exposure intent
         // so the UI doesn't keep showing "custom" after the user taps auto.
         intendedExposureMode = mode
@@ -262,6 +271,10 @@ public final class PRMCamera {
     }
 
     public func setCustomExposure(duration: CMTime, iso: Float) async {
+        PRMLogger.trace(
+            .session,
+            "PRMCamera.setCustomExposure(duration=\(CMTimeGetSeconds(duration))s, iso=\(iso))"
+        )
         intendedExposureMode = .custom
         // Snapshot the user-requested values so `refreshState` keeps the UI
         // pinned to what they set, not the lagging device-reported pre-commit
@@ -304,6 +317,7 @@ public final class PRMCamera {
     }
 
     public func setWhiteBalanceMode(_ mode: AVCaptureDevice.WhiteBalanceMode) async {
+        PRMLogger.trace(.session, "PRMCamera.setWhiteBalanceMode(\(mode.rawValue))")
         intendedWhiteBalanceMode = mode
         if mode != .locked {
             intendedWhiteBalanceTemperature = nil
@@ -313,6 +327,10 @@ public final class PRMCamera {
     }
 
     public func lockWhiteBalance(_ values: AVCaptureDevice.PRMTemperatureAndTint) async {
+        PRMLogger.trace(
+            .session,
+            "PRMCamera.lockWhiteBalance(temp=\(values.temperature), tint=\(values.tint))"
+        )
         intendedWhiteBalanceMode = .locked
         intendedWhiteBalanceTemperature = values.temperature
         // Same async-completion handling as `setCustomExposure` — see that doc.
@@ -340,11 +358,13 @@ public final class PRMCamera {
     }
 
     public func setFrameRate(_ fps: Float64, allowFormatChange: Bool = true) async {
+        PRMLogger.trace(.session, "PRMCamera.setFrameRate(\(fps), allowFormatChange=\(allowFormatChange))")
         await runOnDevice { _ = try? $0.prm_setFrameRate(fps, allowFormatChange: allowFormatChange) }
         await refreshState()
     }
 
     public func resetFrameRate() async {
+        PRMLogger.trace(.session, "PRMCamera.resetFrameRate")
         await runOnDevice { try? $0.prm_resetFrameRate() }
         await refreshState()
     }
@@ -364,6 +384,7 @@ public final class PRMCamera {
     /// is a cheap no-op after the first call.
     @discardableResult
     public func enableDepthFormat() async -> Bool {
+        PRMLogger.trace(.session, "PRMCamera.enableDepthFormat")
         let result = await PRMCameraActor.shared.run { [session] in
             guard let device = await session.videoDevice else { return false }
             // The format change must be wrapped in `beginConfiguration` /

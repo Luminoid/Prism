@@ -289,6 +289,13 @@ final class StudioViewController: UIViewController {
 
     override func viewDidLoad() {
         super.viewDidLoad()
+        // Example app: turn on Prism's verbose SDK traces so the Console.app log shows
+        // every configure / start / switchCamera / setter / format-swap / capture entry.
+        // SDK callers ship with this off — flipping it on here keeps the example useful
+        // as a "what's actually happening under the hood?" debugging surface without
+        // making release builds chatty.
+        PRMLogger.isVerboseTracingEnabled = true
+
         view.backgroundColor = .black
         overrideUserInterfaceStyle = .dark
         navigationController?.setNavigationBarHidden(true, animated: false)
@@ -299,6 +306,7 @@ final class StudioViewController: UIViewController {
         previewView.addInteraction(captureEventHelper.makeInteraction())
         captureEventHelper.onPrimaryAction = { [weak self] in self?.handleShutterTap() }
         captureEventHelper.onSecondaryAction = { [weak self] in self?.flipCameraSync() }
+        PRMLogger.session.notice("Studio viewDidLoad — verbose tracing enabled")
         Task { await bootCamera() }
     }
 
@@ -535,20 +543,30 @@ final class StudioViewController: UIViewController {
 
         do {
             var config = PRMCameraConfiguration()
-            // Start in Live-Photo-capable session shape (no movie file output) but with
-            // Live Photo capture itself OFF. `applyModeChange()` flips Live Photo on when
-            // the user enters Live mode and back off elsewhere. Reason: the initial mode
-            // is `.photo` (not `.live`), and Live Photo capability is incompatible with
-            // manual exposure / WB lock — the photo output requires the sensor in a
-            // continuous-auto pipeline to retroactively bracket the Live Photo movie, so
-            // `device.exposureMode = .custom` and WB lock silently revert within a frame
-            // or two. AVCamManual (Apple's manual-controls sample) deliberately never
-            // enables Live Photo for the same reason. `setLivePhotoCaptureEnabled` (which
-            // we call on every mode change) is the runtime knob; leaving Live Photo off
-            // at configure time means the cold-start ISO / shutter / WB sliders work
-            // immediately without waiting for the first mode toggle.
+            // **`enableLivePhoto` MUST be true at configure time** if Live Photo is ever
+            // going to be tapped at runtime. Per Apple's docs
+            // (developer.apple.com/documentation/avfoundation/avcapturephotooutput/
+            // islivephotocapturesupported): "Live Photo capture requires a lengthy
+            // reconfiguration of the capture render pipeline, so if you intend to do any
+            // Live Photo captures at all, you should set livePhotoCaptureEnabled to YES
+            // *before calling -[AVCaptureSession startRunning]*." The pipeline's secondary
+            // movie-capture path is decided at build time; no runtime format swap can
+            // retroactively add it — `isLivePhotoCaptureSupported` stays false forever
+            // for sessions that started without it (verified empirically: iterating all
+            // 12 formats on Triple camera, every single one reports
+            // isLivePhotoCaptureSupported=false when the pipeline was built with
+            // enableLivePhoto=false).
+            //
+            // The per-frame runtime knob `setLivePhotoCaptureEnabled(_:)` is still needed
+            // for manual-exposure modes — Live Photo *enabled* (not supported) at the
+            // photo output silently reverts `device.exposureMode = .custom` and WB lock
+            // back to continuous-auto within a frame or two (the photo output requires
+            // the sensor in auto pipeline to bracket the Live Photo movie). So Studio's
+            // `applyModeChange()` flips `setLivePhotoCaptureEnabled(true)` in Live mode
+            // and `false` everywhere else. That toggle is cheap when the pipeline already
+            // has the support wired; what we cannot do is *add* support at runtime.
             config.includesMovieFileOutput = false
-            config.enableLivePhoto = false
+            config.enableLivePhoto = true
             config.enableDepthDataDelivery = true
             config.enablePortraitEffectsMatteDelivery = true
             // Auto-deferred photo delivery conflicts with depth/matte on iPhone Pro
@@ -924,6 +942,9 @@ final class StudioViewController: UIViewController {
     /// controller already understands. Burst folds into `.photo` via `burstEnabled`; the
     /// Night variants fold into `.night` via `nightDuration`.
     private func applyModeChange(primary: ModePicker.Primary, variant: ModePicker.Variant) {
+        PRMLogger.session.notice(
+            "Studio applyModeChange: primary=\(String(describing: primary), privacy: .public), variant=\(String(describing: variant), privacy: .public)"
+        )
         // Re-apply variant-disable state — `rebuildVariants` swapped the strip contents
         // when the primary changed, dropping any per-variant disable we set previously.
         syncModePickerAvailability()
@@ -969,6 +990,9 @@ final class StudioViewController: UIViewController {
     }
 
     private func applyModeChange(from oldMode: Mode) {
+        PRMLogger.session.notice(
+            "Studio mode change: \(oldMode.label, privacy: .public) → \(self.mode.label, privacy: .public)"
+        )
         Task {
             // Live Photo and AVCaptureMovieFileOutput are mutually exclusive on the same
             // session: having both attached forces `isLivePhotoCaptureSupported` to false.
@@ -1327,6 +1351,13 @@ final class StudioViewController: UIViewController {
     }
 
     private func capturePhoto() {
+        Task {
+            await refreshPhotoCaptureIfOutputChanged()
+            await MainActor.run { self.capturePhotoOnCurrent() }
+        }
+    }
+
+    private func capturePhotoOnCurrent() {
         guard let photoCapture else { return }
         let settings = makePhotoSettings(flash: flashSetting.avMode, quality: .quality)
 
@@ -1353,6 +1384,13 @@ final class StudioViewController: UIViewController {
     }
 
     private func captureBurst() {
+        Task {
+            await refreshPhotoCaptureIfOutputChanged()
+            await MainActor.run { self.captureBurstOnCurrent() }
+        }
+    }
+
+    private func captureBurstOnCurrent() {
         guard let photoCapture else { return }
         let settings = makePhotoSettings(flash: flashSetting.avMode, quality: .speed)
         flashOverlay()
@@ -1370,6 +1408,33 @@ final class StudioViewController: UIViewController {
     }
 
     private func captureLivePhoto() {
+        Task {
+            await refreshPhotoCaptureIfOutputChanged()
+            await MainActor.run { self.captureLivePhotoOnCurrent() }
+        }
+    }
+
+    /// Refresh `photoCapture` if the session's current `AVCapturePhotoOutput` is a
+    /// different instance from the one we cached at boot. Necessary because the
+    /// Live-Photo-recovery reconfigure path in `PRMCameraSession.swapInput` tears
+    /// down + recreates the photo output to restore `isLivePhotoCaptureSupported`
+    /// on virtual devices — if Studio kept using the pre-reconfigure instance, its
+    /// `isLivePhotoCaptureSupported` would silently read false (the old output is
+    /// no longer in the session) and every Live capture would fail at the gate.
+    private func refreshPhotoCaptureIfOutputChanged() async {
+        let currentOutput = await camera.session.photoOutput
+        guard let currentOutput else { return }
+        if photoCapture?.output !== currentOutput {
+            let renderContext = renderContext
+            let newCapture = PRMPhotoCapture(output: currentOutput)
+            await MainActor.run {
+                self.photoCapture = newCapture
+                self.nightCapture = PRMNightModeCapture(capture: newCapture, context: renderContext)
+            }
+        }
+    }
+
+    private func captureLivePhotoOnCurrent() {
         guard let photoCapture else { return }
         let settings = makePhotoSettings(flash: flashSetting.avMode, quality: .quality)
         flashOverlay()
@@ -1388,6 +1453,13 @@ final class StudioViewController: UIViewController {
     }
 
     private func capturePortraitPhoto() {
+        Task {
+            await refreshPhotoCaptureIfOutputChanged()
+            await MainActor.run { self.capturePortraitPhotoOnCurrent() }
+        }
+    }
+
+    private func capturePortraitPhotoOnCurrent() {
         guard let photoCapture else { return }
         let settings = makePhotoSettings(flash: .off, quality: .quality)
         flashOverlay()
@@ -1654,6 +1726,9 @@ final class StudioViewController: UIViewController {
     // MARK: - Shutter
 
     private func handleShutterTap() {
+        PRMLogger.capture.notice(
+            "Studio shutter tap: mode=\(self.mode.label, privacy: .public), timer=\(self.timerSetting.rawValue), maxDim=\(self.capMaxDimensions)"
+        )
         guard timerSetting != .off else {
             performShutter()
             return
@@ -1742,6 +1817,7 @@ final class StudioViewController: UIViewController {
     private func flipCamera() async {
         let current = camera.device?.position ?? .back
         let next: AVCaptureDevice.Position = current == .back ? .front : .back
+        PRMLogger.session.notice("Studio flipCamera: \(current.rawValue) → \(next.rawValue)")
         do {
             pipeline.isEnabled = false
             try await camera.switchCamera(to: next)
@@ -2135,6 +2211,10 @@ extension StudioViewController {
             // constituent. Without an explicit swap, toggling Max Dimensions on
             // 15 Pro Max picks 24MP and the user sees no benefit. Force a hop to
             // wide first; on toggle-off, restore the virtual device.
+            let modeBefore = mode
+            PRMLogger.session.notice(
+                "Studio Max Dimensions toggle → \(toggle.isOn ? "on" : "off", privacy: .public) (mode=\(modeBefore.label, privacy: .public))"
+            )
             Task {
                 if toggle.isOn {
                     await self.ensureWideCameraForManual()
@@ -2143,7 +2223,25 @@ extension StudioViewController {
                 if !toggle.isOn {
                     await self.restoreVirtualCameraIfFullyAuto()
                 }
-                await MainActor.run { self.syncModePickerAvailability() }
+                await MainActor.run {
+                    self.syncModePickerAvailability()
+                    // Max ON disables Live / Burst / Portrait at the session level. If the
+                    // user was already in one of those modes when they toggle Max on, the
+                    // picker chip becomes disabled but `self.mode` still points at it —
+                    // and `applyModeChange` is the only path that calls
+                    // `camera.setLivePhotoCaptureEnabled(mode == .live)`. Without dropping
+                    // the mode back to `.photo` here, a subsequent capture fails with
+                    // `Live Photo is not enabled on the photo output` even though the
+                    // user's last chip tap selected Live. The system Camera app handles
+                    // the same cross-feature conflict by silently moving the mode picker.
+                    if toggle.isOn, self.mode == .live || self.mode == .portrait {
+                        PRMLogger.session.notice(
+                            "Studio: Max ON forces mode \(self.mode.label, privacy: .public) → photo (incompatible with Max Dimensions)"
+                        )
+                        self.modePicker.select(primary: .photo, variant: .standard)
+                        self.applyModeChange(primary: .photo, variant: .standard)
+                    }
+                }
             }
         }, for: .valueChanged)
         maxDimensionsRow = row

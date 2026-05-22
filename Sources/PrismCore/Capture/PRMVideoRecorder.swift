@@ -44,6 +44,10 @@ public final class PRMVideoRecorder: NSObject, @unchecked Sendable {
         rotationAngle: CGFloat? = nil,
         stabilizationMode: AVCaptureVideoStabilizationMode? = nil
     ) async throws {
+        PRMLogger.trace(
+            .capture,
+            "PRMVideoRecorder.start(rotation=\(rotationAngle.map { String(describing: $0) } ?? "nil"), stab=\(stabilizationMode?.rawValue.description ?? "nil"))"
+        )
         if case .recording = state { return }
 
         let url = PRMTempFile.url(withExtension: "mov")
@@ -75,6 +79,7 @@ public final class PRMVideoRecorder: NSObject, @unchecked Sendable {
     /// (the file is already being flushed by AVFoundation) — the call still resumes when the
     /// delegate fires, so the caller gets the partial recording. Use ``cancel()`` to discard.
     public func stop() async throws -> PRMRecording {
+        PRMLogger.trace(.capture, "PRMVideoRecorder.stop")
         guard case .recording = state else {
             throw PRMSessionError.videoRecordingFailed("Not currently recording")
         }

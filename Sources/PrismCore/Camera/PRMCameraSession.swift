@@ -52,6 +52,20 @@ public final class PRMCameraSession {
     /// Whether `session.startRunning()` has been called.
     public private(set) var isRunning: Bool = false
 
+    /// The `device.activeFormat` snapshot captured at `configure(_:)` and refreshed
+    /// at every `switchCamera` / `switchDevice` success. Used by
+    /// `applyLivePhotoCompatibleFormat()` as the canonical "restore" target on
+    /// Max-Dimensions-OFF — the format AVFoundation picked for our session at
+    /// configure time is guaranteed BGRA-capable (we render a preview with it
+    /// from the start), whereas any format-scoring heuristic risks picking a
+    /// sibling 12MP format whose connection chain excludes BGRA from
+    /// `videoDataOutput.availableVideoPixelFormatTypes` (the iPhone 15 Pro Max
+    /// portrait-coupled `.photo`-preset format trap — `supportedDepthDataFormats`
+    /// is empty for it but `availableVideoPixelFormatTypes` still excludes BGRA).
+    /// Captured per device so a wide-camera hop replaces the baseline with that
+    /// device's known-good default.
+    private var baselineActiveFormat: AVCaptureDevice.Format?
+
     // MARK: - Init
 
     public nonisolated init() {}
@@ -75,6 +89,16 @@ public final class PRMCameraSession {
     /// `canAddInput` silently failing and the session stuck on the first device.)
     public func configure(_ configuration: PRMCameraConfiguration) throws {
         self.configuration = configuration
+
+        PRMLogger.trace(
+            .session,
+            """
+            configure(pos=\(configuration.cameraPosition.rawValue), preset=\(configuration.sessionPreset.rawValue), \
+            audio=\(configuration.includesAudio), video=\(configuration.includesVideoDataOutput), \
+            photo=\(configuration.includesPhotoOutput), movie=\(configuration.includesMovieFileOutput), \
+            preferMaxPhoto=\(configuration.prefersMaxPhotoDimensionsFormat))
+            """
+        )
 
         session.beginConfiguration()
         defer { session.commitConfiguration() }
@@ -124,6 +148,20 @@ public final class PRMCameraSession {
                 }
             }
         #endif
+
+        // Snapshot the format AVFoundation landed on so `applyLivePhotoCompatibleFormat`
+        // can restore it verbatim later. We capture AFTER all attachments + preferred-
+        // format application so the snapshot reflects the format the user will actually
+        // see rendering, not an intermediate state.
+        baselineActiveFormat = videoDevice?.activeFormat
+
+        if let device = videoDevice {
+            let dims = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
+            PRMLogger.trace(
+                .session,
+                "configure complete: device=\(device.localizedName), activeFormat=\(dims.width)×\(dims.height)"
+            )
+        }
     }
 
     private func applyPreferredStabilization(_ mode: AVCaptureVideoStabilizationMode) {
@@ -160,13 +198,16 @@ public final class PRMCameraSession {
     /// Starts the session. Idempotent.
     public func start() {
         guard !isRunning else { return }
+        PRMLogger.trace(.session, "start")
         session.startRunning()
         isRunning = session.isRunning
+        PRMLogger.trace(.session, "start: isRunning=\(isRunning)")
     }
 
     /// Stops the session. Idempotent.
     public func stop() {
         guard isRunning else { return }
+        PRMLogger.trace(.session, "stop")
         session.stopRunning()
         isRunning = false
     }
@@ -237,6 +278,10 @@ public final class PRMCameraSession {
         guard let currentInput = videoDeviceInput else {
             throw PRMSessionError.cannotAttachToSession("No current input to swap")
         }
+        PRMLogger.trace(
+            .session,
+            "swapInput: \(videoDevice?.localizedName ?? "nil") → \(newDevice.localizedName) (type=\(newDevice.deviceType.rawValue), pos=\(newDevice.position.rawValue))"
+        )
         let newInput: AVCaptureDeviceInput
         do {
             newInput = try AVCaptureDeviceInput(device: newDevice)
@@ -262,16 +307,148 @@ public final class PRMCameraSession {
             // the photo output's max-dimensions ceiling to match.
             applyPreferredPhotoFormatIfNeeded()
             refreshOutputMaxPhotoDimensions()
+            // Re-assert the photo output's aux delivery flags against the new input.
+            // Per Apple's AVCam reference: "When changing cameras, the
+            // livePhotoCaptureEnabled and depthDataDeliveryEnabled properties of the
+            // AVCapturePhotoOutput gets set to NO when a video device is disconnected
+            // from the session. After the new video device is added to the session,
+            // re-enable them on the AVCapturePhotoOutput if it is supported." We
+            // honor that pattern instead of detaching/reattaching the whole output —
+            // a full reattach against the destination input doesn't reliably restore
+            // `isLivePhotoCaptureSupported` on virtual devices (Triple/Dual), but the
+            // AVCam-style in-place re-set does because the support flag re-reads from
+            // the new connection chain on the existing output instance.
+            if let photoOutput, let configuration {
+                if configuration.enableLivePhoto {
+                    photoOutput.isLivePhotoCaptureEnabled = photoOutput.isLivePhotoCaptureSupported
+                }
+                if configuration.enableDepthDataDelivery {
+                    photoOutput.isDepthDataDeliveryEnabled = photoOutput.isDepthDataDeliverySupported
+                }
+                if configuration.enablePortraitEffectsMatteDelivery {
+                    photoOutput.isPortraitEffectsMatteDeliveryEnabled = photoOutput.isPortraitEffectsMatteDeliverySupported
+                }
+                PRMLogger.trace(
+                    .session,
+                    "swapInput post: live(supported=\(photoOutput.isLivePhotoCaptureSupported), enabled=\(photoOutput.isLivePhotoCaptureEnabled))"
+                )
+            }
         #endif
         session.commitConfiguration()
+
+        #if !os(macOS)
+            // **Fallback: full session reconfigure when Live Photo support didn't survive
+            // the swap.** AVCam's in-place re-set works for some device transitions
+            // (Triple → Wide) but fails for others (Wide → Triple): on virtual devices,
+            // the photo output's secondary movie pipeline doesn't re-bind to the new
+            // input even with the AVCam-style flag re-assert. Empirically the *only*
+            // path that reliably restores `isLivePhotoCaptureSupported` on Triple after
+            // a Wide round-trip is the same path that worked at boot: tear down every
+            // attachment and re-run the full configure flow.
+            //
+            // This is expensive (300+ ms preview freeze) and we'd prefer not to do it,
+            // but: (a) the user explicitly asked us to prioritize making this work over
+            // staying clever; (b) it only fires when Live Photo was requested AND the
+            // in-place re-set failed — the common case (Live Photo off, or in-place
+            // succeeded) is unaffected. The reconfigure preserves the destination
+            // device since `videoDevice` is already updated above.
+            if let configuration, configuration.enableLivePhoto, let photoOutput,
+               !photoOutput.isLivePhotoCaptureSupported {
+                PRMLogger.session.notice(
+                    "swapInput: Live Photo lost on \(newDevice.localizedName, privacy: .public) — full session reconfigure"
+                )
+                try reconfigureForDevice(newDevice, configuration: configuration)
+            }
+        #endif
+
+        // Re-snapshot the baseline format for the new device so a subsequent
+        // `applyLivePhotoCompatibleFormat()` restores to THIS device's known-good
+        // default, not a stale snapshot from the prior device.
+        baselineActiveFormat = videoDevice?.activeFormat ?? newDevice.activeFormat
+        let dims = CMVideoFormatDescriptionGetDimensions((videoDevice ?? newDevice).activeFormat.formatDescription)
+        PRMLogger.trace(
+            .session,
+            "swapInput complete: device=\((videoDevice ?? newDevice).localizedName), activeFormat=\(dims.width)×\(dims.height)"
+        )
     }
+
+    #if !os(macOS)
+        /// Full session tear-down + rebuild against a specific destination device,
+        /// reusing the original `PRMCameraConfiguration` shape (audio / video / photo
+        /// / movie attachments, enableLivePhoto, depth, etc.). Used as a last-resort
+        /// recovery from `swapInput` when the in-place flag re-assert can't restore
+        /// `isLivePhotoCaptureSupported` on virtual devices (see swapInput comment).
+        ///
+        /// Mirrors `configure(_:)`'s attach order: video input → preferred format →
+        /// audio → video data output → photo output → movie output. The destination
+        /// device is forced via a direct `AVCaptureDeviceInput(device:)` instead of
+        /// going through `attachVideoDevice` (which would re-run device discovery and
+        /// could pick a different device).
+        private func reconfigureForDevice(
+            _ device: AVCaptureDevice,
+            configuration: PRMCameraConfiguration
+        ) throws {
+            session.beginConfiguration()
+            defer { session.commitConfiguration() }
+            tearDownAttachments()
+            session.sessionPreset = configuration.sessionPreset
+
+            let input: AVCaptureDeviceInput
+            do {
+                input = try AVCaptureDeviceInput(device: device)
+            } catch {
+                throw PRMSessionError.cannotCreateDeviceInput(error.localizedDescription)
+            }
+            guard session.canAddInput(input) else {
+                throw PRMSessionError.cannotAttachToSession("Cannot add video input during reconfigure")
+            }
+            session.addInput(input)
+            videoDeviceInput = input
+            videoDevice = device
+
+            applyPreferredPhotoFormatIfNeeded()
+
+            if configuration.includesAudio {
+                attachAudioDevice()
+            }
+            if configuration.includesVideoDataOutput {
+                try attachVideoDataOutput(
+                    pixelFormat: configuration.videoPixelFormat,
+                    discardsLateVideoFrames: configuration.discardsLateVideoFrames
+                )
+            }
+            if configuration.includesPhotoOutput {
+                try attachPhotoOutput(configuration: configuration)
+            }
+            if configuration.includesMovieFileOutput {
+                try attachMovieFileOutput()
+            }
+            applyPreferredStabilization(configuration.preferredVideoStabilizationMode)
+            let supported = photoOutput?.isLivePhotoCaptureSupported ?? false
+            let enabled = photoOutput?.isLivePhotoCaptureEnabled ?? false
+            PRMLogger.trace(
+                .session,
+                "reconfigureForDevice complete: device=\(device.localizedName), live(supported=\(supported), enabled=\(enabled))"
+            )
+        }
+    #endif
 
     // MARK: - Delegate installation
 
-    /// Installs a sample-buffer delegate on the video data output.
+    /// Cached sample-buffer delegate so it can be re-installed after a full session
+    /// reconfigure (which creates a fresh `videoDataOutput` instance and loses the
+    /// delegate set on the prior instance). `nonisolated(unsafe)` because the only
+    /// writers run on `PRMCameraActor` and the AVFoundation `setSampleBufferDelegate`
+    /// docs are explicit that it can be called from any actor.
+    private var cachedVideoDataOutputDelegate: (any AVCaptureVideoDataOutputSampleBufferDelegate)?
+
+    /// Installs a sample-buffer delegate on the video data output. Cached so a
+    /// full session reconfigure (e.g. the `swapInput` recovery path for Live Photo
+    /// support on virtual devices) automatically re-installs it on the new output.
     public func setVideoDataOutputDelegate(
         _ delegate: any AVCaptureVideoDataOutputSampleBufferDelegate
     ) {
+        cachedVideoDataOutputDelegate = delegate
         videoDataOutput?.setSampleBufferDelegate(delegate, queue: dataOutputQueue)
     }
 
@@ -349,6 +526,12 @@ public final class PRMCameraSession {
         }
         session.addOutput(output)
         videoDataOutput = output
+        // Re-apply the cached delegate so a full reconfigure (which creates a fresh
+        // output instance) doesn't strand the filter pipeline / preview view with no
+        // frame source. The cache is populated by `setVideoDataOutputDelegate(_:)`.
+        if let cachedVideoDataOutputDelegate {
+            output.setSampleBufferDelegate(cachedVideoDataOutputDelegate, queue: dataOutputQueue)
+        }
     }
 
     private func attachPhotoOutput(configuration: PRMCameraConfiguration) throws {
@@ -416,6 +599,9 @@ public final class PRMCameraSession {
     }
 
     #if !os(macOS)
+    #endif
+
+    #if !os(macOS)
         /// Sets `output.maxPhotoDimensions` to the largest entry the current device's
         /// active format supports. Without this, per-photo `maxPhotoDimensions` requests
         /// for entries larger than AVFoundation's conservative default ceiling (typically
@@ -434,6 +620,112 @@ public final class PRMCameraSession {
                 .filter { $0.width >= $0.height }
             guard let largest = supported.max(by: { Int64($0.width) * Int64($0.height) < Int64($1.width) * Int64($1.height) }) else { return }
             output.maxPhotoDimensions = largest
+        }
+
+        /// Re-applies the video-data-output's pixel-format override against the
+        /// **current** active format. `AVCaptureVideoDataOutput.videoSettings` is
+        /// honored per-active-format: each `device.activeFormat` swap invalidates
+        /// the previous override and AVFoundation falls back to whatever the new
+        /// format's `availableVideoCVPixelFormatTypes` declares first — typically
+        /// the device's native `420f` YUV. On iPhone Pro models the depth-streaming
+        /// format and the portrait-coupled 12MP format both deliver YUV by default
+        /// and exclude BGRA from `availableVideoPixelFormatTypes` entirely (the
+        /// list is `[420f, 420v, x420, x422, ...]` — no BGRA).
+        ///
+        /// Without this re-apply, frames after a format swap arrive as YUV; our
+        /// preview path hardcodes `bgra8Unorm` and the BufferPoolAllocator
+        /// requires `kCVPixelFormatType_32BGRA`, so the preview freezes. Re-writing
+        /// `videoSettings` forces AVFoundation to validate against the new format
+        /// — it honors the BGRA conversion when available, and we log a loud
+        /// `.error` if BGRA isn't even in the list so the silent freeze becomes
+        /// a single Console.app grep target.
+        private func refreshVideoDataOutputPixelFormat() {
+            guard let output = videoDataOutput else { return }
+            let target = kCVPixelFormatType_32BGRA
+            let available = output.availableVideoPixelFormatTypes
+            guard available.contains(target) else {
+                PRMLogger.session.error(
+                    "videoDataOutput: BGRA not in availableVideoCVPixelFormatTypes after format swap (\(available, privacy: .public)) — preview may freeze"
+                )
+                return
+            }
+            output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: target]
+        }
+
+        /// Aligns the photo output's Live Photo / depth / portrait-matte / ZSL /
+        /// deferred-delivery flags with the active format's capability. Called from
+        /// inside `applyPhotoFormat` and `restoreBaselineFormat` while the session
+        /// is in a begin/commit window.
+        ///
+        /// - `highRes: true` — pin every auxiliary stream OFF. The 48MP photo format
+        ///   doesn't carry depth, matte, or the Live Photo movie pipeline, and ZSL /
+        ///   deferred proxy delivery both substitute 12MP captures. The original
+        ///   `PRMCameraConfiguration` is preserved so the inverse path can restore.
+        /// - `highRes: false` — re-apply each flag from the original
+        ///   `PRMCameraConfiguration` (subject to the output's `is*Supported` gate,
+        ///   which is active-format-dependent). Leaves `isLivePhotoCaptureEnabled`
+        ///   alone — that runtime state is owned by `setLivePhotoCaptureEnabled(_:)`
+        ///   / the consuming app's mode picker, not configure-time defaults.
+        private func applyAuxiliaryPhotoOutputFlags(highRes: Bool) {
+            guard let output = photoOutput else { return }
+            let live = output.isLivePhotoCaptureEnabled
+            let depth = output.isDepthDataDeliveryEnabled
+            let matte = output.isPortraitEffectsMatteDeliveryEnabled
+            let zsl = output.isZeroShutterLagEnabled
+            let deferred = output.isAutoDeferredPhotoDeliveryEnabled
+            PRMLogger.trace(
+                .session,
+                """
+                applyAuxiliaryPhotoOutputFlags(highRes=\(highRes)) entry: \
+                live=\(live), depth=\(depth), matte=\(matte), zsl=\(zsl), deferred=\(deferred)
+                """
+            )
+            if highRes {
+                if output.isLivePhotoCaptureEnabled {
+                    PRMLogger.session.notice("aux-flags(highRes=true): disabling isLivePhotoCaptureEnabled (was true)")
+                    output.isLivePhotoCaptureEnabled = false
+                }
+                if output.isDepthDataDeliverySupported, output.isDepthDataDeliveryEnabled {
+                    PRMLogger.session.notice("aux-flags(highRes=true): disabling isDepthDataDeliveryEnabled (was true)")
+                    output.isDepthDataDeliveryEnabled = false
+                }
+                if output.isPortraitEffectsMatteDeliverySupported, output.isPortraitEffectsMatteDeliveryEnabled {
+                    PRMLogger.session.notice("aux-flags(highRes=true): disabling isPortraitEffectsMatteDeliveryEnabled (was true)")
+                    output.isPortraitEffectsMatteDeliveryEnabled = false
+                }
+                if output.isAutoDeferredPhotoDeliverySupported, output.isAutoDeferredPhotoDeliveryEnabled {
+                    output.isAutoDeferredPhotoDeliveryEnabled = false
+                }
+                if output.isZeroShutterLagSupported, output.isZeroShutterLagEnabled {
+                    output.isZeroShutterLagEnabled = false
+                }
+            } else {
+                guard let configuration else { return }
+                if output.isDepthDataDeliverySupported {
+                    let want = configuration.enableDepthDataDelivery
+                    if output.isDepthDataDeliveryEnabled != want {
+                        output.isDepthDataDeliveryEnabled = want
+                    }
+                }
+                if output.isPortraitEffectsMatteDeliverySupported {
+                    let want = configuration.enablePortraitEffectsMatteDelivery
+                    if output.isPortraitEffectsMatteDeliveryEnabled != want {
+                        output.isPortraitEffectsMatteDeliveryEnabled = want
+                    }
+                }
+                if output.isAutoDeferredPhotoDeliverySupported {
+                    let want = configuration.enableAutoDeferredPhotoDelivery
+                    if output.isAutoDeferredPhotoDeliveryEnabled != want {
+                        output.isAutoDeferredPhotoDeliveryEnabled = want
+                    }
+                }
+                if output.isZeroShutterLagSupported {
+                    let want = configuration.enableZeroShutterLag
+                    if output.isZeroShutterLagEnabled != want {
+                        output.isZeroShutterLagEnabled = want
+                    }
+                }
+            }
         }
 
         /// If `prefersMaxPhotoDimensionsFormat` is set, swap `activeFormat` to the device
@@ -466,28 +758,92 @@ public final class PRMCameraSession {
         /// sees a "48MP format + depth enabled" transient that would either reject
         /// the swap or downgrade captures to a tiny preview frame.
         func applyHighResolutionPhotoFormat() {
+            PRMLogger.trace(.session, "applyHighResolutionPhotoFormat")
+            // **Do NOT snapshot `baselineActiveFormat` here.** The configure-time
+            // and `swapInput` snapshots are the authoritative "known-good" state.
+            // A per-toggle snapshot would clobber that with whatever happens to be
+            // active right now — and after a previous toggle-ON cycle the active
+            // format is the 48MP one, which Live Photo / depth / matte all reject.
+            // Re-toggling OFF would then "restore" to the 48MP format and break
+            // every downstream feature that depends on a Live-Photo-compatible
+            // active format. Trust the configure / swapInput snapshot — it's the
+            // format AVFoundation actually picked at session-startup time when
+            // every constraint (Live Photo, depth, BGRA delivery) was satisfied.
             applyPhotoFormat(name: "max-dimensions", maxAreaCeiling: nil, highRes: true)
         }
 
-        /// Restores `activeFormat` to a Live-Photo-compatible format. The 48MP photo
-        /// format doesn't stream the parallel movie pipeline Live Photo needs, so
-        /// callers must reset before enabling Live Photo, burst, or depth capture.
-        /// Picks the largest-resolution format whose dimensions stay at or below 20MP
-        /// (the boundary that separates 12MP video-streaming formats from the 48MP
-        /// pure-photo format across iPhone Pro models).
+        /// Restores the active format to whatever was working at configure / pre-high-res
+        /// time. **Does not compute a new format from scratch**: format introspection
+        /// (`supportedDepthDataFormats`, frame-rate range, etc.) cannot predict whether
+        /// `videoDataOutput.availableVideoPixelFormatTypes` will contain BGRA — that's
+        /// computed by AVFoundation from the entire connection chain (device → input →
+        /// connection → output), and on iPhone 15 Pro Max the 12MP `.photo`-preset
+        /// portrait-coupled format excludes BGRA even though it looks identical to the
+        /// regular 12MP format by every introspectable signal. So we trust the format
+        /// AVFoundation picked at session-configure time (which we just rendered a
+        /// preview with) and restore it verbatim.
         ///
-        /// **Restores** the auxiliary delivery flags (Live Photo / depth / portrait
-        /// matte) per the original `PRMCameraConfiguration` so toggling Max Dimensions
-        /// off recovers the pre-toggle capture pipeline. Without this restore, the
-        /// flags stay off from the high-res toggle and subsequent captures lose
-        /// depth/matte ancillaries that the app explicitly configured at startup —
-        /// AND, more visibly, the output's `maxPhotoDimensions` stays pinned at the
-        /// 48MP ceiling from the toggle-on path, which fights AVFoundation's per-photo
-        /// validation against the now-smaller `activeFormat` and degrades the saved
-        /// photo to a 144×192 preview proxy. This is the "toggle off, photo comes
-        /// back tiny" symptom.
+        /// Also restores the auxiliary delivery flags (depth / portrait matte /
+        /// deferred / ZSL) per `PRMCameraConfiguration` so the pre-toggle capture
+        /// pipeline comes back intact.
+        ///
+        /// Falls back to the scored format pick (≤20MP, non-depth) when no baseline
+        /// was captured — happens only if `applyHighResolutionPhotoFormat()` is the
+        /// first format-swap call after configure (unusual; the snapshot path
+        /// dominates real usage).
         func applyLivePhotoCompatibleFormat() {
-            applyPhotoFormat(name: "Live-Photo-compatible", maxAreaCeiling: 20_000_000, highRes: false)
+            PRMLogger.trace(
+                .session,
+                "applyLivePhotoCompatibleFormat: baseline=\(baselineActiveFormat == nil ? "nil (will score)" : "captured")"
+            )
+            if let baseline = baselineActiveFormat {
+                restoreBaselineFormat(baseline)
+            } else {
+                applyPhotoFormat(name: "Live-Photo-compatible", maxAreaCeiling: 20_000_000, highRes: false)
+            }
+        }
+
+        /// Restore path: re-activate the previously-snapshotted format and re-apply
+        /// the auxiliary flags + photo-output ceiling + videoDataOutput pixel-format
+        /// override inside a single session begin/commit. No scoring, no probing —
+        /// just put the device back where the user last had a working preview.
+        private func restoreBaselineFormat(_ baseline: AVCaptureDevice.Format) {
+            guard let device = videoDevice else { return }
+
+            session.beginConfiguration()
+            defer { session.commitConfiguration() }
+
+            // Reconcile aux flags FIRST so AVFoundation never sees a 48MP-format +
+            // aux-flags-on transient on the way back. The current state coming in is
+            // "48MP format + aux flags OFF" (set by applyHighResolutionPhotoFormat).
+            // Targeting `highRes: false` re-enables depth/matte per PRMCameraConfiguration
+            // if the destination format supports them (guarded by isDepthDataDeliverySupported).
+            applyAuxiliaryPhotoOutputFlags(highRes: false)
+
+            if baseline !== device.activeFormat {
+                do {
+                    try device.lockForConfiguration()
+                    defer { device.unlockForConfiguration() }
+                    device.activeFormat = baseline
+                } catch {
+                    PRMLogger.session.warning(
+                        "Failed to restore baseline activeFormat: \(error.localizedDescription, privacy: .public)"
+                    )
+                    return
+                }
+            }
+
+            refreshVideoDataOutputPixelFormat()
+            refreshOutputMaxPhotoDimensions()
+
+            let dims = baseline.supportedMaxPhotoDimensions
+                .filter { $0.width >= $0.height }
+                .max(by: { Int64($0.width) * Int64($0.height) < Int64($1.width) * Int64($1.height) })
+            if let dims {
+                PRMLogger.session.notice(
+                    "applyLivePhotoCompatibleFormat: restored baseline format with maxPhotoDimensions \(dims.width, privacy: .public)×\(dims.height, privacy: .public)"
+                )
+            }
         }
 
         /// Shared format-swap path for the high-res / Live-Photo-compatible toggles.
@@ -548,22 +904,52 @@ public final class PRMCameraSession {
                     .max() ?? 0
                 return maxFps <= 30.0
             }
-            let candidates = device.formats.filter { format in
+            /// Whether the format streams depth. On iPhone 14 Pro+ / 15 Pro+,
+            /// depth-streaming formats **exclude BGRA** from
+            /// `AVCaptureVideoDataOutput.availableVideoPixelFormatTypes` — the
+            /// videoDataOutput delivers only YUV (`420f`, `420v`, `x420`, `x422`,
+            /// plus 10-bit variants) on those formats. Our preview pipeline + filter
+            /// pipeline both hardcode BGRA, so picking a depth-streaming format
+            /// freezes the preview (every frame fails the BGRA gate). The
+            /// `PRMCamera.enableDepthFormat()` path picks one deliberately when
+            /// the consumer enters Portrait mode; the general Live-Photo-compatible
+            /// fallback should NOT, because it's invoked on toggle-OFF from Max
+            /// Dimensions and the user isn't expecting their preview to die.
+            func isDepthStreamingFormat(_ format: AVCaptureDevice.Format) -> Bool {
+                !format.supportedDepthDataFormats.isEmpty
+            }
+            let allCandidates = device.formats.filter { format in
                 let s = score(format)
                 if s == 0 { return false }
                 if let ceiling = maxAreaCeiling, s > ceiling { return false }
                 return true
             }
+            // For the Live-Photo-compatible fallback path (no baseline snapshot
+            // available): hard-prefer non-depth formats. Note that
+            // `!supportedDepthDataFormats.isEmpty` is NOT a perfect signal — on
+            // iPhone 15 Pro Max, the portrait-coupled 12MP format has an empty
+            // depth-data list but still excludes BGRA from
+            // `availableVideoPixelFormatTypes`. The proper handling is via
+            // `applyLivePhotoCompatibleFormat`'s baseline-restore path; this
+            // scoring is only the cold-start fallback.
+            let candidates: [AVCaptureDevice.Format] = {
+                if highRes { return allCandidates }
+                let nonDepth = allCandidates.filter { !isDepthStreamingFormat($0) }
+                return nonDepth.isEmpty ? allCandidates : nonDepth
+            }()
             // Compound ordering: (1) higher max-photo-dim wins; (2) among ties, the
-            // pure-photo format wins over video-streaming formats.
+            // pure-photo format wins over video-streaming formats; (3) further ties
+            // broken by non-depth-streaming preference.
             guard let best = candidates.max(by: { a, b in
                 let scoreA = score(a)
                 let scoreB = score(b)
                 if scoreA != scoreB { return scoreA < scoreB }
-                // Equal max-photo-dim: prefer the dedicated photo format.
                 let photoA = isPhotoFormat(a)
                 let photoB = isPhotoFormat(b)
                 if photoA != photoB { return !photoA && photoB }
+                let depthA = isDepthStreamingFormat(a)
+                let depthB = isDepthStreamingFormat(b)
+                if depthA != depthB { return depthA && !depthB }
                 return false
             }) else { return }
 
@@ -571,12 +957,8 @@ public final class PRMCameraSession {
             defer { session.commitConfiguration() }
 
             // Reconcile the photo output's auxiliary delivery flags with the destination
-            // format BEFORE the format swap. The 48MP-capable format doesn't carry
-            // depth / matte / Live Photo, and leaving those flags on across the swap
-            // makes AVFoundation either silently reject the swap or downgrade the next
-            // capture to a 144×192 preview proxy (the canonical "toggle does nothing /
-            // export comes back tiny" symptom — see workspace lessons.md AVFoundation
-            // section "48MP capture on iPhone 14 Pro+ / 15 Pro+").
+            // format BEFORE the format swap. See `applyAuxiliaryPhotoOutputFlags` for
+            // the rationale (48MP format incompatibilities + 144×192 proxy bug).
             applyAuxiliaryPhotoOutputFlags(highRes: highRes)
 
             if best !== device.activeFormat {
@@ -592,17 +974,13 @@ public final class PRMCameraSession {
                 }
             }
 
-            // Must run inside the session config so the photo output validates the
-            // new ceiling against the just-installed `activeFormat`. See the
-            // `applyPhotoFormat` doc-comment for why this is required.
+            // Re-apply videoDataOutput's BGRA pixel-format override and the photo
+            // output's max-dimensions ceiling against the new active format. Both
+            // must run inside the session config so AVFoundation re-validates them
+            // against the just-installed format before the commit lands.
+            refreshVideoDataOutputPixelFormat()
             refreshOutputMaxPhotoDimensions()
 
-            // Diagnostic: surface the selected format's actual photo-dimension
-            // capability so "Max Dimensions doesn't work" tickets have a single
-            // log line to grep for. AVFoundation will silently reject the format
-            // swap or downgrade captures if the selected format mismatches the
-            // photo output's auxiliary flags — logging the picked dims here means
-            // the failure mode is observable in Console.app without breakpoints.
             let pickedDims = best.supportedMaxPhotoDimensions
                 .filter { $0.width >= $0.height }
                 .max(by: { Int64($0.width) * Int64($0.height) < Int64($1.width) * Int64($1.height) })
@@ -613,69 +991,6 @@ public final class PRMCameraSession {
             }
         }
 
-        /// Aligns the photo output's Live Photo / depth / portrait-matte / ZSL /
-        /// deferred-delivery flags with the active format's capability. Called from
-        /// inside `applyPhotoFormat` while the session is in a begin/commit window.
-        ///
-        /// - `highRes: true` — pin every auxiliary stream OFF. The 48MP photo format
-        ///   doesn't carry depth, matte, or the Live Photo movie pipeline, and ZSL /
-        ///   deferred proxy delivery both substitute 12MP captures. The original
-        ///   `PRMCameraConfiguration` is preserved so the inverse path can restore
-        ///   the user's intent.
-        /// - `highRes: false` — re-apply each flag from the original
-        ///   `PRMCameraConfiguration` (subject to the output's `is*Supported` gate).
-        ///   We deliberately leave `isLivePhotoCaptureEnabled` alone here — runtime
-        ///   Live Photo state is owned by `setLivePhotoCaptureEnabled(_:)` /
-        ///   `applyModeChange` in the consuming app, not by configure-time defaults.
-        private func applyAuxiliaryPhotoOutputFlags(highRes: Bool) {
-            guard let output = photoOutput else { return }
-
-            if highRes {
-                if output.isLivePhotoCaptureEnabled {
-                    output.isLivePhotoCaptureEnabled = false
-                }
-                if output.isDepthDataDeliverySupported, output.isDepthDataDeliveryEnabled {
-                    output.isDepthDataDeliveryEnabled = false
-                }
-                if output.isPortraitEffectsMatteDeliverySupported, output.isPortraitEffectsMatteDeliveryEnabled {
-                    output.isPortraitEffectsMatteDeliveryEnabled = false
-                }
-                if output.isAutoDeferredPhotoDeliverySupported, output.isAutoDeferredPhotoDeliveryEnabled {
-                    output.isAutoDeferredPhotoDeliveryEnabled = false
-                }
-                if output.isZeroShutterLagSupported, output.isZeroShutterLagEnabled {
-                    output.isZeroShutterLagEnabled = false
-                }
-            } else {
-                guard let configuration else { return }
-                if output.isDepthDataDeliverySupported {
-                    let want = configuration.enableDepthDataDelivery
-                    if output.isDepthDataDeliveryEnabled != want {
-                        output.isDepthDataDeliveryEnabled = want
-                    }
-                }
-                if output.isPortraitEffectsMatteDeliverySupported {
-                    let want = configuration.enablePortraitEffectsMatteDelivery
-                    if output.isPortraitEffectsMatteDeliveryEnabled != want {
-                        output.isPortraitEffectsMatteDeliveryEnabled = want
-                    }
-                }
-                if output.isAutoDeferredPhotoDeliverySupported {
-                    let want = configuration.enableAutoDeferredPhotoDelivery
-                    if output.isAutoDeferredPhotoDeliveryEnabled != want {
-                        output.isAutoDeferredPhotoDeliveryEnabled = want
-                    }
-                }
-                if output.isZeroShutterLagSupported {
-                    let want = configuration.enableZeroShutterLag
-                    if output.isZeroShutterLagEnabled != want {
-                        output.isZeroShutterLagEnabled = want
-                    }
-                }
-                // Don't touch isLivePhotoCaptureEnabled — owned by setLivePhotoCaptureEnabled
-                // / consuming app's mode picker, not configure-time defaults.
-            }
-        }
     #endif
 
     private func attachMovieFileOutput() throws {
@@ -717,27 +1032,56 @@ public final class PRMCameraSession {
     /// requested state is already in effect.
     public func setLivePhotoCaptureEnabled(_ enabled: Bool) {
         #if !os(macOS)
-            guard let photoOutput else { return }
-            // When enabling: if the current format / configuration doesn't support Live
-            // Photo, try recovering by swapping the device's `activeFormat` to one that
-            // does. The 48MP-capable photo format on iPhone 14 Pro+ / 15 Pro+ wide
-            // explicitly drops the parallel movie pipeline Live Photo needs — without
-            // this recovery, `setLivePhotoCaptureEnabled(true)` silently no-ops and the
-            // next `captureLivePhoto` fails with "Live Photo is not enabled on the
-            // photo output." Pulling the format flip in here means the photo output
-            // doesn't need to know about the cross-feature exclusion.
-            if enabled, !photoOutput.isLivePhotoCaptureSupported {
-                applyLivePhotoCompatibleFormat()
+            guard let photoOutput else {
+                PRMLogger.session.error("setLivePhotoCaptureEnabled(\(enabled, privacy: .public)): no photoOutput attached")
+                return
             }
-            guard photoOutput.isLivePhotoCaptureSupported else { return }
-            guard photoOutput.isLivePhotoCaptureEnabled != enabled else { return }
+            // **`isLivePhotoCaptureSupported` is a build-time property of the pipeline,
+            // not a runtime one.** Per Apple's docs
+            // (developer.apple.com/documentation/avfoundation/avcapturephotooutput/
+            // islivephotocapturesupported): "Live Photo capture requires a lengthy
+            // reconfiguration of the capture render pipeline, so if you intend to do any
+            // Live Photo captures at all, you should set livePhotoCaptureEnabled to YES
+            // *before calling -[AVCaptureSession startRunning]*." If the session was
+            // configured with `PRMCameraConfiguration.enableLivePhoto = false`, the
+            // secondary movie-capture path was never wired into the pipeline and no
+            // amount of format swapping or output reconfiguration can add it after the
+            // fact (verified empirically: iterating all 12 formats on Triple camera with
+            // a Live-Photo-disabled pipeline produces `isLivePhotoCaptureSupported=false`
+            // on every single one).
+            //
+            // So the error here is a configuration-time bug in the consuming app, not a
+            // runtime-recoverable state. The log message points the user at the fix
+            // instead of silently no-op'ing or thrashing the active format.
+            if enabled, !photoOutput.isLivePhotoCaptureSupported {
+                PRMLogger.session.error(
+                    """
+                    setLivePhotoCaptureEnabled(true): isLivePhotoCaptureSupported=false. \
+                    The session was configured with enableLivePhoto=false. Live Photo \
+                    pipeline support is decided at configure time and cannot be added \
+                    at runtime — set PRMCameraConfiguration.enableLivePhoto=true before \
+                    calling camera.configure(_:).
+                    """
+                )
+                return
+            }
+            guard photoOutput.isLivePhotoCaptureEnabled != enabled else {
+                PRMLogger.session.debug(
+                    "setLivePhotoCaptureEnabled(\(enabled, privacy: .public)): already \(enabled, privacy: .public), no-op"
+                )
+                return
+            }
             session.beginConfiguration()
             defer { session.commitConfiguration() }
             photoOutput.isLivePhotoCaptureEnabled = enabled
+            PRMLogger.session.notice(
+                "setLivePhotoCaptureEnabled: now \(enabled, privacy: .public)"
+            )
         #endif
     }
 
     public func setMovieFileOutputAttached(_ attached: Bool) throws {
+        PRMLogger.trace(.session, "setMovieFileOutputAttached(\(attached)): current=\(movieFileOutput != nil)")
         session.beginConfiguration()
         defer { session.commitConfiguration() }
 

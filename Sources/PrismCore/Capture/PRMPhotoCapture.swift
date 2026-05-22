@@ -96,6 +96,13 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         filterRecipe: FilterRecipe,
         willCapture: (@Sendable () -> Void)?
     ) async throws -> PRMPhoto {
+        let maxDim = output.maxPhotoDimensions
+        let live = output.isLivePhotoCaptureEnabled
+        let depth = output.isDepthDataDeliveryEnabled
+        PRMLogger.trace(
+            .capture,
+            "capturePhoto entry: maxDim=\(maxDim.width)×\(maxDim.height), live=\(live), depth=\(depth)"
+        )
         // Route through a single-frame photo bracket whenever the device is in
         // `.custom` exposure mode. `AVCapturePhotoBracketSettings` natively
         // disables Smart HDR, Deep Fusion, virtual-device fusion, dual-camera
@@ -333,10 +340,19 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
             throw PRMSessionError.photoCaptureFailed("Live Photo is unavailable on macOS")
         #else
             guard output.isLivePhotoCaptureSupported, output.isLivePhotoCaptureEnabled else {
+                let supported = output.isLivePhotoCaptureSupported
+                let enabled = output.isLivePhotoCaptureEnabled
+                PRMLogger.capture.error(
+                    "captureLivePhoto: refused — isLivePhotoCaptureSupported=\(supported, privacy: .public), isLivePhotoCaptureEnabled=\(enabled, privacy: .public)"
+                )
                 throw PRMSessionError.photoCaptureFailed(
-                    "Live Photo is not enabled on the photo output. Set enableLivePhoto on PRMCameraConfiguration."
+                    "Live Photo is not enabled on the photo output (supported=\(supported), enabled=\(enabled)). Call camera.setLivePhotoCaptureEnabled(true)."
                 )
             }
+            PRMLogger.trace(
+                .capture,
+                "captureLivePhoto entry: supported=\(output.isLivePhotoCaptureSupported), enabled=\(output.isLivePhotoCaptureEnabled)"
+            )
             let liveSettings = settings.livePhoto(true).makeAVSettings(for: output)
             clampFlashMode(on: liveSettings)
             applyManualExposureOverrides(on: liveSettings)
@@ -375,6 +391,7 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         settings: PRMPhotoSettings = PRMPhotoSettings(),
         willCapture: (@Sendable () -> Void)? = nil
     ) async throws -> [PRMPhoto] {
+        PRMLogger.trace(.capture, "captureBurst entry: count=\(count)")
         guard count > 0 else { return [] }
         var results: [PRMPhoto] = []
         results.reserveCapacity(count)
