@@ -680,6 +680,19 @@ extension PRMPhotoCapture: AVCapturePhotoCaptureDelegate {
 
             if pending.cancelled {
                 pendingCaptures.removeValue(forKey: id)
+                // For Live Photo: the movie sidecar's URL is owned by us (assigned
+                // via `liveSettings.livePhotoMovieFileURL = movieURL`), so we must
+                // remove it on cancellation regardless of whether the movie delegate
+                // has fired yet. The cancelled-photo path used to leak the file when
+                // the movie finished AFTER cancellation — `PhotoOutcome.resume()`
+                // only removes the file on the failure branch, but a cancelled photo
+                // hits the failure branch here, so this cleanup is now correctly
+                // routed by `PhotoOutcome.resume()`. The explicit removal below is
+                // defensive: AVFoundation may also call the movie delegate after we
+                // remove the pending entry, in which case the file would be orphaned.
+                if case let .live(movieURL) = pending.kind {
+                    PRMTempFile.remove(movieURL)
+                }
                 return .terminal(pending, .failure(PRMSessionError.cancelled))
             }
             if let error {
@@ -751,6 +764,13 @@ extension PRMPhotoCapture: AVCapturePhotoCaptureDelegate {
                 lock.lock()
                 defer { lock.unlock() }
                 guard let pending = pendingCaptures[id], case .live = pending.kind else {
+                    // No matching pending capture — either the still path already
+                    // resolved (cancellation race) or a stale callback fired after
+                    // teardown. Either way, the movie file at `outputFileURL` is
+                    // unreferenced now and would orphan in `<tmp>/Prism/` without
+                    // explicit cleanup. Removing here closes the window between the
+                    // still delegate's removal and a late movie delegate.
+                    PRMTempFile.remove(outputFileURL)
                     return .ignore
                 }
                 pending.liveMovieReady = error == nil

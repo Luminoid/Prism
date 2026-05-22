@@ -39,10 +39,10 @@ public extension AVCaptureDevice {
         }
 
         if currentSupports {
-            try lockForConfiguration()
-            defer { unlockForConfiguration() }
-            activeVideoMinFrameDuration = duration
-            activeVideoMaxFrameDuration = duration
+            try withConfigurationLock {
+                activeVideoMinFrameDuration = duration
+                activeVideoMaxFrameDuration = duration
+            }
             return PRMFrameRateChange(appliedFPS: fps, formatChanged: false)
         }
 
@@ -94,20 +94,20 @@ public extension AVCaptureDevice {
         }
         guard let format else { return nil }
 
-        try lockForConfiguration()
-        defer { unlockForConfiguration() }
-        activeFormat = format
-        activeVideoMinFrameDuration = duration
-        activeVideoMaxFrameDuration = duration
+        try withConfigurationLock {
+            activeFormat = format
+            activeVideoMinFrameDuration = duration
+            activeVideoMaxFrameDuration = duration
+        }
         return PRMFrameRateChange(appliedFPS: fps, formatChanged: true)
     }
 
     /// Clears frame rate constraints, returning to the device's default.
     func prm_resetFrameRate() throws {
-        try lockForConfiguration()
-        defer { unlockForConfiguration() }
-        activeVideoMinFrameDuration = .invalid
-        activeVideoMaxFrameDuration = .invalid
+        try withConfigurationLock {
+            activeVideoMinFrameDuration = .invalid
+            activeVideoMaxFrameDuration = .invalid
+        }
     }
 
     /// Current effective frame rate derived from `activeVideoMinFrameDuration`.

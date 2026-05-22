@@ -11,9 +11,9 @@ public extension AVCaptureDevice {
     /// - Throws: If the device cannot be locked for configuration.
     func prm_setZoom(_ factor: CGFloat) throws {
         let clamped = min(max(factor, minAvailableVideoZoomFactor), maxAvailableVideoZoomFactor)
-        try lockForConfiguration()
-        defer { unlockForConfiguration() }
-        videoZoomFactor = clamped
+        try withConfigurationLock {
+            videoZoomFactor = clamped
+        }
     }
 
     /// Begins a smooth zoom ramp.
@@ -23,16 +23,16 @@ public extension AVCaptureDevice {
     ///   - rate: Ramp rate (`pow(2, rate × t)`); 1.0 doubles magnification per second.
     func prm_rampZoom(to factor: CGFloat, rate: Float = 1.0) throws {
         let clamped = min(max(factor, minAvailableVideoZoomFactor), maxAvailableVideoZoomFactor)
-        try lockForConfiguration()
-        defer { unlockForConfiguration() }
-        ramp(toVideoZoomFactor: clamped, withRate: rate)
+        try withConfigurationLock {
+            ramp(toVideoZoomFactor: clamped, withRate: rate)
+        }
     }
 
     /// Cancels an in-progress zoom ramp.
     func prm_cancelZoomRamp() throws {
-        try lockForConfiguration()
-        defer { unlockForConfiguration() }
-        cancelVideoZoomRamp()
+        try withConfigurationLock {
+            cancelVideoZoomRamp()
+        }
     }
 
     // MARK: - Lens Descriptors

@@ -49,11 +49,16 @@
         }
 
         @Test
-        func `Each call to makeInteraction returns a fresh instance`() {
+        func `makeInteraction is memoized — repeated calls return the same instance`() {
+            // The helper memoizes its `AVCaptureEventInteraction` so callers can invoke
+            // `makeInteraction()` multiple times (e.g. from re-attachment paths like
+            // `viewWillAppear`) without accidentally creating duplicate interactions that
+            // would double-fire every Camera Control / volume-button event when both
+            // ended up attached to the same view.
             let helper = PRMCaptureEventHelper()
             let a = helper.makeInteraction()
             let b = helper.makeInteraction()
-            #expect(a !== b)
+            #expect(a === b)
         }
     }
 #endif

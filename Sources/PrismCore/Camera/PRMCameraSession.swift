@@ -457,27 +457,16 @@ public final class PRMCameraSession {
         /// that would otherwise outrank the true 48MP photo format by area on iPhone
         /// 15 Pro Max. **Incompatible with Live Photo / burst / depth streaming** —
         /// call `applyLivePhotoCompatibleFormat()` before re-enabling those.
+        ///
+        /// Per the workspace AVFoundation lesson catalog and Apple dev-forum 715452 /
+        /// 748321, 48MP capture requires the photo output's auxiliary delivery flags
+        /// (Live Photo, depth, portrait matte) to be OFF — these all substitute 12MP
+        /// proxy captures regardless of the active format. This helper turns them off
+        /// inside the same session commit as the format swap so AVFoundation never
+        /// sees a "48MP format + depth enabled" transient that would either reject
+        /// the swap or downgrade captures to a tiny preview frame.
         func applyHighResolutionPhotoFormat() {
-            guard let device = videoDevice else { return }
-            func score(_ format: AVCaptureDevice.Format) -> Int64 {
-                format.supportedMaxPhotoDimensions
-                    .filter { $0.width >= $0.height }
-                    .map { Int64($0.width) * Int64($0.height) }
-                    .max() ?? 0
-            }
-            let candidates = device.formats.filter { score($0) > 0 }
-            guard let best = candidates.max(by: { score($0) < score($1) }) else { return }
-            if best === device.activeFormat { return }
-            do {
-                try device.lockForConfiguration()
-                defer { device.unlockForConfiguration() }
-                device.activeFormat = best
-            } catch {
-                PRMLogger.session.warning(
-                    "Failed to promote activeFormat for max-dimensions capture: \(error.localizedDescription, privacy: .public)"
-                )
-            }
-            refreshOutputMaxPhotoDimensions()
+            applyPhotoFormat(name: "max-dimensions", maxAreaCeiling: nil, highRes: true)
         }
 
         /// Restores `activeFormat` to a Live-Photo-compatible format. The 48MP photo
@@ -486,7 +475,59 @@ public final class PRMCameraSession {
         /// Picks the largest-resolution format whose dimensions stay at or below 20MP
         /// (the boundary that separates 12MP video-streaming formats from the 48MP
         /// pure-photo format across iPhone Pro models).
+        ///
+        /// **Restores** the auxiliary delivery flags (Live Photo / depth / portrait
+        /// matte) per the original `PRMCameraConfiguration` so toggling Max Dimensions
+        /// off recovers the pre-toggle capture pipeline. Without this restore, the
+        /// flags stay off from the high-res toggle and subsequent captures lose
+        /// depth/matte ancillaries that the app explicitly configured at startup —
+        /// AND, more visibly, the output's `maxPhotoDimensions` stays pinned at the
+        /// 48MP ceiling from the toggle-on path, which fights AVFoundation's per-photo
+        /// validation against the now-smaller `activeFormat` and degrades the saved
+        /// photo to a 144×192 preview proxy. This is the "toggle off, photo comes
+        /// back tiny" symptom.
         func applyLivePhotoCompatibleFormat() {
+            applyPhotoFormat(name: "Live-Photo-compatible", maxAreaCeiling: 20_000_000, highRes: false)
+        }
+
+        /// Shared format-swap path for the high-res / Live-Photo-compatible toggles.
+        /// Critical detail: the format swap MUST be wrapped in
+        /// `session.beginConfiguration()` / `commitConfiguration()`, not just the
+        /// device-level `lockForConfiguration()`. Without the session wrap:
+        ///
+        /// 1. `device.activeFormat = best` updates the device immediately.
+        /// 2. `output.maxPhotoDimensions = largest` is then validated by AVFoundation
+        ///    against the SESSION's view of the active format — which is still the
+        ///    pre-swap format until the next session commit. The assignment is
+        ///    silently clamped to the OLD format's ceiling (typically 12MP).
+        /// 3. Subsequent per-photo `settings.maxPhotoDimensions = largest` reads the
+        ///    already-clamped output value, requesting (4032, 3024). The 48MP capture
+        ///    you toggled on never actually fires — the saved photo stays at 12MP
+        ///    with no error surfaced. This is the "Max Dimensions toggle does
+        ///    nothing" symptom.
+        ///
+        /// Wrapping the format swap AND the output-ceiling refresh in a single
+        /// session begin/commit forces AVFoundation to re-validate the photo output
+        /// against the new active format before the assignment lands, so the 48MP
+        /// ceiling sticks.
+        ///
+        /// Same pattern as `PRMCamera.enableDepthFormat()` — the photo output's
+        /// delivery flags re-validate at session commit time, not at device-unlock
+        /// time.
+        ///
+        /// - Parameters:
+        ///   - name: Human-readable name for log lines on failure.
+        ///   - maxAreaCeiling: When non-nil, only formats whose max landscape area
+        ///     is ≤ this value are eligible (used to exclude the 48MP pure-photo
+        ///     format from the Live-Photo-compatible path).
+        ///   - highRes: `true` for the 48MP path — disables Live Photo / depth /
+        ///     portrait matte on the photo output inside the same session commit so
+        ///     AVFoundation never sees a 48MP-format + aux-flags-on transient (which
+        ///     would either reject the swap or downgrade captures to a 144×192 preview
+        ///     proxy). `false` for the Live-Photo-compatible path — restores the
+        ///     aux flags from the original `PRMCameraConfiguration` so the toggle-off
+        ///     direction recovers depth/matte/Live Photo support.
+        private func applyPhotoFormat(name: String, maxAreaCeiling: Int64?, highRes: Bool) {
             guard let device = videoDevice else { return }
             func score(_ format: AVCaptureDevice.Format) -> Int64 {
                 format.supportedMaxPhotoDimensions
@@ -494,22 +535,146 @@ public final class PRMCameraSession {
                     .map { Int64($0.width) * Int64($0.height) }
                     .max() ?? 0
             }
+            /// True dedicated photo format: max frame rate ≤ 30 (video formats can reach
+            /// 60/120/240). Used as a tie-breaker so when multiple formats advertise the
+            /// 48MP entry, we pick the pure-photo one over a video-streaming format that
+            /// happens to list 48MP. iPhone 14 Pro+ / 15 Pro+ wide cameras both have
+            /// exactly one such photo format with the 48MP entry — picking a video format
+            /// by accident produces captures AVFoundation silently degrades to a preview
+            /// proxy because the video pipeline can't actually deliver 48MP frames.
+            func isPhotoFormat(_ format: AVCaptureDevice.Format) -> Bool {
+                let maxFps = format.videoSupportedFrameRateRanges
+                    .map(\.maxFrameRate)
+                    .max() ?? 0
+                return maxFps <= 30.0
+            }
             let candidates = device.formats.filter { format in
                 let s = score(format)
-                return s > 0 && s <= 20_000_000
+                if s == 0 { return false }
+                if let ceiling = maxAreaCeiling, s > ceiling { return false }
+                return true
             }
-            guard let best = candidates.max(by: { score($0) < score($1) }) else { return }
-            if best === device.activeFormat { return }
-            do {
-                try device.lockForConfiguration()
-                defer { device.unlockForConfiguration() }
-                device.activeFormat = best
-            } catch {
-                PRMLogger.session.warning(
-                    "Failed to restore Live-Photo-compatible format: \(error.localizedDescription, privacy: .public)"
+            // Compound ordering: (1) higher max-photo-dim wins; (2) among ties, the
+            // pure-photo format wins over video-streaming formats.
+            guard let best = candidates.max(by: { a, b in
+                let scoreA = score(a)
+                let scoreB = score(b)
+                if scoreA != scoreB { return scoreA < scoreB }
+                // Equal max-photo-dim: prefer the dedicated photo format.
+                let photoA = isPhotoFormat(a)
+                let photoB = isPhotoFormat(b)
+                if photoA != photoB { return !photoA && photoB }
+                return false
+            }) else { return }
+
+            session.beginConfiguration()
+            defer { session.commitConfiguration() }
+
+            // Reconcile the photo output's auxiliary delivery flags with the destination
+            // format BEFORE the format swap. The 48MP-capable format doesn't carry
+            // depth / matte / Live Photo, and leaving those flags on across the swap
+            // makes AVFoundation either silently reject the swap or downgrade the next
+            // capture to a 144×192 preview proxy (the canonical "toggle does nothing /
+            // export comes back tiny" symptom — see workspace lessons.md AVFoundation
+            // section "48MP capture on iPhone 14 Pro+ / 15 Pro+").
+            applyAuxiliaryPhotoOutputFlags(highRes: highRes)
+
+            if best !== device.activeFormat {
+                do {
+                    try device.lockForConfiguration()
+                    defer { device.unlockForConfiguration() }
+                    device.activeFormat = best
+                } catch {
+                    PRMLogger.session.warning(
+                        "Failed to apply \(name, privacy: .public) format: \(error.localizedDescription, privacy: .public)"
+                    )
+                    return
+                }
+            }
+
+            // Must run inside the session config so the photo output validates the
+            // new ceiling against the just-installed `activeFormat`. See the
+            // `applyPhotoFormat` doc-comment for why this is required.
+            refreshOutputMaxPhotoDimensions()
+
+            // Diagnostic: surface the selected format's actual photo-dimension
+            // capability so "Max Dimensions doesn't work" tickets have a single
+            // log line to grep for. AVFoundation will silently reject the format
+            // swap or downgrade captures if the selected format mismatches the
+            // photo output's auxiliary flags — logging the picked dims here means
+            // the failure mode is observable in Console.app without breakpoints.
+            let pickedDims = best.supportedMaxPhotoDimensions
+                .filter { $0.width >= $0.height }
+                .max(by: { Int64($0.width) * Int64($0.height) < Int64($1.width) * Int64($1.height) })
+            if let pickedDims {
+                PRMLogger.session.notice(
+                    "applyPhotoFormat(\(name, privacy: .public)) picked format with maxPhotoDimensions \(pickedDims.width, privacy: .public)×\(pickedDims.height, privacy: .public)"
                 )
             }
-            refreshOutputMaxPhotoDimensions()
+        }
+
+        /// Aligns the photo output's Live Photo / depth / portrait-matte / ZSL /
+        /// deferred-delivery flags with the active format's capability. Called from
+        /// inside `applyPhotoFormat` while the session is in a begin/commit window.
+        ///
+        /// - `highRes: true` — pin every auxiliary stream OFF. The 48MP photo format
+        ///   doesn't carry depth, matte, or the Live Photo movie pipeline, and ZSL /
+        ///   deferred proxy delivery both substitute 12MP captures. The original
+        ///   `PRMCameraConfiguration` is preserved so the inverse path can restore
+        ///   the user's intent.
+        /// - `highRes: false` — re-apply each flag from the original
+        ///   `PRMCameraConfiguration` (subject to the output's `is*Supported` gate).
+        ///   We deliberately leave `isLivePhotoCaptureEnabled` alone here — runtime
+        ///   Live Photo state is owned by `setLivePhotoCaptureEnabled(_:)` /
+        ///   `applyModeChange` in the consuming app, not by configure-time defaults.
+        private func applyAuxiliaryPhotoOutputFlags(highRes: Bool) {
+            guard let output = photoOutput else { return }
+
+            if highRes {
+                if output.isLivePhotoCaptureEnabled {
+                    output.isLivePhotoCaptureEnabled = false
+                }
+                if output.isDepthDataDeliverySupported, output.isDepthDataDeliveryEnabled {
+                    output.isDepthDataDeliveryEnabled = false
+                }
+                if output.isPortraitEffectsMatteDeliverySupported, output.isPortraitEffectsMatteDeliveryEnabled {
+                    output.isPortraitEffectsMatteDeliveryEnabled = false
+                }
+                if output.isAutoDeferredPhotoDeliverySupported, output.isAutoDeferredPhotoDeliveryEnabled {
+                    output.isAutoDeferredPhotoDeliveryEnabled = false
+                }
+                if output.isZeroShutterLagSupported, output.isZeroShutterLagEnabled {
+                    output.isZeroShutterLagEnabled = false
+                }
+            } else {
+                guard let configuration else { return }
+                if output.isDepthDataDeliverySupported {
+                    let want = configuration.enableDepthDataDelivery
+                    if output.isDepthDataDeliveryEnabled != want {
+                        output.isDepthDataDeliveryEnabled = want
+                    }
+                }
+                if output.isPortraitEffectsMatteDeliverySupported {
+                    let want = configuration.enablePortraitEffectsMatteDelivery
+                    if output.isPortraitEffectsMatteDeliveryEnabled != want {
+                        output.isPortraitEffectsMatteDeliveryEnabled = want
+                    }
+                }
+                if output.isAutoDeferredPhotoDeliverySupported {
+                    let want = configuration.enableAutoDeferredPhotoDelivery
+                    if output.isAutoDeferredPhotoDeliveryEnabled != want {
+                        output.isAutoDeferredPhotoDeliveryEnabled = want
+                    }
+                }
+                if output.isZeroShutterLagSupported {
+                    let want = configuration.enableZeroShutterLag
+                    if output.isZeroShutterLagEnabled != want {
+                        output.isZeroShutterLagEnabled = want
+                    }
+                }
+                // Don't touch isLivePhotoCaptureEnabled — owned by setLivePhotoCaptureEnabled
+                // / consuming app's mode picker, not configure-time defaults.
+            }
         }
     #endif
 

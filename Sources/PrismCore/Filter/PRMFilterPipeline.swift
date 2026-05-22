@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreMedia
+import QuartzCore
 
 /// Routes video frames from `AVCaptureVideoDataOutput` through an active ``PRMFilterRenderer``.
 ///
@@ -92,6 +93,16 @@ public final class PRMFilterPipeline: NSObject, @unchecked Sendable {
 
     private var streamContinuations: [UUID: AsyncStream<PRMVideoFrame>.Continuation] = [:]
 
+    // Dropped-frame rollup state. AVFoundation calls `captureOutput(_:didDrop:from:)`
+    // for every dropped frame — at 30-60 fps under interruption (incoming call,
+    // control-center pull, multi-app camera arbitration, slow consumer) this floods
+    // the log with hundreds of identical "Dropped video frame" lines, drowning
+    // signal. Counting here and flushing the count every `dropLogInterval` seconds
+    // turns a torrent into a single rolled-up line ("Dropped N frames in last X.Xs").
+    private var droppedFrameCount: UInt64 = 0
+    private var lastDropLogTime: CFTimeInterval = 0
+    private let dropLogInterval: CFTimeInterval = 2.0
+
     deinit {
         // Don't leave consumers hanging on `for await frame in pipeline.frameStream()` if the
         // pipeline is deallocated mid-iteration.
@@ -105,6 +116,17 @@ public final class PRMFilterPipeline: NSObject, @unchecked Sendable {
     }
 
     /// Async stream of processed frames.
+    ///
+    /// **Drops frames under backpressure.** Buffering policy is `.bufferingNewest(1)`:
+    /// when the consumer is slower than the camera (30–60 fps), older queued frames are
+    /// silently discarded so only the newest pending frame survives. This is the right
+    /// trade-off for *preview* consumers (showing yesterday's frame is worse than
+    /// skipping it), but it is **wrong** for consumers that must see every frame —
+    /// recording, ML inference batching, motion-vector estimation. Those should consume
+    /// via the synchronous ``onFrame`` callback instead, where the consumer runs on the
+    /// data-output queue and naturally backpressures by holding the queue. Dropped
+    /// frames are also logged via the dedicated `didDrop` delegate path (visible at
+    /// `.debug` level under `com.luminoid.Prism.Filter`).
     public func frameStream() -> AsyncStream<PRMVideoFrame> {
         AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
             let id = UUID()
@@ -143,15 +165,44 @@ extension PRMFilterPipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
         guard let videoBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
               let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) else { return }
 
+        // Detect mid-session format changes (e.g. `device.activeFormat` swap when
+        // toggling Max Dimensions — 12MP → 48MP changes the connection dimensions
+        // even though `videoDataOutput.videoSettings` keeps the pixel format
+        // stable). Without this, the prepared renderer's `outputPixelBufferPool`
+        // stays sized to the OLD format, and new frames either fail to render or
+        // produce visually wrong output: classic symptoms are "two preview frames
+        // stacked vertically" (the renderer overflowing into a wrong-sized pool
+        // and the GPU sampling beyond the texture bounds) and "weird colors" (the
+        // BGRA pool sized for HxW now receives W'xH' bytes and the sampler reads
+        // misaligned pixels). Comparing format dimensions catches the swap; we
+        // also compare the previous format description to catch color-space /
+        // FOV changes that don't change pixel dimensions.
+        let previousFormatDescription: CMFormatDescription?
         stateLock.lock()
+        previousFormatDescription = _currentFormatDescription
         _currentFormatDescription = formatDescription
         stateLock.unlock()
+
+        let formatChanged: Bool = {
+            guard let previousFormatDescription else { return false }
+            let newDims = CMVideoFormatDescriptionGetDimensions(formatDescription)
+            let oldDims = CMVideoFormatDescriptionGetDimensions(previousFormatDescription)
+            return newDims.width != oldDims.width || newDims.height != oldDims.height
+        }()
 
         let timestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
         var processedBuffer = videoBuffer
         if let renderer {
-            if !renderer.isPrepared {
+            if !renderer.isPrepared || formatChanged {
+                if formatChanged {
+                    // Tear down the old pool before re-preparing — keeping it would
+                    // leak the prior format's buffers across the swap.
+                    renderer.reset()
+                    PRMLogger.filter.notice(
+                        "Reconfiguring renderer for new format (dimensions changed across session)"
+                    )
+                }
                 renderer.prepare(with: formatDescription, outputRetainedBufferCountHint: 3)
             }
             if let filtered = renderer.render(pixelBuffer: videoBuffer) {
@@ -175,6 +226,36 @@ extension PRMFilterPipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
         didDrop sampleBuffer: CMSampleBuffer,
         from connection: AVCaptureConnection
     ) {
-        PRMLogger.filter.debug("Dropped video frame")
+        stateLock.lock()
+        droppedFrameCount &+= 1
+        let now = CACurrentMediaTime()
+        if lastDropLogTime == 0 {
+            lastDropLogTime = now
+        }
+        let elapsed = now - lastDropLogTime
+        let shouldFlush = elapsed >= dropLogInterval
+        let countToFlush: UInt64
+        let intervalToFlush: CFTimeInterval
+        if shouldFlush {
+            countToFlush = droppedFrameCount
+            intervalToFlush = elapsed
+            droppedFrameCount = 0
+            lastDropLogTime = now
+        } else {
+            countToFlush = 0
+            intervalToFlush = 0
+        }
+        stateLock.unlock()
+
+        if shouldFlush, countToFlush > 0 {
+            // Promoted from `.debug` to `.notice` so consumers can see catastrophic
+            // drop rates (interruption, slow ML pipeline starving the queue) without
+            // turning on debug logging. Rolled up to one line per `dropLogInterval`s
+            // — the previous per-frame `.debug` line flooded the log at 30-60 lines/s
+            // under interruption with no useful aggregate signal.
+            PRMLogger.filter.notice(
+                "Dropped \(countToFlush, privacy: .public) video frame(s) in last \(intervalToFlush, format: .fixed(precision: 2), privacy: .public)s"
+            )
+        }
     }
 }

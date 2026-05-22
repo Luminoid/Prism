@@ -72,28 +72,27 @@ public extension AVCaptureDevice {
             targetDepthFormat = depthFormat
         }
 
-        try lockForConfiguration()
-        defer { unlockForConfiguration() }
+        try withConfigurationLock {
+            // Geometric distortion correction is enabled by default on multi-camera
+            // virtual devices (builtInTripleCamera / builtInDualCamera). When GDC is on,
+            // AVFoundation suppresses depth + camera calibration data delivery because
+            // the corrected frames no longer match the depth maps' coordinate space.
+            // The symptom matches the iPhone Pro reports exactly: depth ancillaries
+            // arrive but `depthDataMap` is internally null, with no error surfaced.
+            // Disable GDC before applying the depth format. See Apple Developer Forum
+            // thread 131829 (Dual delivery with empty calibration data).
+            #if !os(macOS)
+                if isGeometricDistortionCorrectionSupported, isGeometricDistortionCorrectionEnabled {
+                    isGeometricDistortionCorrectionEnabled = false
+                }
+            #endif
 
-        // Geometric distortion correction is enabled by default on multi-camera
-        // virtual devices (builtInTripleCamera / builtInDualCamera). When GDC is on,
-        // AVFoundation suppresses depth + camera calibration data delivery because
-        // the corrected frames no longer match the depth maps' coordinate space.
-        // The symptom matches the iPhone Pro reports exactly: depth ancillaries
-        // arrive but `depthDataMap` is internally null, with no error surfaced.
-        // Disable GDC before applying the depth format. See Apple Developer Forum
-        // thread 131829 (Dual delivery with empty calibration data).
-        #if !os(macOS)
-            if isGeometricDistortionCorrectionSupported, isGeometricDistortionCorrectionEnabled {
-                isGeometricDistortionCorrectionEnabled = false
+            if activeFormat !== targetFormat {
+                activeFormat = targetFormat
             }
-        #endif
-
-        if activeFormat !== targetFormat {
-            activeFormat = targetFormat
-        }
-        if activeDepthDataFormat !== targetDepthFormat {
-            activeDepthDataFormat = targetDepthFormat
+            if activeDepthDataFormat !== targetDepthFormat {
+                activeDepthDataFormat = targetDepthFormat
+            }
         }
         return true
     }

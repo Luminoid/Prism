@@ -30,8 +30,17 @@
         public var gapWidth: CGFloat = 4 { didSet { setNeedsLayout() } }
         public var photoFillColor: UIColor = .white { didSet { applyMode(animated: false) } }
         public var recordingFillColor: UIColor = .systemRed { didSet { applyMode(animated: false) } }
+
+        /// Intrinsic width + height of the shutter button. Default `76` matches the
+        /// iOS Camera app shutter. **Must stay ≥ 44pt** per Apple HIG hit-target rules:
+        /// VoiceOver users and any user with motor accessibility needs the full 44pt
+        /// touch target to reliably activate the control. Sizes smaller than 44pt are
+        /// rejected at runtime (debug-only assertion); host apps that want a visually
+        /// smaller button should keep `buttonSize` at 44+ and shrink only the inner
+        /// circle/ring via the color/width knobs above.
         public var buttonSize: CGFloat = 76 {
             didSet {
+                assert(buttonSize >= 44, "PRMShutterButton.buttonSize (\(buttonSize)) is below the 44pt HIG hit-target minimum.")
                 invalidateIntrinsicContentSize()
                 setNeedsLayout()
             }

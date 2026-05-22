@@ -43,14 +43,20 @@ public extension AVCaptureDevice {
     /// Sets the white balance mode if supported.
     func prm_setWhiteBalanceMode(_ mode: AVCaptureDevice.WhiteBalanceMode) throws {
         guard isWhiteBalanceModeSupported(mode) else { return }
-        try lockForConfiguration()
-        defer { unlockForConfiguration() }
-        whiteBalanceMode = mode
+        try withConfigurationLock {
+            whiteBalanceMode = mode
+        }
     }
 
     // MARK: - Lock to Temperature / Tint
 
     /// Locks white balance at the given temperature and tint.
+    ///
+    /// Throws ``PRMSessionError/virtualDeviceManualControlUnsupported(_:)`` when the
+    /// active device is a virtual multi-camera — its constituent cameras' auto-AWB
+    /// systems silently re-assert themselves, so the lock has no visible effect on the
+    /// preview or saved photo. Switch to `.builtInWideAngleCamera` first via
+    /// ``PRMCamera/switchDevice(type:position:)``.
     func prm_lockWhiteBalance(
         _ values: PRMTemperatureAndTint,
         completion: (@Sendable (CMTime) -> Void)? = nil
@@ -58,6 +64,9 @@ public extension AVCaptureDevice {
         guard isWhiteBalanceModeSupported(.locked),
               isLockingWhiteBalanceWithCustomDeviceGainsSupported
         else { return }
+        if prm_isVirtualMultiCameraDevice {
+            throw PRMSessionError.virtualDeviceManualControlUnsupported(deviceType)
+        }
 
         let avTemp = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(
             temperature: values.temperature,
@@ -66,9 +75,25 @@ public extension AVCaptureDevice {
         let gains = deviceWhiteBalanceGains(for: avTemp)
         let clampedGains = Self.clampGains(gains, for: self)
 
-        try lockForConfiguration()
-        defer { unlockForConfiguration() }
-        setWhiteBalanceModeLocked(with: clampedGains) { time in completion?(time) }
+        try withConfigurationLock {
+            setWhiteBalanceModeLocked(with: clampedGains) { time in completion?(time) }
+        }
+    }
+
+    /// Async-completion variant of ``prm_lockWhiteBalance(_:completion:)``. Awaits the
+    /// AVFoundation commit handler so the caller knows the WB lock has actually landed
+    /// on the device before returning. Useful right before a still capture where the
+    /// EXIF must reflect the user's locked Kelvin.
+    func prm_lockWhiteBalance(_ values: PRMTemperatureAndTint) async throws -> CMTime {
+        try await withCheckedThrowingContinuation { continuation in
+            do {
+                try prm_lockWhiteBalance(values) { time in
+                    continuation.resume(returning: time)
+                }
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
     }
 
     /// Locks white balance to a named preset (neutral tint).

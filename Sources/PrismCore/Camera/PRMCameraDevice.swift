@@ -189,6 +189,27 @@ public struct PRMCameraDevice: Sendable, Equatable {
     }
 
     public static func anyDeviceSupportsSlowMotion(at position: AVCaptureDevice.Position) -> Bool {
+        SlowMotionCache.supports(at: position)
+    }
+}
+
+/// Per-position cache for the slow-motion discovery result. The device list itself
+/// is hardware — it doesn't change at runtime — so the answer is constant per
+/// `(deviceTypes, mediaType, position)` triple. Repeatedly building a
+/// `DiscoverySession` (e.g. from a settings-drawer telemetry tick that fires every
+/// 500 ms) wastes allocations and CPU; cache once per position.
+private enum SlowMotionCache {
+    private static let lock = NSLock()
+    private nonisolated(unsafe) static var values: [AVCaptureDevice.Position: Bool] = [:]
+
+    static func supports(at position: AVCaptureDevice.Position) -> Bool {
+        lock.lock()
+        if let cached = values[position] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+
         let types: [AVCaptureDevice.DeviceType] = [
             .builtInWideAngleCamera,
             .builtInUltraWideCamera,
@@ -202,10 +223,15 @@ public struct PRMCameraDevice: Sendable, Equatable {
             mediaType: .video,
             position: position
         )
-        return discovery.devices.contains { device in
+        let result = discovery.devices.contains { device in
             device.formats.contains { format in
                 format.videoSupportedFrameRateRanges.contains { $0.maxFrameRate >= 120 }
             }
         }
+
+        lock.lock()
+        values[position] = result
+        lock.unlock()
+        return result
     }
 }

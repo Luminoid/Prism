@@ -13,21 +13,28 @@
             case ratio4x3
             case ratio16x9
             case ratio1x1
-            case full
+            /// No aspect-ratio constraint — the mask is hidden, the captured frame uses
+            /// its full sensor extent. ``value`` is `nil` (there is no meaningful ratio
+            /// to compute against) so any layout/crop math must gate on this case before
+            /// reading the value.
+            case unconstrained
 
-            public var value: CGFloat {
+            /// Width:height ratio, or `nil` for ``unconstrained``. Callers that compute
+            /// crop rects must guard on the nil case rather than substituting a default,
+            /// otherwise an "unconstrained" pass becomes an unintended 1:1 crop.
+            public var value: CGFloat? {
                 switch self {
                 case .ratio4x3: 4.0 / 3.0
                 case .ratio16x9: 16.0 / 9.0
                 case .ratio1x1: 1.0
-                case .full: 1.0
+                case .unconstrained: nil
                 }
             }
         }
 
         // MARK: - Configuration
 
-        public var aspectRatio: AspectRatio = .full {
+        public var aspectRatio: AspectRatio = .unconstrained {
             didSet { setNeedsLayout() }
         }
 
@@ -89,7 +96,7 @@
             rightMask.frame = CGRect(x: crop.maxX, y: crop.minY, width: bounds.width - crop.maxX, height: crop.height)
             borderLayer.path = UIBezierPath(rect: crop).cgPath
 
-            let showMask = aspectRatio != .full
+            let showMask = aspectRatio != .unconstrained
             [topMask, bottomMask, leftMask, rightMask].forEach { $0.isHidden = !showMask }
             borderLayer.isHidden = !showMask
         }
@@ -97,9 +104,9 @@
         // MARK: - Public
 
         /// Returns the crop rectangle for the current aspect ratio within `bounds`.
+        /// Returns `bounds` unchanged when the active ratio is ``AspectRatio/unconstrained``.
         public func cropRect(in bounds: CGRect) -> CGRect {
-            guard aspectRatio != .full else { return bounds }
-            let target = aspectRatio.value
+            guard let target = aspectRatio.value else { return bounds }
             let boundsRatio = bounds.width / bounds.height
             let cropWidth: CGFloat
             let cropHeight: CGFloat

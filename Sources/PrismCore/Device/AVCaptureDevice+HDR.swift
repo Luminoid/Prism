@@ -7,13 +7,13 @@ public extension AVCaptureDevice {
     ///   `false`, locks HDR on or off.
     func prm_setVideoHDR(_ enabled: Bool?) throws {
         guard activeFormat.isVideoHDRSupported else { return }
-        try lockForConfiguration()
-        defer { unlockForConfiguration() }
-        if let enabled {
-            automaticallyAdjustsVideoHDREnabled = false
-            isVideoHDREnabled = enabled
-        } else {
-            automaticallyAdjustsVideoHDREnabled = true
+        try withConfigurationLock {
+            if let enabled {
+                automaticallyAdjustsVideoHDREnabled = false
+                isVideoHDREnabled = enabled
+            } else {
+                automaticallyAdjustsVideoHDREnabled = true
+            }
         }
     }
 
@@ -21,9 +21,9 @@ public extension AVCaptureDevice {
     /// Mutually exclusive with custom exposure modes.
     func prm_setLowLightBoost(_ enabled: Bool) throws {
         guard isLowLightBoostSupported else { return }
-        try lockForConfiguration()
-        defer { unlockForConfiguration() }
-        automaticallyEnablesLowLightBoostWhenAvailable = enabled
+        try withConfigurationLock {
+            automaticallyEnablesLowLightBoostWhenAvailable = enabled
+        }
     }
 
     /// Whether low-light boost is currently active on the device.

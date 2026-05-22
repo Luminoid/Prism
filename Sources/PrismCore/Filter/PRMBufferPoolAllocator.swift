@@ -69,7 +69,16 @@ public enum PRMBufferPoolAllocator: Sendable {
         var colorSpace = CGColorSpaceCreateDeviceRGB()
 
         guard let extensions = CMFormatDescriptionGetExtensions(formatDescription) as Dictionary?
-        else { return colorSpace }
+        else {
+            // No extensions at all — most camera formats DO carry color primaries,
+            // so this is unusual. Log so a missing color-space mismatch on a P3 / Rec.2020
+            // capture (color shifts on encode) doesn't surface only as a "looks wrong"
+            // user report.
+            PRMLogger.filter.notice(
+                "CMFormatDescription has no extensions — falling back to deviceRGB color space"
+            )
+            return colorSpace
+        }
 
         let colorPrimaries = extensions[kCVImageBufferColorPrimariesKey]
         if let colorPrimaries {
@@ -102,6 +111,17 @@ public enum PRMBufferPoolAllocator: Sendable {
         } else if (colorPrimaries as? String) == (kCVImageBufferColorPrimaries_P3_D65 as String),
                   let displayP3 = CGColorSpace(name: CGColorSpace.displayP3) {
             colorSpace = displayP3
+        } else if colorPrimaries != nil {
+            // Format description carried color primaries but neither a CGColorSpace
+            // payload nor a recognized primaries match. We propagated the primaries +
+            // YCbCr matrix + transfer function via `kCVBufferPropagatedAttachmentsKey`
+            // so CoreVideo can still render the buffer, but the CIContext encode path
+            // will use deviceRGB — which on a Rec.2020 / extended-range capture causes
+            // visible color shifts. Surface this at .notice so unexpected color drift
+            // has a single log line to grep for.
+            PRMLogger.filter.notice(
+                "Camera format has color primaries but no CGColorSpace payload; falling back to deviceRGB (may shift colors on encode)"
+            )
         }
 
         return colorSpace

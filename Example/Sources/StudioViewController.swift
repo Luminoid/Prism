@@ -83,7 +83,7 @@ final class StudioViewController: UIViewController {
     }
 
     private var aspectIndex = 0
-    private let aspectCycle: [PRMAspectRatioMaskView.AspectRatio] = [.full, .ratio4x3, .ratio16x9, .ratio1x1]
+    private let aspectCycle: [PRMAspectRatioMaskView.AspectRatio] = [.unconstrained, .ratio4x3, .ratio16x9, .ratio1x1]
 
     private var gridIndex = 0
     private let gridCycle: [PRMGridView.GridType?] = [nil, .ruleOfThirds]
@@ -1492,19 +1492,19 @@ final class StudioViewController: UIViewController {
 
     /// Crops JPEG/HEIC photo data to the currently-selected aspect ratio mask, in the
     /// orientation the user sees in the preview. Returns the original bytes when the
-    /// active ratio is `.full` (no crop needed) or when decode fails. EXIF/TIFF metadata
-    /// is preserved aside from the orientation tag (forced to `1` because the output
-    /// pixels are upright after applying the source orientation).
+    /// active ratio is `.unconstrained` (no crop needed) or when decode fails. EXIF/TIFF
+    /// metadata is preserved aside from the orientation tag (forced to `1` because the
+    /// output pixels are upright after applying the source orientation).
     ///
     /// `CIImage(data:)` ignores EXIF orientation by default, so the prior implementation
     /// cropped against the *sensor*-orientation extent (landscape 4032×3024 on iPhone)
     /// then copied the original orientation tag back. For aspect ratios that match the
     /// sensor (`.ratio4x3` on a 4:3 sensor) the crop was a no-op — the user sees the
-    /// preview cropped to 4:3 in portrait but the saved photo looks identical to `.full`.
-    /// Applying orientation first means we crop in the same coordinate space the user is
-    /// looking at, so every aspect ratio actually trims pixels.
+    /// preview cropped to 4:3 in portrait but the saved photo looks identical to
+    /// `.unconstrained`. Applying orientation first means we crop in the same coordinate
+    /// space the user is looking at, so every aspect ratio actually trims pixels.
     private func croppedToActiveAspect(data: Data) -> Data {
-        guard aspectMask.aspectRatio != .full else { return data }
+        guard aspectMask.aspectRatio != .unconstrained else { return data }
         // `applyOrientationProperty: true` makes `CIImage(data:)` honor the EXIF
         // orientation tag — the resulting `extent` is in display (upright) coordinates,
         // matching what the user composed in the preview.
@@ -1717,7 +1717,7 @@ final class StudioViewController: UIViewController {
     private func cycleAspect() {
         aspectIndex = (aspectIndex + 1) % aspectCycle.count
         aspectMask.aspectRatio = aspectCycle[aspectIndex]
-        let active = aspectMask.aspectRatio != .full
+        let active = aspectMask.aspectRatio != .unconstrained
         aspectButton.setActive(active)
     }
 
@@ -2127,8 +2127,22 @@ extension StudioViewController {
             // Switch the device's `activeFormat` per toggle state. On (48MP-capable
             // format) is incompatible with Live Photo / burst / depth — see
             // `syncModePickerAvailability` for the mode-picker gating that follows.
+            //
+            // Critical: 48MP capture is **only exposed on the physical wide camera**.
+            // Virtual devices (`.builtInTripleCamera` etc.) cap at the device's
+            // largest virtual-fusion-compatible format — on iPhone 15 Pro Max that's
+            // 24MP (5712×4284), NOT the 48MP entry that's available on the wide
+            // constituent. Without an explicit swap, toggling Max Dimensions on
+            // 15 Pro Max picks 24MP and the user sees no benefit. Force a hop to
+            // wide first; on toggle-off, restore the virtual device.
             Task {
+                if toggle.isOn {
+                    await self.ensureWideCameraForManual()
+                }
                 await self.camera.setHighResolutionPhotoFormat(toggle.isOn)
+                if !toggle.isOn {
+                    await self.restoreVirtualCameraIfFullyAuto()
+                }
                 await MainActor.run { self.syncModePickerAvailability() }
             }
         }, for: .valueChanged)
@@ -2161,9 +2175,39 @@ extension StudioViewController {
         }
     }
 
+    /// Whether high-resolution (> 12MP) photo capture is reachable from the user's
+    /// position. The toggle hops to `.builtInWideAngleCamera` when needed (see the
+    /// Max Dimensions row action), so this returns `true` whenever EITHER the
+    /// active device OR the wide camera at the current position can deliver > 12MP.
+    /// Without the "or wide camera" branch the toggle was disabled on iPhone 15 Pro
+    /// Max in virtual-triple mode even though hopping to wide would have unlocked
+    /// the 48MP format.
     private func currentDeviceSupportsHighResPhoto() -> Bool {
-        guard let dims = camera.device?.maxSupportedPhotoDimensions else { return false }
-        return Int64(dims.width) * Int64(dims.height) > Int64(4032) * Int64(3024)
+        let twelveMP = Int64(4032) * Int64(3024)
+        if let dims = camera.device?.maxSupportedPhotoDimensions,
+           Int64(dims.width) * Int64(dims.height) > twelveMP {
+            return true
+        }
+        // Active device caps at 12MP (e.g. virtual triple on iPhone 15 Pro Max
+        // exposes 24MP via constituent fusion, but the 48MP entry is only on the
+        // physical wide). Check whether the wide camera at the current position
+        // could deliver >12MP after a device hop.
+        let position = camera.device?.position ?? .back
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: [.builtInWideAngleCamera],
+            mediaType: .video,
+            position: position
+        )
+        for device in discovery.devices {
+            for format in device.formats {
+                for dim in format.supportedMaxPhotoDimensions where dim.width >= dim.height {
+                    if Int64(dim.width) * Int64(dim.height) > twelveMP {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
     }
 
     /// Greys out variant pills that are incompatible with the current configuration.

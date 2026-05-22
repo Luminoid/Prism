@@ -9,12 +9,12 @@ public extension AVCaptureDevice {
     /// face-AE and subject-area-change recovery come back for a normal Camera-app feel.
     func prm_setExposureMode(_ mode: AVCaptureDevice.ExposureMode) throws {
         guard isExposureModeSupported(mode) else { return }
-        try lockForConfiguration()
-        defer { unlockForConfiguration() }
-        if mode != .custom {
-            prm_restoreExposureAutoTracking()
+        try withConfigurationLock {
+            if mode != .custom {
+                prm_restoreExposureAutoTracking()
+            }
+            exposureMode = mode
         }
-        exposureMode = mode
     }
 
     // MARK: - Exposure Bias (EV)
@@ -24,9 +24,9 @@ public extension AVCaptureDevice {
     /// - Parameter completion: Fires when the adjustment completes, with the actual timestamp.
     func prm_setExposureBias(_ bias: Float, completion: (@Sendable (CMTime) -> Void)? = nil) throws {
         let clamped = min(max(bias, minExposureTargetBias), maxExposureTargetBias)
-        try lockForConfiguration()
-        defer { unlockForConfiguration() }
-        setExposureTargetBias(clamped) { time in completion?(time) }
+        try withConfigurationLock {
+            setExposureTargetBias(clamped) { time in completion?(time) }
+        }
     }
 
     // MARK: - Custom Exposure (Manual)
@@ -64,16 +64,50 @@ public extension AVCaptureDevice {
         completion: (@Sendable (CMTime) -> Void)? = nil
     ) throws {
         guard isExposureModeSupported(.custom) else { return }
+        // Virtual multi-camera devices (`.builtInTripleCamera`, `.builtInDualCamera`,
+        // `.builtInDualWideCamera`) silently reject manual exposure: the constituent
+        // physical cameras' auto-AE systems keep re-asserting themselves, so the saved
+        // photo's EXIF shows continuous-auto values even though `setExposureModeCustom`
+        // returned success. Per Apple's white-balance docs: "exposure duration, ISO,
+        // aperture, white balance gains, or lens position may change when the device
+        // switches from one camera to the other." Fail fast with a clear error rather
+        // than silently doing nothing — caller should switch to `.builtInWideAngleCamera`
+        // via `PRMCamera.switchDevice(type:position:)` first.
+        if prm_isVirtualMultiCameraDevice {
+            throw PRMSessionError.virtualDeviceManualControlUnsupported(deviceType)
+        }
         let clampedISO: Float = (iso == AVCaptureDevice.currentISO)
             ? AVCaptureDevice.currentISO
             : min(max(iso, activeFormat.minISO), activeFormat.maxISO)
         let clampedDuration: CMTime = (duration.isValid && duration != AVCaptureDevice.currentExposureDuration)
             ? Self.clampDuration(duration, for: self)
             : duration
-        try lockForConfiguration()
-        defer { unlockForConfiguration() }
-        prm_disableExposureAutoTracking()
-        setExposureModeCustom(duration: clampedDuration, iso: clampedISO) { time in completion?(time) }
+        try withConfigurationLock {
+            prm_disableExposureAutoTracking()
+            setExposureModeCustom(duration: clampedDuration, iso: clampedISO) { time in completion?(time) }
+        }
+    }
+
+    /// Async-completion variant of ``prm_setCustomExposure(duration:iso:completion:)``.
+    /// Awaits the AVFoundation commit handler — which can lag up to ~3 s on long shutter
+    /// durations (Apple dev-forum 751112) — so the caller knows the manual values have
+    /// actually landed on the device before returning. Returns the commit timestamp.
+    ///
+    /// **Don't await inside a slider drag** — continuous setters fire 30+ calls/sec and
+    /// each commit serializes the actor. Prefer the fire-and-forget overload for live
+    /// adjustment; use this when you need the committed state to be authoritative before
+    /// the next step (e.g. before capturing a still where the EXIF must reflect the user's
+    /// manual values exactly).
+    func prm_setCustomExposure(duration: CMTime, iso: Float) async throws -> CMTime {
+        try await withCheckedThrowingContinuation { continuation in
+            do {
+                try prm_setCustomExposure(duration: duration, iso: iso) { time in
+                    continuation.resume(returning: time)
+                }
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
     }
 
     /// Turn off every parallel-AE system that would otherwise overwrite manual values
@@ -124,20 +158,19 @@ public extension AVCaptureDevice {
         at devicePoint: CGPoint,
         monitorSubjectAreaChange: Bool = false
     ) throws {
-        try lockForConfiguration()
-        defer { unlockForConfiguration() }
-
-        if isFocusPointOfInterestSupported, isFocusModeSupported(focusMode) {
-            focusPointOfInterest = devicePoint
-            self.focusMode = focusMode
+        try withConfigurationLock {
+            if isFocusPointOfInterestSupported, isFocusModeSupported(focusMode) {
+                focusPointOfInterest = devicePoint
+                self.focusMode = focusMode
+            }
+            if isExposurePointOfInterestSupported, isExposureModeSupported(exposureMode) {
+                exposurePointOfInterest = devicePoint
+                self.exposureMode = exposureMode
+            }
+            #if !os(macOS)
+                isSubjectAreaChangeMonitoringEnabled = monitorSubjectAreaChange
+            #endif
         }
-        if isExposurePointOfInterestSupported, isExposureModeSupported(exposureMode) {
-            exposurePointOfInterest = devicePoint
-            self.exposureMode = exposureMode
-        }
-        #if !os(macOS)
-            isSubjectAreaChangeMonitoringEnabled = monitorSubjectAreaChange
-        #endif
     }
 
     // MARK: - Private

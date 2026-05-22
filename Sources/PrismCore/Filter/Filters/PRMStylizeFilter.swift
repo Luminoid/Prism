@@ -10,11 +10,11 @@ public struct PRMPixellateFilter: PRMFilter {
     }
 
     public func render(_ image: CIImage) -> CIImage {
-        let center = CIVector(x: image.extent.midX, y: image.extent.midY)
-        return image.applyingFilter("CIPixellate", parameters: [
+        let output = image.applyingFilter("CIPixellate", parameters: [
             kCIInputScaleKey: scale,
-            kCIInputCenterKey: center,
+            kCIInputCenterKey: Self.ciCenter(of: image),
         ])
+        return Self.cropped(output, to: image)
     }
 }
 
@@ -24,7 +24,8 @@ public struct PRMComicFilter: PRMFilter {
     public init() {}
 
     public func render(_ image: CIImage) -> CIImage {
-        image.applyingFilter("CIComicEffect")
+        let output = image.applyingFilter("CIComicEffect")
+        return Self.cropped(output, to: image)
     }
 }
 
@@ -38,11 +39,11 @@ public struct PRMPointillizeFilter: PRMFilter {
     }
 
     public func render(_ image: CIImage) -> CIImage {
-        let center = CIVector(x: image.extent.midX, y: image.extent.midY)
-        return image.applyingFilter("CIPointillize", parameters: [
+        let output = image.applyingFilter("CIPointillize", parameters: [
             kCIInputRadiusKey: radius,
-            kCIInputCenterKey: center,
+            kCIInputCenterKey: Self.ciCenter(of: image),
         ])
+        return Self.cropped(output, to: image)
     }
 }
 
@@ -56,6 +57,7 @@ public struct PRMEdgesFilter: PRMFilter {
     }
 
     public func render(_ image: CIImage) -> CIImage {
-        image.applyingFilter("CIEdges", parameters: [kCIInputIntensityKey: intensity])
+        let output = image.applyingFilter("CIEdges", parameters: [kCIInputIntensityKey: intensity])
+        return Self.cropped(output, to: image)
     }
 }

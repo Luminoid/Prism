@@ -66,6 +66,58 @@ public enum PRMTempFile: Sendable {
         }
     }
 
+    /// Removes files in `<tmp>/Prism/` older than `maxAge` seconds. Defaults to 24h.
+    ///
+    /// Designed as a launch-time sweep so files orphaned by crashes (Live Photo movie
+    /// sidecars whose paired-up still failed, video recordings cut by SIGKILL, capture
+    /// errors that abandoned a temp file mid-write) don't accumulate forever. The
+    /// system's tmp-eviction policy already evicts on memory pressure, but the cadence
+    /// is opaque — explicit sweeping makes the upper bound predictable.
+    ///
+    /// Best-effort: silently skips files whose modification date can't be read, and
+    /// logs (does not throw) any individual remove failure. Safe to call from any
+    /// thread; runs synchronously, so consumers that want to off-load it should wrap
+    /// in `Task.detached`.
+    ///
+    /// - Parameter maxAge: Maximum age in seconds. Files older than this are removed.
+    public static func sweepStaleFiles(olderThan maxAge: TimeInterval = 24 * 60 * 60) {
+        let fileManager = FileManager.default
+        let url = directoryURL
+        let cutoff = Date().addingTimeInterval(-maxAge)
+        let contents: [URL]
+        do {
+            contents = try fileManager.contentsOfDirectory(
+                at: url,
+                includingPropertiesForKeys: [.contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+            )
+        } catch {
+            PRMLogger.general.warning(
+                "PRMTempFile.sweepStaleFiles: cannot list \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)"
+            )
+            return
+        }
+        var removed = 0
+        for fileURL in contents {
+            let modificationDate = (try? fileURL.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate
+            guard let modificationDate, modificationDate < cutoff else { continue }
+            do {
+                try fileManager.removeItem(at: fileURL)
+                removed += 1
+            } catch {
+                PRMLogger.general.warning(
+                    "PRMTempFile.sweepStaleFiles: cannot remove \(fileURL.path, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                )
+            }
+        }
+        if removed > 0 {
+            PRMLogger.general.notice(
+                "PRMTempFile.sweepStaleFiles: removed \(removed, privacy: .public) stale file(s) older than \(Int(maxAge), privacy: .public)s"
+            )
+        }
+    }
+
     // MARK: - Private
 
     private static func ensureDirectoryExists(at url: URL) {

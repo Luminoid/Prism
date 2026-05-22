@@ -109,11 +109,8 @@ public final class PRMCamera {
 
     public init(session: PRMCameraSession? = nil) {
         self.session = session ?? PRMCameraSession.makeDefaultMainActor()
-        intendedISO = nil
-        intendedExposureDurationSeconds = nil
-        intendedWhiteBalanceTemperature = nil
-        autoExposureBaselineISO = nil
-        autoExposureBaselineDurationSeconds = nil
+        // All `intended*` and `autoExposure*` properties are optional and Swift
+        // initializes them to nil by default — no need to re-assign here.
     }
 
     deinit {
@@ -141,13 +138,7 @@ public final class PRMCamera {
         // Reconfigure clears any per-session manual-exposure / WB intents — the
         // new session starts in `.continuousAuto` for both axes, and we don't
         // want a stale intent from before configure to keep overriding the read.
-        intendedExposureMode = nil
-        intendedWhiteBalanceMode = nil
-        intendedISO = nil
-        intendedExposureDurationSeconds = nil
-        intendedWhiteBalanceTemperature = nil
-        autoExposureBaselineISO = nil
-        autoExposureBaselineDurationSeconds = nil
+        clearIntendedState()
         try await session.configure(configuration)
         await refreshDevice()
         await refreshState()
@@ -170,13 +161,7 @@ public final class PRMCamera {
     public func switchCamera(to position: AVCaptureDevice.Position) async throws {
         // The new physical device starts in `.continuousAuto` — drop intents so
         // the override doesn't keep painting the old custom state on the new lens.
-        intendedExposureMode = nil
-        intendedWhiteBalanceMode = nil
-        intendedISO = nil
-        intendedExposureDurationSeconds = nil
-        intendedWhiteBalanceTemperature = nil
-        autoExposureBaselineISO = nil
-        autoExposureBaselineDurationSeconds = nil
+        clearIntendedState()
         _ = try await session.switchCamera(to: position)
         await refreshDevice()
         await refreshState()
@@ -190,13 +175,7 @@ public final class PRMCamera {
         type: AVCaptureDevice.DeviceType,
         position: AVCaptureDevice.Position? = nil
     ) async throws {
-        intendedExposureMode = nil
-        intendedWhiteBalanceMode = nil
-        intendedISO = nil
-        intendedExposureDurationSeconds = nil
-        intendedWhiteBalanceTemperature = nil
-        autoExposureBaselineISO = nil
-        autoExposureBaselineDurationSeconds = nil
+        clearIntendedState()
         _ = try await session.switchDevice(type: type, position: position)
         await refreshDevice()
         await refreshState()
@@ -310,10 +289,16 @@ public final class PRMCamera {
         // MainActor. We DON'T await the completion inline — continuous slider
         // drags fire `setCustomExposure` 30+ times/sec, and awaiting each ~100 ms
         // commit would serialize the actor into a multi-second stall.
-        await runOnDevice { device in
-            try? device.prm_setCustomExposure(duration: duration, iso: iso) { _ in
+        let thrown = await runOnDeviceThrowing { device in
+            try device.prm_setCustomExposure(duration: duration, iso: iso) { _ in
                 NotificationCenter.default.post(name: Self.deviceCommitNotification, object: nil)
             }
+        }
+        if let sessionError = thrown as? PRMSessionError {
+            // Surface the virtual-device-rejection error (or any future PRMSessionError
+            // the device helper starts throwing) on the errorStream so consumers know
+            // their manual command was silently dropped at the device layer.
+            emitError(sessionError)
         }
         await refreshState()
     }
@@ -337,10 +322,13 @@ public final class PRMCamera {
         // `state.whiteBalanceTemperature` pinned to the user's value during
         // the commit window, so the slider doesn't snap back to the old
         // auto-driven Kelvin after the user releases.
-        await runOnDevice { device in
-            try? device.prm_lockWhiteBalance(values) { _ in
+        let thrown = await runOnDeviceThrowing { device in
+            try device.prm_lockWhiteBalance(values) { _ in
                 NotificationCenter.default.post(name: Self.deviceCommitNotification, object: nil)
             }
+        }
+        if let sessionError = thrown as? PRMSessionError {
+            emitError(sessionError)
         }
         await refreshState()
     }
@@ -604,6 +592,15 @@ public final class PRMCamera {
     /// Yields the current ``state`` immediately on subscribe, then a new value on every
     /// mutation. This is the only stream that yields an initial value — error and
     /// interruption streams only emit on actual events.
+    ///
+    /// **Subscriber cardinality is unbounded.** Each call creates a fresh stream and
+    /// stores its continuation in a per-camera dictionary keyed by UUID; the entry is
+    /// removed when the stream's iterator finishes (via `onTermination`). Typical usage
+    /// is 1–3 concurrent subscribers (HUD, drawer, telemetry strip). The dictionary
+    /// will grow if subscribers leak their iteration tasks — every `Task { for await
+    /// state in camera.stateStream() {...} }` must be stored and cancelled when the
+    /// owning view controller goes away, otherwise the continuation stays alive (and
+    /// keeps receiving values) until the camera itself deinits.
     public func stateStream() -> AsyncStream<PRMCameraState> {
         AsyncStream { continuation in
             let id = UUID()
@@ -780,10 +777,62 @@ public final class PRMCamera {
         device = snapshot
     }
 
+    /// Hops to ``PRMCameraActor`` and runs `work` against the current video device.
+    /// No-ops when the session has no video device (pre-configure, between switchCamera
+    /// failures). Callers use `try?` inside `work` for transient AVFoundation errors
+    /// (device lock contention, mode unsupported on the current device) where retrying
+    /// is unlikely to help and the operation is best-effort — typical for slider-driven
+    /// continuous setters that fire many times per second. Use ``runOnDeviceThrowing(_:)``
+    /// instead when a single failure is significant (e.g. virtual-device rejection of
+    /// manual exposure) and the camera should surface it on the error stream.
     private func runOnDevice(_ work: @escaping @Sendable (AVCaptureDevice) -> Void) async {
         await PRMCameraActor.shared.run { [session] in
             guard let device = await session.videoDevice else { return }
             work(device)
+        }
+    }
+
+    /// Throwing variant of ``runOnDevice(_:)``. Returns the thrown error (or `nil` on
+    /// success / no device) so callers can decide whether to surface it via
+    /// ``emitError(_:)`` or swallow. Kept as an `Error?` return rather than re-throwing
+    /// so the public camera-facing setters stay non-throwing — surfacing failures
+    /// through the error stream keeps the API symmetrical with AVFoundation's own
+    /// notification-based error reporting.
+    private func runOnDeviceThrowing(_ work: @escaping @Sendable (AVCaptureDevice) throws -> Void) async -> Error? {
+        await PRMCameraActor.shared.run { [session] in
+            guard let device = await session.videoDevice else { return Error?.none }
+            do {
+                try work(device)
+                return nil
+            } catch {
+                return error
+            }
+        }
+    }
+
+    /// Drops every user-driven intent override and the auto-exposure baseline.
+    /// Called whenever the underlying device/configuration changes out from under
+    /// the intent values (configure, switchCamera, switchDevice) — the new device
+    /// starts in `.continuousAuto` for both exposure and WB, and a stale intent
+    /// from before the change would keep `refreshState` painting the old custom
+    /// values onto the new device's snapshot.
+    private func clearIntendedState() {
+        intendedExposureMode = nil
+        intendedWhiteBalanceMode = nil
+        intendedISO = nil
+        intendedExposureDurationSeconds = nil
+        intendedWhiteBalanceTemperature = nil
+        autoExposureBaselineISO = nil
+        autoExposureBaselineDurationSeconds = nil
+    }
+
+    /// Yields a session error to every active subscriber on ``errorStream()``.
+    /// Used to surface non-throwing device-helper failures (e.g. the virtual-device
+    /// rejection from ``AVCaptureDevice/prm_setCustomExposure(duration:iso:completion:)``)
+    /// so consumers see a signal instead of a silently dropped command.
+    private func emitError(_ error: PRMSessionError) {
+        for continuation in errorContinuations.values {
+            continuation.yield(error)
         }
     }
 

@@ -5,9 +5,9 @@ public extension AVCaptureDevice {
     /// Sets the focus mode if supported. No-op otherwise.
     func prm_setFocusMode(_ mode: AVCaptureDevice.FocusMode) throws {
         guard isFocusModeSupported(mode) else { return }
-        try lockForConfiguration()
-        defer { unlockForConfiguration() }
-        focusMode = mode
+        try withConfigurationLock {
+            focusMode = mode
+        }
     }
 
     /// Sets the manual lens position (0.0 = near focus, 1.0 = far focus).
@@ -52,8 +52,8 @@ public extension AVCaptureDevice {
     func prm_setLensPositionAsync(_ position: Float, completion: (@Sendable (CMTime) -> Void)? = nil) throws {
         guard isFocusModeSupported(.locked), isLockingFocusWithCustomLensPositionSupported else { return }
         let clamped = min(max(position, 0.0), 1.0)
-        try lockForConfiguration()
-        defer { unlockForConfiguration() }
-        setFocusModeLocked(lensPosition: clamped) { time in completion?(time) }
+        try withConfigurationLock {
+            setFocusModeLocked(lensPosition: clamped) { time in completion?(time) }
+        }
     }
 }

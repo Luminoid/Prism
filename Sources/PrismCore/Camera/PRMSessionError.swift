@@ -30,6 +30,14 @@ public enum PRMSessionError: Error, Sendable, Equatable {
     /// Operation cancelled (e.g., async task was cancelled mid-capture).
     case cancelled
 
+    /// The active device is a virtual multi-camera (`.builtInTripleCamera`,
+    /// `.builtInDualCamera`, `.builtInDualWideCamera`) whose constituent
+    /// auto-AE / auto-AWB systems silently re-assert themselves, defeating
+    /// `setExposureModeCustom` / `setWhiteBalanceModeLocked`. Switch to
+    /// `.builtInWideAngleCamera` via `PRMCamera.switchDevice(type:position:)`
+    /// before re-issuing the manual call.
+    case virtualDeviceManualControlUnsupported(AVCaptureDevice.DeviceType)
+
     public static func == (lhs: Self, rhs: Self) -> Bool {
         switch (lhs, rhs) {
         case (.notAuthorized, .notAuthorized): true
@@ -41,6 +49,7 @@ public enum PRMSessionError: Error, Sendable, Equatable {
         case let (.runtime(a), .runtime(b)): a.code == b.code
         case let (.photoCaptureFailed(a), .photoCaptureFailed(b)): a == b
         case let (.videoRecordingFailed(a), .videoRecordingFailed(b)): a == b
+        case let (.virtualDeviceManualControlUnsupported(a), .virtualDeviceManualControlUnsupported(b)): a == b
         default: false
         }
     }
@@ -69,6 +78,8 @@ extension PRMSessionError: LocalizedError {
             "Video recording failed: \(reason)"
         case .cancelled:
             "Operation cancelled."
+        case let .virtualDeviceManualControlUnsupported(deviceType):
+            "Manual exposure / white-balance lock is unsupported on virtual multi-camera device \(deviceType.rawValue). Switch to .builtInWideAngleCamera first."
         }
     }
 }

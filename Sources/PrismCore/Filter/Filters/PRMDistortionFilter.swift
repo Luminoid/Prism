@@ -12,12 +12,12 @@ public struct PRMBumpDistortionFilter: PRMFilter {
     }
 
     public func render(_ image: CIImage) -> CIImage {
-        let center = CIVector(x: image.extent.midX, y: image.extent.midY)
-        return image.applyingFilter("CIBumpDistortion", parameters: [
-            kCIInputCenterKey: center,
+        let output = image.applyingFilter("CIBumpDistortion", parameters: [
+            kCIInputCenterKey: Self.ciCenter(of: image),
             kCIInputRadiusKey: radius,
             kCIInputScaleKey: scale,
         ])
+        return Self.cropped(output, to: image)
     }
 }
 
@@ -33,12 +33,12 @@ public struct PRMTwirlDistortionFilter: PRMFilter {
     }
 
     public func render(_ image: CIImage) -> CIImage {
-        let center = CIVector(x: image.extent.midX, y: image.extent.midY)
-        return image.applyingFilter("CITwirlDistortion", parameters: [
-            kCIInputCenterKey: center,
+        let output = image.applyingFilter("CITwirlDistortion", parameters: [
+            kCIInputCenterKey: Self.ciCenter(of: image),
             kCIInputRadiusKey: radius,
             kCIInputAngleKey: angle,
         ])
+        return Self.cropped(output, to: image)
     }
 }
 
@@ -54,12 +54,12 @@ public struct PRMPinchDistortionFilter: PRMFilter {
     }
 
     public func render(_ image: CIImage) -> CIImage {
-        let center = CIVector(x: image.extent.midX, y: image.extent.midY)
-        return image.applyingFilter("CIPinchDistortion", parameters: [
-            kCIInputCenterKey: center,
+        let output = image.applyingFilter("CIPinchDistortion", parameters: [
+            kCIInputCenterKey: Self.ciCenter(of: image),
             kCIInputRadiusKey: radius,
             kCIInputScaleKey: scale,
         ])
+        return Self.cropped(output, to: image)
     }
 }
 
@@ -75,11 +75,11 @@ public struct PRMVortexDistortionFilter: PRMFilter {
     }
 
     public func render(_ image: CIImage) -> CIImage {
-        let center = CIVector(x: image.extent.midX, y: image.extent.midY)
-        return image.applyingFilter("CIVortexDistortion", parameters: [
-            kCIInputCenterKey: center,
+        let output = image.applyingFilter("CIVortexDistortion", parameters: [
+            kCIInputCenterKey: Self.ciCenter(of: image),
             kCIInputRadiusKey: radius,
             kCIInputAngleKey: angle,
         ])
+        return Self.cropped(output, to: image)
     }
 }

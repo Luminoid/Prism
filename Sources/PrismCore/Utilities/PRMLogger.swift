@@ -14,11 +14,18 @@ public enum PRMLogCategory: String, Sendable {
 // MARK: - PRMLogger
 
 /// Lightweight `os.Logger` wrapper for structured logging across Prism subsystems.
+///
+/// `os.Logger` is thread-safe by Apple's documentation — internally backed by a
+/// lock-free ring buffer with mutex-protected coalescing. All Prism subsystems
+/// (camera actor, data-output queue, MainActor view controllers, background
+/// continuations) log through the same `Logger` instances without coordination.
 public enum PRMLogger: Sendable {
     private static let subsystem = "com.luminoid.Prism"
 
-    /// Returns a cached `os.Logger` for the given category.
-    public static func logger(for category: PRMLogCategory) -> Logger {
+    /// Returns a cached `os.Logger` for the given category. Marked `nonisolated`
+    /// for clarity — the function has no actor isolation and is safe to call from
+    /// any context (it returns a new `Logger` value, which is itself `Sendable`).
+    public nonisolated static func logger(for category: PRMLogCategory) -> Logger {
         Logger(subsystem: subsystem, category: category.rawValue)
     }
 

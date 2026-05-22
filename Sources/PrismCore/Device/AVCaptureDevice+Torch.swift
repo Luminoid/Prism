@@ -17,17 +17,17 @@ public extension AVCaptureDevice {
     ///           `setTorchModeOn(level:)` fails (e.g., thermal limit reached).
     func prm_setTorch(_ mode: PRMTorchMode) throws {
         guard hasTorch else { return }
-        try lockForConfiguration()
-        defer { unlockForConfiguration() }
-        switch mode {
-        case .off:
-            torchMode = .off
-        case let .on(level):
-            // setTorchModeOn requires level > 0; smallest legal value is .leastNormalMagnitude.
-            let bounded = min(max(level, .leastNormalMagnitude), AVCaptureDevice.maxAvailableTorchLevel)
-            try setTorchModeOn(level: bounded)
-        case .auto:
-            torchMode = .auto
+        try withConfigurationLock {
+            switch mode {
+            case .off:
+                torchMode = .off
+            case let .on(level):
+                // setTorchModeOn requires level > 0; smallest legal value is .leastNormalMagnitude.
+                let bounded = min(max(level, .leastNormalMagnitude), AVCaptureDevice.maxAvailableTorchLevel)
+                try setTorchModeOn(level: bounded)
+            case .auto:
+                torchMode = .auto
+            }
         }
     }
 }
