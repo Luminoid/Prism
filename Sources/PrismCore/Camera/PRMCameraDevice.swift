@@ -58,6 +58,21 @@ public struct PRMCameraDevice: Sendable, Equatable {
     /// Maximum supported frame rate across all formats.
     public let maxFrameRate: Float64
 
+    /// Largest landscape (`width >= height`) entry across all formats'
+    /// `supportedMaxPhotoDimensions`. `nil` when the device exposes no photo dimensions
+    /// (e.g. video-only formats). Use this to gate "max resolution" toggles in UI —
+    /// virtual devices (`triple`, `dual`, `dualWide`) cap at 12MP (4032×3024) regardless
+    /// of format selection; only the physical `.builtInWideAngleCamera` on iPhone 14
+    /// Pro+ / 15 Pro+ exposes the 48MP entry (8064×6048).
+    public let maxSupportedPhotoDimensions: CMVideoDimensions?
+
+    /// Whether the device supports `setFocusModeLocked(lensPosition:)`. Virtual devices
+    /// (`triple`, `dual`, `dualWide`) report `isFocusModeSupported(.locked) == true` but
+    /// throw `NSInvalidArgumentException` at the setter call (newer iOS releases enforce
+    /// `isLockingFocusWithCustomLensPositionSupported` as a separate gate). Gate manual-
+    /// focus UI on this flag and require a physical-device swap when false.
+    public let supportsCustomLensPosition: Bool
+
     public init(
         uniqueID: String,
         deviceType: AVCaptureDevice.DeviceType,
@@ -74,7 +89,9 @@ public struct PRMCameraDevice: Sendable, Equatable {
         shutterRange: ClosedRange<Double>,
         supportsCustomWhiteBalance: Bool,
         supportsSlowMotion: Bool,
-        maxFrameRate: Float64
+        maxFrameRate: Float64,
+        maxSupportedPhotoDimensions: CMVideoDimensions? = nil,
+        supportsCustomLensPosition: Bool = true
     ) {
         self.uniqueID = uniqueID
         self.deviceType = deviceType
@@ -92,6 +109,8 @@ public struct PRMCameraDevice: Sendable, Equatable {
         self.supportsCustomWhiteBalance = supportsCustomWhiteBalance
         self.supportsSlowMotion = supportsSlowMotion
         self.maxFrameRate = maxFrameRate
+        self.maxSupportedPhotoDimensions = maxSupportedPhotoDimensions
+        self.supportsCustomLensPosition = supportsCustomLensPosition
     }
 
     /// Constructs a snapshot from an `AVCaptureDevice`. Call from session-actor context where
@@ -121,6 +140,23 @@ public struct PRMCameraDevice: Sendable, Equatable {
             }
         }
         maxFrameRate = maxFPS
+        // Largest landscape photo entry across all formats. Mirrors the scoring used
+        // in `PRMCameraSession.applyPreferredPhotoFormatIfNeeded` so UI gating matches
+        // the format the session would actually pick.
+        var bestPhotoDims: CMVideoDimensions?
+        var bestArea: Int64 = 0
+        for format in device.formats {
+            for dim in format.supportedMaxPhotoDimensions where dim.width >= dim.height {
+                let area = Int64(dim.width) * Int64(dim.height)
+                if area > bestArea {
+                    bestArea = area
+                    bestPhotoDims = dim
+                }
+            }
+        }
+        maxSupportedPhotoDimensions = bestPhotoDims
+        supportsCustomLensPosition = device.isFocusModeSupported(.locked)
+            && device.isLockingFocusWithCustomLensPositionSupported
     }
 
     /// Whether *any* discoverable device at `position` supports a format at ≥120 fps.
@@ -130,6 +166,28 @@ public struct PRMCameraDevice: Sendable, Equatable {
     /// virtual `.builtInTripleCamera`'s `formats` list caps at 60 fps, but the physical
     /// `.builtInWideAngleCamera` (a separately-discoverable device) does support 120/240.
     /// Switch to it via ``PRMCamera/switchDevice(type:position:)`` when entering slo-mo.
+    public static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.uniqueID == rhs.uniqueID
+            && lhs.deviceType == rhs.deviceType
+            && lhs.position == rhs.position
+            && lhs.localizedName == rhs.localizedName
+            && lhs.minZoomFactor == rhs.minZoomFactor
+            && lhs.maxZoomFactor == rhs.maxZoomFactor
+            && lhs.switchOverZoomFactors == rhs.switchOverZoomFactors
+            && lhs.lenses == rhs.lenses
+            && lhs.hasTorch == rhs.hasTorch
+            && lhs.hasFlash == rhs.hasFlash
+            && lhs.exposureBiasRange == rhs.exposureBiasRange
+            && lhs.isoRange == rhs.isoRange
+            && lhs.shutterRange == rhs.shutterRange
+            && lhs.supportsCustomWhiteBalance == rhs.supportsCustomWhiteBalance
+            && lhs.supportsSlowMotion == rhs.supportsSlowMotion
+            && lhs.maxFrameRate == rhs.maxFrameRate
+            && lhs.maxSupportedPhotoDimensions?.width == rhs.maxSupportedPhotoDimensions?.width
+            && lhs.maxSupportedPhotoDimensions?.height == rhs.maxSupportedPhotoDimensions?.height
+            && lhs.supportsCustomLensPosition == rhs.supportsCustomLensPosition
+    }
+
     public static func anyDeviceSupportsSlowMotion(at position: AVCaptureDevice.Position) -> Bool {
         let types: [AVCaptureDevice.DeviceType] = [
             .builtInWideAngleCamera,

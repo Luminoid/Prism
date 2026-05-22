@@ -77,5 +77,13 @@ public struct PRMLens: Sendable, Equatable {
     }
 
     /// Standard phone-camera 35mm-equivalent focal lengths.
-    public static let standardFocalLengths: [Int] = [13, 15, 23, 24, 26, 48, 50, 52, 65, 70, 77, 120, 200]
+    ///
+    /// Excludes 23 deliberately: `videoFieldOfView` reports the *video-cropped* FOV
+    /// (post-GDC), ~10% narrower than the photo FOV, so the FOV-derived focal length
+    /// for the iPhone 14/15/16/17 Pro wide camera lands at ~23.x mm even though
+    /// Apple markets the lens as 24mm. Including 23 in the standards list lets
+    /// `snapping()`'s "smallest in tolerance" rule pick 23 over 24 — the marketing
+    /// value — which surfaces in chip strips and EXIF labels as the wrong number.
+    /// See Apple dev-forum 90230 for the video-vs-photo FOV split.
+    public static let standardFocalLengths: [Int] = [13, 15, 24, 26, 48, 50, 52, 65, 70, 77, 120, 200]
 }

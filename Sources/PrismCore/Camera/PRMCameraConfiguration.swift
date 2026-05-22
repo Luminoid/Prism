@@ -70,6 +70,24 @@ public struct PRMCameraConfiguration: Sendable {
     /// this is true on an unsupported device.
     public var enableMultitaskingCameraAccess: Bool
 
+    /// When `true`, the session selects the `activeFormat` whose `supportedMaxPhotoDimensions`
+    /// contains the largest entry — required to unlock 48MP capture on iPhone 14 Pro+ /
+    /// 15 Pro+. The `.photo` preset's default activeFormat caps at 12MP regardless of the
+    /// device's 48MP capability. Setting this flag picks a 48MP-capable format and raises
+    /// the photo output's `maxPhotoDimensions` accordingly.
+    ///
+    /// **The 48MP-capable format is mutually exclusive with Live Photo capture** — Live
+    /// Photo requires a format that streams a parallel movie pipeline, which the 48MP
+    /// photo format doesn't expose. Setting both this flag *and* `enableLivePhoto = true`
+    /// is undefined; the format promotion wins and Live Photo silently fails. Apps that
+    /// need to toggle between modes at runtime should leave this `false` and call
+    /// ``PRMCamera/setHighResolutionPhotoFormat(_:)`` per user action.
+    ///
+    /// Pair with `deviceTypes: [.builtInWideAngleCamera]` — virtual devices (`triple`, `dual`,
+    /// `dualWide`) cap at 12MP regardless of format selection. Also disable `enableZeroShutterLag`,
+    /// `enableAutoDeferredPhotoDelivery`, `enableLivePhoto` — all substitute 12MP proxy captures.
+    public var prefersMaxPhotoDimensionsFormat: Bool
+
     public init(
         sessionPreset: AVCaptureSession.Preset = .photo,
         cameraPosition: AVCaptureDevice.Position = .back,
@@ -88,7 +106,8 @@ public struct PRMCameraConfiguration: Sendable {
         enableDepthDataDelivery: Bool = false,
         enablePortraitEffectsMatteDelivery: Bool = false,
         preferredVideoStabilizationMode: AVCaptureVideoStabilizationMode = .auto,
-        enableMultitaskingCameraAccess: Bool = false
+        enableMultitaskingCameraAccess: Bool = false,
+        prefersMaxPhotoDimensionsFormat: Bool = false
     ) {
         self.sessionPreset = sessionPreset
         self.cameraPosition = cameraPosition
@@ -108,6 +127,7 @@ public struct PRMCameraConfiguration: Sendable {
         self.enablePortraitEffectsMatteDelivery = enablePortraitEffectsMatteDelivery
         self.preferredVideoStabilizationMode = preferredVideoStabilizationMode
         self.enableMultitaskingCameraAccess = enableMultitaskingCameraAccess
+        self.prefersMaxPhotoDimensionsFormat = prefersMaxPhotoDimensionsFormat
     }
 
     /// Default device type preference order: triple → dual → dual-wide → wide-angle.

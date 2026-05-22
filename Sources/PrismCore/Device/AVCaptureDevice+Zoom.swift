@@ -48,10 +48,26 @@ public extension AVCaptureDevice {
     /// The first switch-over is the wide lens — all `displayZoomFactor` values are
     /// normalized so the wide lens equals 1× (Apple Camera convention).
     ///
-    /// Returns an empty array on non-virtual devices.
+    /// Returns a single-lens descriptor for physical devices (no virtual switch-overs),
+    /// matching the device's own FOV-derived focal length at the minimum zoom factor.
+    /// Without this fallback, callers that compute focal length via lens lookup (e.g. the
+    /// Studio telemetry strip) render `0mm` whenever the active device is physical (e.g.
+    /// after a virtual → wide swap for manual exposure mode).
     func prm_lenses() -> [PRMLens] {
         let switchOvers = virtualDeviceSwitchOverVideoZoomFactors.map { CGFloat($0.doubleValue) }
-        guard !switchOvers.isEmpty else { return [] }
+        guard !switchOvers.isEmpty else {
+            let factor = minAvailableVideoZoomFactor
+            let focal = prm_focalLength35mm(atZoomFactor: factor)
+            return [
+                PRMLens(
+                    zoomFactor: factor,
+                    displayZoomFactor: 1,
+                    focalLength35mm: focal,
+                    deviceType: deviceType,
+                    kind: .physical
+                ),
+            ]
+        }
 
         var factors: Set<CGFloat> = [minAvailableVideoZoomFactor]
         for value in switchOvers {

@@ -244,7 +244,11 @@ final class StudioViewController: UIViewController {
     private var focusModeSegmented: UISegmentedControl?
     private var focusRow: PRMSettingsRow?
     private var lensSlider: UISlider?
-
+    /// Max Dimensions row + its toggle. Tracked so `syncMaxDimensionsRow(from:)` can
+    /// flip the disabled state when the active device's largest supported photo
+    /// dimensions don't exceed 12MP (virtual devices like `.builtInTripleCamera`).
+    private var maxDimensionsRow: PRMSettingsRow?
+    private var maxDimensionsToggle: UISwitch?
     /// Set while a programmatic slider / segmented update is in flight so the
     /// `.valueChanged` action doesn't re-fire the underlying camera setter. Prevents a
     /// feedback loop when the state-stream sync writes back into the same control that
@@ -431,6 +435,9 @@ final class StudioViewController: UIViewController {
         modePicker.onChange = { [weak self] primary, variant in
             self?.applyModeChange(primary: primary, variant: variant)
         }
+        modePicker.onDisabledVariantTap = { [weak self] message in
+            self?.showToast(message)
+        }
 
         view.addSubview(shutter)
         view.addSubview(switchCameraButton)
@@ -570,6 +577,11 @@ final class StudioViewController: UIViewController {
             // same reason.
             config.enableResponsiveCapture = false
             config.enableZeroShutterLag = false
+            // Don't pre-promote to the 48MP format at configure time — that format is
+            // mutually exclusive with Live Photo. Studio toggles Max Dimensions per user
+            // action via `camera.setHighResolutionPhotoFormat(_:)`, which flips formats
+            // on demand. Configure leaves us in the default `.photo` preset format,
+            // which supports Live Photo + burst + depth.
             try await camera.configure(config)
         } catch {
             PRMLogger.session.error("Camera configure failed: \(String(describing: error), privacy: .public)")
@@ -912,6 +924,9 @@ final class StudioViewController: UIViewController {
     /// controller already understands. Burst folds into `.photo` via `burstEnabled`; the
     /// Night variants fold into `.night` via `nightDuration`.
     private func applyModeChange(primary: ModePicker.Primary, variant: ModePicker.Variant) {
+        // Re-apply variant-disable state — `rebuildVariants` swapped the strip contents
+        // when the primary changed, dropping any per-variant disable we set previously.
+        syncModePickerAvailability()
         burstEnabled = (primary == .photo && variant == .burst)
         if primary == .night {
             switch variant {
@@ -1132,6 +1147,22 @@ final class StudioViewController: UIViewController {
     /// `setExposureModeCustom` and `setWhiteBalanceModeLocked` land
     /// immediately and stick. Called from every manual slider's
     /// `.valueChanged` handler — idempotent (no-op when already on wide).
+    /// Returns the LV reference for reciprocity math, captured from the on-screen
+    /// state BEFORE any device swap. Only meaningful when the device is currently in
+    /// continuous-auto exposure (i.e. the user is about to enter manual for the first
+    /// time). Returns `nil` in manual mode, where `PRMCamera` should keep using its
+    /// own snapshotted baseline.
+    private func currentAutoExposureBaseline() -> (iso: Float, durationSeconds: Double)? {
+        let state = camera.state
+        let isAuto = state.exposureMode == .continuousAutoExposure || state.exposureMode == .autoExpose
+        guard isAuto,
+              state.iso > 0,
+              let duration = state.exposureDurationSeconds,
+              duration > 0
+        else { return nil }
+        return (iso: state.iso, durationSeconds: duration)
+    }
+
     private func ensureWideCameraForManual() async {
         guard let current = camera.device else { return }
         let virtualDeviceTypes: Set<AVCaptureDevice.DeviceType> = [
@@ -1139,12 +1170,23 @@ final class StudioViewController: UIViewController {
         ]
         guard virtualDeviceTypes.contains(current.deviceType) else { return }
         preManualDeviceType = current.deviceType
+        // Snapshot EV bias on the source device before the swap. Per Apple AVCaptureDevice
+        // docs ("exposure duration, ISO, aperture, white balance gains, or lens position
+        // may change when the device switches from one camera to the other"), each
+        // device has an independent AE engine — the wide camera meters a narrower FOV
+        // than the triple's virtual blend and lands at a different baseline LV. Carrying
+        // the user's EV offset across the swap preserves their relative exposure intent
+        // (e.g. "+0.7 stops brighter than what the camera meters").
+        let priorBias = camera.state.exposureBias
         do {
             pipeline.isEnabled = false
             try await camera.switchDevice(
                 type: .builtInWideAngleCamera,
                 position: current.position
             )
+            if abs(priorBias) > 0.01 {
+                await camera.setExposureBias(priorBias)
+            }
             await applyConnectionRotation(90)
             pipeline.isEnabled = true
             rebuildLensStrip()
@@ -1842,6 +1884,9 @@ final class StudioViewController: UIViewController {
         shutterRow?.onDisabledTap = toast
         wbRow?.onDisabledTap = toast
         focusRow?.onDisabledTap = toast
+        maxDimensionsRow?.onDisabledTap = toast
+        syncMaxDimensionsRow()
+        syncModePickerAvailability()
     }
 }
 
@@ -2079,8 +2124,57 @@ extension StudioViewController {
             guard let self else { return }
             capMaxDimensions = toggle.isOn
             row?.valueText = toggle.isOn ? "cap" : "default"
+            // Switch the device's `activeFormat` per toggle state. On (48MP-capable
+            // format) is incompatible with Live Photo / burst / depth — see
+            // `syncModePickerAvailability` for the mode-picker gating that follows.
+            Task {
+                await self.camera.setHighResolutionPhotoFormat(toggle.isOn)
+                await MainActor.run { self.syncModePickerAvailability() }
+            }
         }, for: .valueChanged)
+        maxDimensionsRow = row
+        maxDimensionsToggle = toggle
         return row
+    }
+
+    /// Flips the Max Dimensions row's disabled state based on whether the active
+    /// device can actually deliver >12MP photos. Virtual devices (`triple`, `dual`,
+    /// `dualWide`) cap at 12MP regardless of format selection — only the physical
+    /// `.builtInWideAngleCamera` exposes the 48MP entry on iPhone 14 Pro+. When
+    /// disabled, the toggle is force-off (so a capture doesn't request a maxDimensions
+    /// the device can't honor) and a tap surfaces a toast explaining the limitation.
+    /// Called from every state-stream tick and after `ensureWideCameraForManual`.
+    private func syncMaxDimensionsRow() {
+        guard let row = maxDimensionsRow, let toggle = maxDimensionsToggle else { return }
+        let supported = currentDeviceSupportsHighResPhoto()
+        if supported {
+            row.setDisabled(message: nil)
+            toggle.isEnabled = true
+        } else {
+            row.setDisabled(message: "Current lens caps at 12MP. Switch to wide for higher resolution.")
+            toggle.isEnabled = false
+            if toggle.isOn {
+                toggle.isOn = false
+                capMaxDimensions = false
+                row.valueText = "default"
+            }
+        }
+    }
+
+    private func currentDeviceSupportsHighResPhoto() -> Bool {
+        guard let dims = camera.device?.maxSupportedPhotoDimensions else { return false }
+        return Int64(dims.width) * Int64(dims.height) > Int64(4032) * Int64(3024)
+    }
+
+    /// Greys out variant pills that are incompatible with the current configuration.
+    /// Today the only cross-feature exclusion is Max Dimensions ↔ Live Photo / Burst /
+    /// Portrait: the 48MP photo format doesn't stream the parallel movie pipeline those
+    /// modes need. Tapping a disabled pill surfaces a toast instead of switching modes.
+    private func syncModePickerAvailability() {
+        let blockedByMax = capMaxDimensions ? "Turn off Max Dimensions to use this mode." : nil
+        modePicker.setVariantDisabled(.live, message: blockedByMax)
+        modePicker.setVariantDisabled(.burst, message: blockedByMax)
+        modePicker.setVariantDisabled(.portrait, message: blockedByMax)
     }
 
     private func makeRedEyeRow() -> PRMSettingsRow {
@@ -2151,6 +2245,19 @@ extension StudioViewController {
                 await self.restoreVirtualCameraIfFullyAuto()
             }
         }
+        // On touchDown, if still in auto mode, snap the slider to the live `state.iso`
+        // before the user starts dragging. The slider doesn't auto-track auto-mode
+        // telemetry (by design, see `syncDrawerControls`), so without this snap the
+        // first drag would land on whatever stale value the slider was constructed
+        // with (typically the cold-start ISO before auto-AE converged). Snapping on
+        // touchDown means the first drag continues smoothly from the on-screen value.
+        slider.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            let state = camera.state
+            let isAuto = state.exposureMode == .continuousAutoExposure || state.exposureMode == .autoExpose
+            guard isAuto, state.iso > 0 else { return }
+            slider.value = state.iso
+        }, for: .touchDown)
         slider.addAction(UIAction { [weak self, weak row] _ in
             guard let self, !isApplyingExternalUpdate else { return }
             let iso = slider.value
@@ -2160,9 +2267,15 @@ extension StudioViewController {
             // segmented (Custom segment). Also reset the Custom Exposure preset to "—"
             // since the user is now driving a free-form value, not one of the presets.
             customExposureSegmented?.selectedSegmentIndex = UISegmentedControl.noSegment
+            // Snapshot the on-screen auto-exposure baseline BEFORE swapping to the wide
+            // camera. `ensureWideCameraForManual` wipes `PRMCamera`'s baseline and lets the
+            // wide camera's auto-AE re-snapshot a different LV (narrower FOV / different
+            // metering), so the post-switch reciprocity math would compute against the
+            // wrong reference. Passing the pre-switch baseline pins LV to what the user saw.
+            let baseline = currentAutoExposureBaseline()
             Task {
                 await self.ensureWideCameraForManual()
-                await self.camera.setISO(iso)
+                await self.camera.setISO(iso, baseline: baseline)
             }
         }, for: .valueChanged)
         isoRow = row
@@ -2186,6 +2299,16 @@ extension StudioViewController {
             valueText: "auto",
             content: slider
         )
+        // Same on-touchDown snap as the ISO slider — see comment there for the rationale.
+        slider.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            let state = camera.state
+            let isAuto = state.exposureMode == .continuousAutoExposure || state.exposureMode == .autoExpose
+            guard isAuto, !shutterStops.isEmpty, let durationSec = state.exposureDurationSeconds, durationSec > 0 else { return }
+            let index = Self.nearestStopIndex(to: durationSec, in: shutterStops)
+            let denom = max(shutterStops.count - 1, 1)
+            slider.value = Float(Double(index) / Double(denom))
+        }, for: .touchDown)
         slider.addAction(UIAction { [weak self, weak row] _ in
             guard let self, !isApplyingExternalUpdate, !shutterStops.isEmpty else { return }
             let normalized = slider.value
@@ -2193,9 +2316,11 @@ extension StudioViewController {
             let seconds = shutterStops[index]
             row?.valueText = Self.formatShutter(seconds)
             customExposureSegmented?.selectedSegmentIndex = UISegmentedControl.noSegment
+            // Same baseline-pinning rationale as the ISO slider — see comment there.
+            let baseline = currentAutoExposureBaseline()
             Task {
                 await self.ensureWideCameraForManual()
-                await self.camera.setShutterSpeed(seconds: seconds)
+                await self.camera.setShutterSpeed(seconds: seconds, baseline: baseline)
             }
         }, for: .valueChanged)
         shutterRow = row
@@ -2306,7 +2431,14 @@ extension StudioViewController {
             row?.valueText = String(format: "%.2f", pos)
             // `setLensPosition` switches the device into `.locked` focus mode — the
             // next state-stream tick will sync the Focus Mode segmented to "Locked".
-            Task { await self.camera.setLensPosition(pos) }
+            // Virtual devices (`.builtInTripleCamera` etc.) report
+            // `isFocusModeSupported(.locked) == true` but throw on
+            // `setFocusModeLocked(lensPosition:)` — only the physical wide camera
+            // honors custom lens position. Swap first.
+            Task {
+                await self.ensureWideCameraForManual()
+                await self.camera.setLensPosition(pos)
+            }
         }, for: .valueChanged)
         focusRow = row
         lensSlider = slider
@@ -2446,6 +2578,7 @@ extension StudioViewController {
     /// when in auto modes) so the user can see what AVFoundation is currently using even
     /// when the slider is parked.
     private func syncDrawerControls(from state: PRMCameraState) {
+        syncMaxDimensionsRow()
         if let segmented = exposureModeSegmented {
             applyExposureModeUI(state.exposureMode, to: segmented, row: nil)
         }
@@ -2542,7 +2675,14 @@ extension StudioViewController {
         // The remaining disable cases are mid-recording (visible jumps).
         let recordingMessage: String? = recording ? "Setting locked while recording" : nil
         wbRow?.setDisabled(message: recordingMessage)
-        focusRow?.setDisabled(message: recordingMessage)
+        // Custom lens position is not supported on virtual devices on recent iOS — the
+        // `setFocusModeLocked(lensPosition:)` setter throws even when
+        // `isFocusModeSupported(.locked)` reports true. Surface that as a disabled
+        // row with a toast pointing at manual exposure (which auto-swaps to wide).
+        let focusUnsupportedMessage = (camera.device?.supportsCustomLensPosition == false)
+            ? "Manual focus needs the wide camera. Drag ISO / Shutter to switch."
+            : nil
+        focusRow?.setDisabled(message: recordingMessage ?? focusUnsupportedMessage)
     }
 
     /// Find the stop index whose value is closest (in log-shutter space) to `seconds`.
@@ -2992,6 +3132,7 @@ private final class NightCaptureIndicator: UIView {
 
 private final class ModePillStrip: UIView {
     var onSelect: ((Int) -> Void)?
+    var onDisabledTap: ((String) -> Void)?
     var selectedIndex: Int = 0 {
         didSet { applySelection() }
     }
@@ -2999,7 +3140,7 @@ private final class ModePillStrip: UIView {
     private let scrollView = UIScrollView()
     private let stackView = UIStackView()
     private var pills: [TextChip] = []
-
+    private var disabledMessages: [Int: String] = [:]
     init() {
         super.init(frame: .zero)
         addSubview(scrollView)
@@ -3032,11 +3173,17 @@ private final class ModePillStrip: UIView {
             pill.removeFromSuperview()
         }
         pills = []
+        disabledMessages.removeAll()
         for (index, label) in labels.enumerated() {
             let pill = TextChip(title: label)
             pill.onTap = { [weak self] in
-                self?.selectedIndex = index
-                self?.onSelect?(index)
+                guard let self else { return }
+                if let message = disabledMessages[index] {
+                    onDisabledTap?(message)
+                    return
+                }
+                selectedIndex = index
+                onSelect?(index)
             }
             pills.append(pill)
             stackView.addArrangedSubview(pill)
@@ -3058,13 +3205,28 @@ private final class ModePillStrip: UIView {
         (pills[index].subviews.first as? UILabel)?.text = text
     }
 
+    /// Marks a pill as disabled. Disabled pills render at reduced opacity and route
+    /// taps to `onDisabledTap` with the supplied message instead of changing the
+    /// selected index. Pass `nil` to re-enable.
+    func setDisabled(at index: Int, message: String?) {
+        guard index >= 0, index < pills.count else { return }
+        if let message {
+            disabledMessages[index] = message
+        } else {
+            disabledMessages.removeValue(forKey: index)
+        }
+        applySelection()
+    }
+
     private func applySelection() {
         for (index, pill) in pills.enumerated() {
             let active = index == selectedIndex
+            let disabled = disabledMessages[index] != nil
             pill.backgroundColor = active
                 ? UIColor.systemYellow
                 : UIColor.white.withAlphaComponent(0.10)
             (pill.subviews.first as? UILabel)?.textColor = active ? .black : .white
+            pill.alpha = disabled ? 0.35 : 1.0
         }
     }
 }
@@ -3121,6 +3283,7 @@ private final class ModePicker: UIView {
     }
 
     var onChange: ((Primary, Variant) -> Void)?
+    var onDisabledVariantTap: ((String) -> Void)?
 
     /// Whether the slo-mo variant is offered under VIDEO. Driven by `device.supportsSlowMotion`.
     var supportsSlowMotion: Bool = false {
@@ -3171,6 +3334,9 @@ private final class ModePicker: UIView {
             self.variant = variants[index]
             self.onChange?(self.primary, self.variant)
         }
+        variantRow.onDisabledTap = { [weak self] message in
+            self?.onDisabledVariantTap?(message)
+        }
 
         rebuildVariants()
     }
@@ -3178,6 +3344,15 @@ private final class ModePicker: UIView {
     @available(*, unavailable)
     required init?(coder _: NSCoder) {
         fatalError("Use init()")
+    }
+
+    /// Disables or re-enables a variant pill. Disabled pills render at reduced opacity
+    /// and route taps to `onDisabledVariantTap` with `message`. Pass `nil` to clear.
+    /// No-op if `variant` isn't in the current primary's variant list.
+    func setVariantDisabled(_ variant: Variant, message: String?) {
+        let variants = self.variants(for: primary)
+        guard let index = variants.firstIndex(of: variant) else { return }
+        variantRow.setDisabled(at: index, message: message)
     }
 
     /// Replace the displayed label for a single variant pill. Used so the Night AUTO

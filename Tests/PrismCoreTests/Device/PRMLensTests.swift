@@ -11,6 +11,16 @@ struct PRMLensTests {
     }
 
     @Test
+    func `Snapping rounds video-FOV-cropped raw to marketing 24mm`() {
+        // `videoFieldOfView` on iPhone 14/15/16/17 Pro wide reports the video-cropped FOV
+        // (~10% narrower than photo FOV), so the FOV-derived raw lands at ~23.x mm.
+        // Snapping must surface the marketing 24mm, not pick the cropped value.
+        let lens = PRMLens(zoomFactor: 1.0, displayZoomFactor: 1.0, focalLength35mm: 23.5)
+        let snapped = lens.snapping()
+        #expect(snapped.focalLength35mm == 24)
+    }
+
+    @Test
     func `Snapping leaves out-of-tolerance values unchanged`() {
         let lens = PRMLens(zoomFactor: 1.0, displayZoomFactor: 1.0, focalLength35mm: 1000)
         let snapped = lens.snapping()

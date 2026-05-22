@@ -217,6 +217,30 @@ public final class PRMCamera {
         await session.setLivePhotoCaptureEnabled(enabled)
     }
 
+    /// Promotes the device's `activeFormat` to the format with the largest landscape
+    /// `supportedMaxPhotoDimensions` — typically the 48MP format on iPhone 14 Pro+ /
+    /// 15 Pro+ wide camera. Also raises the photo output's `maxPhotoDimensions` ceiling.
+    ///
+    /// **Mutually exclusive with Live Photo capture** — the 48MP photo format doesn't
+    /// stream the parallel movie pipeline Live Photo requires. Disable Live Photo before
+    /// calling this; re-enable Live Photo (which itself restores a compatible format)
+    /// when reverting to standard-resolution capture.
+    ///
+    /// On virtual devices (`triple`, `dual`, `dualWide`) this is a no-op — virtual
+    /// devices cap at 12MP regardless of format selection. Swap to
+    /// `.builtInWideAngleCamera` via ``switchDevice(type:position:)`` first.
+    public func setHighResolutionPhotoFormat(_ enabled: Bool) async {
+        await PRMCameraActor.shared.run { [session] in
+            if enabled {
+                await session.applyHighResolutionPhotoFormat()
+            } else {
+                await session.applyLivePhotoCompatibleFormat()
+            }
+        }
+        await refreshDevice()
+        await refreshState()
+    }
+
     // MARK: - Device controls (forward to AVCaptureDevice extensions on actor)
 
     public func setZoom(_ factor: CGFloat) async {
@@ -457,15 +481,17 @@ public final class PRMCamera {
     /// the target product — the alternative would be to silently re-derive
     /// the user's slider value to keep LV, which the user explicitly didn't
     /// ask for.
-    public func setISO(_ iso: Float) async {
-        guard let baselineISO = autoExposureBaselineISO,
-              let baselineDur = autoExposureBaselineDurationSeconds,
-              baselineISO > 0, iso > 0
-        else {
+    public func setISO(_ iso: Float, baseline: (iso: Float, durationSeconds: Double)? = nil) async {
+        let resolvedBaseline = baseline.flatMap { override in
+            (override.iso > 0 && override.durationSeconds > 0) ? override : nil
+        } ?? autoExposureBaselineISO.flatMap { snap in
+            autoExposureBaselineDurationSeconds.map { (iso: snap, durationSeconds: $0) }
+        }
+        guard let resolvedBaseline, resolvedBaseline.iso > 0, iso > 0 else {
             await setCustomExposure(duration: AVCaptureDevice.currentExposureDuration, iso: iso)
             return
         }
-        let targetLV = Double(baselineISO) * baselineDur
+        let targetLV = Double(resolvedBaseline.iso) * resolvedBaseline.durationSeconds
         let (finalISO, finalDuration) = await Self.reciprocity(
             fixedISO: iso,
             fixedDurationSeconds: nil,
@@ -478,16 +504,24 @@ public final class PRMCamera {
 
     /// User drags shutter → shutter is the **fixed** axis; ISO is derived
     /// from the LV target. Same clamping rule as ``setISO(_:)``.
-    public func setShutterSpeed(seconds: Double) async {
-        guard let baselineISO = autoExposureBaselineISO,
-              let baselineDur = autoExposureBaselineDurationSeconds,
-              baselineDur > 0, seconds > 0
-        else {
+    ///
+    /// `baseline` lets the caller pin the reciprocity reference to a snapshot
+    /// taken *before* a device switch (e.g. virtual → wide for manual mode).
+    /// Without it, callers that swap the device immediately before driving
+    /// shutter would compute LV against the post-switch auto-AE baseline,
+    /// which meters a different FOV and yields the wrong ISO target.
+    public func setShutterSpeed(seconds: Double, baseline: (iso: Float, durationSeconds: Double)? = nil) async {
+        let resolvedBaseline = baseline.flatMap { override in
+            (override.iso > 0 && override.durationSeconds > 0) ? override : nil
+        } ?? autoExposureBaselineISO.flatMap { snap in
+            autoExposureBaselineDurationSeconds.map { (iso: snap, durationSeconds: $0) }
+        }
+        guard let resolvedBaseline, resolvedBaseline.durationSeconds > 0, seconds > 0 else {
             let durationCM = CMTimeMakeWithSeconds(seconds, preferredTimescale: 1_000_000)
             await setCustomExposure(duration: durationCM, iso: AVCaptureDevice.currentISO)
             return
         }
-        let targetLV = Double(baselineISO) * baselineDur
+        let targetLV = Double(resolvedBaseline.iso) * resolvedBaseline.durationSeconds
         let (finalISO, finalDuration) = await Self.reciprocity(
             fixedISO: nil,
             fixedDurationSeconds: seconds,

@@ -84,6 +84,13 @@ public final class PRMCameraSession {
         session.sessionPreset = configuration.sessionPreset
 
         try attachVideoDevice(position: configuration.cameraPosition, types: configuration.deviceTypes)
+        #if !os(macOS)
+            // Promote `activeFormat` to a 48MP-capable format BEFORE the photo output is
+            // attached — `refreshOutputMaxPhotoDimensions` reads
+            // `activeFormat.supportedMaxPhotoDimensions` at attach time and pins the
+            // output ceiling against it.
+            applyPreferredPhotoFormatIfNeeded()
+        #endif
 
         if configuration.includesAudio {
             attachAudioDevice()
@@ -249,6 +256,13 @@ public final class PRMCameraSession {
             session.commitConfiguration()
             throw PRMSessionError.cannotAttachToSession("Cannot attach \(newDevice.localizedName)")
         }
+        #if !os(macOS)
+            // New device may have a different `formats` list (e.g. virtual → physical wide
+            // unlocks the 48MP-capable format). Re-pick the preferred format and re-raise
+            // the photo output's max-dimensions ceiling to match.
+            applyPreferredPhotoFormatIfNeeded()
+            refreshOutputMaxPhotoDimensions()
+        #endif
         session.commitConfiguration()
     }
 
@@ -352,20 +366,7 @@ public final class PRMCameraSession {
         photoOutput = output
 
         #if !os(macOS)
-            // Raise the output-level `maxPhotoDimensions` ceiling to the largest entry the
-            // active format actually supports — without this, per-photo settings that
-            // request the 48MP entry throw `NSInvalidArgumentException` ("must not be
-            // larger than the maxPhotoDimensions set on the AVCapturePhotoOutput").
-            // AVFoundation defaults the output ceiling to a conservative value (typically
-            // the 12MP entry), and `AVCapturePhotoSettings.maxPhotoDimensions` is hard-
-            // capped at the output's ceiling, not the format's. Setting this once at attach
-            // lets callers freely choose any dimension entry per capture.
-            if let device = videoDevice {
-                let supported = device.activeFormat.supportedMaxPhotoDimensions
-                if let largest = supported.max(by: { $0.width < $1.width }) {
-                    output.maxPhotoDimensions = largest
-                }
-            }
+            refreshOutputMaxPhotoDimensions()
 
             applyPhotoOutputFeature(
                 "Live Photo",
@@ -414,6 +415,104 @@ public final class PRMCameraSession {
         apply()
     }
 
+    #if !os(macOS)
+        /// Sets `output.maxPhotoDimensions` to the largest entry the current device's
+        /// active format supports. Without this, per-photo `maxPhotoDimensions` requests
+        /// for entries larger than AVFoundation's conservative default ceiling (typically
+        /// the 12MP entry) throw `NSInvalidArgumentException` ("must not be larger than
+        /// the maxPhotoDimensions set on the AVCapturePhotoOutput").
+        ///
+        /// Called at photo output attach AND again after every `swapInput` so the
+        /// ceiling tracks the device's actual capability across virtual ↔ physical
+        /// camera swaps (e.g. triple → wide for manual exposure or 48MP capture).
+        private func refreshOutputMaxPhotoDimensions() {
+            guard let output = photoOutput, let device = videoDevice else { return }
+            // Same landscape filter as `applyPreferredPhotoFormatIfNeeded` — portrait
+            // entries from video formats would otherwise win an area-based pick on iPhone
+            // 15 Pro Max and pin the output ceiling to a 12MP video resolution.
+            let supported = device.activeFormat.supportedMaxPhotoDimensions
+                .filter { $0.width >= $0.height }
+            guard let largest = supported.max(by: { Int64($0.width) * Int64($0.height) < Int64($1.width) * Int64($1.height) }) else { return }
+            output.maxPhotoDimensions = largest
+        }
+
+        /// If `prefersMaxPhotoDimensionsFormat` is set, swap `activeFormat` to the device
+        /// format with the largest `supportedMaxPhotoDimensions` area. The `.photo` preset
+        /// defaults to a conservative format (typically 12MP) even on iPhone 14 Pro+ /
+        /// 15 Pro+ where the wide camera physically supports 48MP. Must run BEFORE
+        /// `refreshOutputMaxPhotoDimensions` so the output ceiling pins against the
+        /// promoted format.
+        ///
+        /// Pair the configuration flag with `deviceTypes: [.builtInWideAngleCamera]` —
+        /// virtual devices (`triple`, `dual`, `dualWide`) cap at 12MP regardless of the
+        /// format chosen, so this helper is a no-op on those.
+        private func applyPreferredPhotoFormatIfNeeded() {
+            guard configuration?.prefersMaxPhotoDimensionsFormat == true else { return }
+            applyHighResolutionPhotoFormat()
+        }
+
+        /// Promotes `activeFormat` to the device format with the largest landscape
+        /// `supportedMaxPhotoDimensions`. Filters to landscape (`width >= height`)
+        /// entries — some video formats expose portrait dimensions (e.g. `(3024, 4032)`)
+        /// that would otherwise outrank the true 48MP photo format by area on iPhone
+        /// 15 Pro Max. **Incompatible with Live Photo / burst / depth streaming** —
+        /// call `applyLivePhotoCompatibleFormat()` before re-enabling those.
+        func applyHighResolutionPhotoFormat() {
+            guard let device = videoDevice else { return }
+            func score(_ format: AVCaptureDevice.Format) -> Int64 {
+                format.supportedMaxPhotoDimensions
+                    .filter { $0.width >= $0.height }
+                    .map { Int64($0.width) * Int64($0.height) }
+                    .max() ?? 0
+            }
+            let candidates = device.formats.filter { score($0) > 0 }
+            guard let best = candidates.max(by: { score($0) < score($1) }) else { return }
+            if best === device.activeFormat { return }
+            do {
+                try device.lockForConfiguration()
+                defer { device.unlockForConfiguration() }
+                device.activeFormat = best
+            } catch {
+                PRMLogger.session.warning(
+                    "Failed to promote activeFormat for max-dimensions capture: \(error.localizedDescription, privacy: .public)"
+                )
+            }
+            refreshOutputMaxPhotoDimensions()
+        }
+
+        /// Restores `activeFormat` to a Live-Photo-compatible format. The 48MP photo
+        /// format doesn't stream the parallel movie pipeline Live Photo needs, so
+        /// callers must reset before enabling Live Photo, burst, or depth capture.
+        /// Picks the largest-resolution format whose dimensions stay at or below 20MP
+        /// (the boundary that separates 12MP video-streaming formats from the 48MP
+        /// pure-photo format across iPhone Pro models).
+        func applyLivePhotoCompatibleFormat() {
+            guard let device = videoDevice else { return }
+            func score(_ format: AVCaptureDevice.Format) -> Int64 {
+                format.supportedMaxPhotoDimensions
+                    .filter { $0.width >= $0.height }
+                    .map { Int64($0.width) * Int64($0.height) }
+                    .max() ?? 0
+            }
+            let candidates = device.formats.filter { format in
+                let s = score(format)
+                return s > 0 && s <= 20_000_000
+            }
+            guard let best = candidates.max(by: { score($0) < score($1) }) else { return }
+            if best === device.activeFormat { return }
+            do {
+                try device.lockForConfiguration()
+                defer { device.unlockForConfiguration() }
+                device.activeFormat = best
+            } catch {
+                PRMLogger.session.warning(
+                    "Failed to restore Live-Photo-compatible format: \(error.localizedDescription, privacy: .public)"
+                )
+            }
+            refreshOutputMaxPhotoDimensions()
+        }
+    #endif
+
     private func attachMovieFileOutput() throws {
         let output = AVCaptureMovieFileOutput()
         guard session.canAddOutput(output) else {
@@ -454,6 +553,17 @@ public final class PRMCameraSession {
     public func setLivePhotoCaptureEnabled(_ enabled: Bool) {
         #if !os(macOS)
             guard let photoOutput else { return }
+            // When enabling: if the current format / configuration doesn't support Live
+            // Photo, try recovering by swapping the device's `activeFormat` to one that
+            // does. The 48MP-capable photo format on iPhone 14 Pro+ / 15 Pro+ wide
+            // explicitly drops the parallel movie pipeline Live Photo needs — without
+            // this recovery, `setLivePhotoCaptureEnabled(true)` silently no-ops and the
+            // next `captureLivePhoto` fails with "Live Photo is not enabled on the
+            // photo output." Pulling the format flip in here means the photo output
+            // doesn't need to know about the cross-feature exclusion.
+            if enabled, !photoOutput.isLivePhotoCaptureSupported {
+                applyLivePhotoCompatibleFormat()
+            }
             guard photoOutput.isLivePhotoCaptureSupported else { return }
             guard photoOutput.isLivePhotoCaptureEnabled != enabled else { return }
             session.beginConfiguration()
