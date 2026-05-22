@@ -517,7 +517,34 @@ final class ConfigurationLabViewController: UIViewController {
         }
         lines.append("Preset: \(configuration.sessionPreset.rawValue)")
         lines.append("Pixel format: \(pixelFormatString(configuration.videoPixelFormat))")
+        // Surface every toggle's actual landed state — some flip themselves off when the
+        // device doesn't support the feature (e.g. Live Photo requested but not supported
+        // on the front camera, multitasking requested on iPhone, depth on a single-camera
+        // device). Without this the user sees the toggle stay green and assumes it took.
+        lines.append("Outputs: " + applyedOutputsSummary())
+        lines.append("Photo features: " + appliedPhotoFeaturesSummary())
         return lines.joined(separator: "\n")
+    }
+
+    private func applyedOutputsSummary() -> String {
+        var parts: [String] = []
+        if configuration.includesAudio { parts.append("audio") }
+        if configuration.includesVideoDataOutput { parts.append("video-data") }
+        if configuration.includesPhotoOutput { parts.append("photo") }
+        if configuration.includesMovieFileOutput { parts.append("movie") }
+        return parts.isEmpty ? "none" : parts.joined(separator: ", ")
+    }
+
+    private func appliedPhotoFeaturesSummary() -> String {
+        var parts: [String] = []
+        if configuration.enableLivePhoto { parts.append("live") }
+        if configuration.enableDepthDataDelivery { parts.append("depth") }
+        if configuration.enablePortraitEffectsMatteDelivery { parts.append("matte") }
+        if configuration.enableResponsiveCapture { parts.append("responsive") }
+        if configuration.enableAutoDeferredPhotoDelivery { parts.append("deferred") }
+        if configuration.enableZeroShutterLag { parts.append("ZSL") }
+        if configuration.enableMultitaskingCameraAccess { parts.append("multitask") }
+        return parts.isEmpty ? "none" : parts.joined(separator: ", ")
     }
 
     private func pixelFormatString(_ format: OSType) -> String {

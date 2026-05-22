@@ -352,6 +352,21 @@ public final class PRMCameraSession {
         photoOutput = output
 
         #if !os(macOS)
+            // Raise the output-level `maxPhotoDimensions` ceiling to the largest entry the
+            // active format actually supports — without this, per-photo settings that
+            // request the 48MP entry throw `NSInvalidArgumentException` ("must not be
+            // larger than the maxPhotoDimensions set on the AVCapturePhotoOutput").
+            // AVFoundation defaults the output ceiling to a conservative value (typically
+            // the 12MP entry), and `AVCapturePhotoSettings.maxPhotoDimensions` is hard-
+            // capped at the output's ceiling, not the format's. Setting this once at attach
+            // lets callers freely choose any dimension entry per capture.
+            if let device = videoDevice {
+                let supported = device.activeFormat.supportedMaxPhotoDimensions
+                if let largest = supported.max(by: { $0.width < $1.width }) {
+                    output.maxPhotoDimensions = largest
+                }
+            }
+
             applyPhotoOutputFeature(
                 "Live Photo",
                 requested: configuration.enableLivePhoto,

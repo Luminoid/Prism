@@ -9,6 +9,9 @@ options:
 packages:
   Prism:
     path: ..
+  SnapKit:
+    url: https://github.com/SnapKit/SnapKit.git
+    from: "5.7.0"
 
 targets:
   PrismExample:
@@ -23,6 +26,8 @@ targets:
         product: PrismCore
       - package: Prism
         product: PrismUI
+      - package: SnapKit
+        product: SnapKit
     settings:
       base:
         INFOPLIST_FILE: Resources/Info.plist

@@ -22,6 +22,13 @@ import CoreMedia
 public final class PRMCamera {
     // MARK: - Properties
 
+    /// Internal notification name posted from `setExposureModeCustom` /
+    /// `setWhiteBalanceModeLocked` completion handlers. `installObservers` wires this
+    /// to `refreshState` on MainActor, so the state stream sees AVFoundation's
+    /// committed values without us having to cross the `@MainActor` ↔ `@Sendable`
+    /// boundary with `weak self` from the completion-handler closure.
+    fileprivate nonisolated static let deviceCommitNotification = Notification.Name("com.luminoid.Prism.deviceCommit")
+
     /// Underlying session — escape hatch for advanced AVFoundation work.
     public let session: PRMCameraSession
 
@@ -38,10 +45,75 @@ public final class PRMCamera {
     private var keyValueObservations: [NSKeyValueObservation] = []
     private var notificationObservers: [any NSObjectProtocol] = []
 
+    // User-driven mode intents that override AVFoundation's lagging device
+    // reads during the ~3 s window between the slider-driven setter call and
+    // its completion handler firing (per Apple dev-forum 751112). Without
+    // these, the 500 ms telemetry tick reads the stale mid-flight mode and
+    // the UI flips back to "(auto)" mid-drag — the user-visible "slider
+    // jumped back to auto" symptom. Cleared the moment the device commits
+    // (mode matches the intent), or when the user explicitly picks a new mode.
+    private var intendedExposureMode: AVCaptureDevice.ExposureMode?
+    private var intendedWhiteBalanceMode: AVCaptureDevice.WhiteBalanceMode?
+
+    /// User-intent snapshot for the manual exposure values, exposed so the
+    /// photo-capture layer can patch the saved photo's EXIF without racing
+    /// the device's lagging `iso` / `exposureDuration` properties. Returns
+    /// `nil` when the user isn't in custom exposure mode. Caller is
+    /// responsible for using this only when capturing in a manual context.
+    /// Snapshot the user-driven manual exposure values for callers that need
+    /// to mirror them into a downstream API (e.g. `PRMPhotoCapture`'s EXIF
+    /// patch path). Returns `nil` in continuous-auto modes.
+    ///
+    /// Reads `state.exposureMode == .custom` as the source-of-truth for "is
+    /// the user in manual exposure?" — NOT the transient `intendedExposureMode`
+    /// flag. The intent flags are auto-cleared in `refreshState` once the
+    /// device-reported values catch up to the user's slider input. That's
+    /// correct for UI stickiness (slider can free-drag once AVF lands) but
+    /// wrong for "should I patch the EXIF as manual?" — the device is still
+    /// in `.custom` after the intent flag clears, and the values to use are
+    /// `state.iso` / `state.exposureDurationSeconds`. Falls back to the
+    /// intent values when state lags (race: just after `setCustomExposure`,
+    /// before `refreshState` catches up).
+    public var currentManualExposureSnapshot: (iso: Float, duration: CMTime)? {
+        let isManual = state.exposureMode == .custom || intendedExposureMode == .custom
+        guard isManual else { return nil }
+        let iso = intendedISO ?? state.iso
+        let durationSeconds = intendedExposureDurationSeconds ?? state.exposureDurationSeconds ?? 0
+        guard iso > 0, durationSeconds > 0, durationSeconds.isFinite else { return nil }
+        let duration = CMTimeMakeWithSeconds(durationSeconds, preferredTimescale: 1_000_000)
+        return (iso, duration)
+    }
+
+    /// User-set ISO that should be honored by ``state``.iso until AVFoundation
+    /// commits and the device-reported `iso` matches. Without this, the 500 ms
+    /// telemetry tick reads the stale auto-driven `device.iso` after the user
+    /// releases the slider and the value visibly snaps back — the
+    /// "ISO jumped back" symptom that survived the exposure-mode override.
+    private var intendedISO: Float?
+    /// User-set exposure duration (seconds) honored by
+    /// ``state``.exposureDurationSeconds until AVFoundation commits.
+    private var intendedExposureDurationSeconds: Double?
+    /// User-set WB Kelvin honored by ``state``.whiteBalanceTemperature until
+    /// AVFoundation commits the locked WB gains.
+    private var intendedWhiteBalanceTemperature: Float?
+    /// Auto-exposure ISO baseline snapshotted whenever the device is in
+    /// continuous / auto exposure (and the user isn't actively driving sliders).
+    /// Used as the reference point for the Tv/Av-priority reciprocity math in
+    /// ``setISO(_:)`` and ``setShutterSpeed(seconds:)`` so the OTHER axis can
+    /// be adjusted to preserve the auto-metered light value when one axis is
+    /// changed by the user.
+    private var autoExposureBaselineISO: Float?
+    private var autoExposureBaselineDurationSeconds: Double?
+
     // MARK: - Init
 
     public init(session: PRMCameraSession? = nil) {
         self.session = session ?? PRMCameraSession.makeDefaultMainActor()
+        intendedISO = nil
+        intendedExposureDurationSeconds = nil
+        intendedWhiteBalanceTemperature = nil
+        autoExposureBaselineISO = nil
+        autoExposureBaselineDurationSeconds = nil
     }
 
     deinit {
@@ -66,6 +138,16 @@ public final class PRMCamera {
 
     /// Configures the session and refreshes ``device`` + ``state``.
     public func configure(_ configuration: PRMCameraConfiguration) async throws {
+        // Reconfigure clears any per-session manual-exposure / WB intents — the
+        // new session starts in `.continuousAuto` for both axes, and we don't
+        // want a stale intent from before configure to keep overriding the read.
+        intendedExposureMode = nil
+        intendedWhiteBalanceMode = nil
+        intendedISO = nil
+        intendedExposureDurationSeconds = nil
+        intendedWhiteBalanceTemperature = nil
+        autoExposureBaselineISO = nil
+        autoExposureBaselineDurationSeconds = nil
         try await session.configure(configuration)
         await refreshDevice()
         await refreshState()
@@ -86,6 +168,15 @@ public final class PRMCamera {
 
     /// Switches the camera position and refreshes ``device``.
     public func switchCamera(to position: AVCaptureDevice.Position) async throws {
+        // The new physical device starts in `.continuousAuto` — drop intents so
+        // the override doesn't keep painting the old custom state on the new lens.
+        intendedExposureMode = nil
+        intendedWhiteBalanceMode = nil
+        intendedISO = nil
+        intendedExposureDurationSeconds = nil
+        intendedWhiteBalanceTemperature = nil
+        autoExposureBaselineISO = nil
+        autoExposureBaselineDurationSeconds = nil
         _ = try await session.switchCamera(to: position)
         await refreshDevice()
         await refreshState()
@@ -99,6 +190,13 @@ public final class PRMCamera {
         type: AVCaptureDevice.DeviceType,
         position: AVCaptureDevice.Position? = nil
     ) async throws {
+        intendedExposureMode = nil
+        intendedWhiteBalanceMode = nil
+        intendedISO = nil
+        intendedExposureDurationSeconds = nil
+        intendedWhiteBalanceTemperature = nil
+        autoExposureBaselineISO = nil
+        autoExposureBaselineDurationSeconds = nil
         _ = try await session.switchDevice(type: type, position: position)
         await refreshDevice()
         await refreshState()
@@ -145,28 +243,88 @@ public final class PRMCamera {
     }
 
     public func setExposureMode(_ mode: AVCaptureDevice.ExposureMode) async {
+        // User explicitly picked a mode — drop any prior manual-exposure intent
+        // so the UI doesn't keep showing "custom" after the user taps auto.
+        intendedExposureMode = mode
+        // Returning to any auto path also drops the pinned ISO / duration
+        // values so the slider labels start tracking the auto-driven readings
+        // again. The baseline reset happens implicitly via `refreshState`
+        // re-snapshotting once the device settles back into auto.
+        if mode != .custom {
+            intendedISO = nil
+            intendedExposureDurationSeconds = nil
+        }
         await runOnDevice { try? $0.prm_setExposureMode(mode) }
         await refreshState()
     }
 
     public func setCustomExposure(duration: CMTime, iso: Float) async {
-        await runOnDevice { try? $0.prm_setCustomExposure(duration: duration, iso: iso) }
+        intendedExposureMode = .custom
+        // Snapshot the user-requested values so `refreshState` keeps the UI
+        // pinned to what they set, not the lagging device-reported pre-commit
+        // values. Sentinel `currentISO` / `currentExposureDuration` mean "keep
+        // current" — don't write those into the intent, otherwise the slider
+        // would freeze on the sentinel marker instead of the real current value.
+        if iso != AVCaptureDevice.currentISO {
+            intendedISO = iso
+        }
+        if duration.isValid, duration != AVCaptureDevice.currentExposureDuration {
+            let seconds = CMTimeGetSeconds(duration)
+            if seconds > 0, seconds.isFinite {
+                intendedExposureDurationSeconds = seconds
+            }
+        }
+        // `setExposureModeCustom` is asynchronous — its completion handler fires
+        // when AVFoundation accepts the new mode + values, which can take up to
+        // ~3 s on long shutter durations (per Apple dev-forum 751112). Reading
+        // `device.exposureMode` immediately after the call returns reads the
+        // pre-change mode, so the row's label briefly shows "(auto)". Post a
+        // notification from the completion handler — captured `self` would have
+        // to cross the Sendable closure boundary, which `@MainActor` PRMCamera
+        // can't safely do. NotificationCenter is the clean bridge: the observer
+        // is installed in `installObservers()` and routes to `refreshState` on
+        // MainActor. We DON'T await the completion inline — continuous slider
+        // drags fire `setCustomExposure` 30+ times/sec, and awaiting each ~100 ms
+        // commit would serialize the actor into a multi-second stall.
+        await runOnDevice { device in
+            try? device.prm_setCustomExposure(duration: duration, iso: iso) { _ in
+                NotificationCenter.default.post(name: Self.deviceCommitNotification, object: nil)
+            }
+        }
         await refreshState()
     }
 
     public func setWhiteBalanceMode(_ mode: AVCaptureDevice.WhiteBalanceMode) async {
+        intendedWhiteBalanceMode = mode
+        if mode != .locked {
+            intendedWhiteBalanceTemperature = nil
+        }
         await runOnDevice { try? $0.prm_setWhiteBalanceMode(mode) }
         await refreshState()
     }
 
     public func lockWhiteBalance(_ values: AVCaptureDevice.PRMTemperatureAndTint) async {
-        await runOnDevice { try? $0.prm_lockWhiteBalance(values) }
+        intendedWhiteBalanceMode = .locked
+        intendedWhiteBalanceTemperature = values.temperature
+        // Same async-completion handling as `setCustomExposure` — see that doc.
+        // Refresh-via-notification keeps continuous Kelvin slider drags fluent
+        // while still landing the final "locked" Kelvin after the completion
+        // fires. The `intendedWhiteBalanceTemperature` override above keeps
+        // `state.whiteBalanceTemperature` pinned to the user's value during
+        // the commit window, so the slider doesn't snap back to the old
+        // auto-driven Kelvin after the user releases.
+        await runOnDevice { device in
+            try? device.prm_lockWhiteBalance(values) { _ in
+                NotificationCenter.default.post(name: Self.deviceCommitNotification, object: nil)
+            }
+        }
         await refreshState()
     }
 
     public func lockWhiteBalance(preset: AVCaptureDevice.PRMWhiteBalancePreset) async {
-        await runOnDevice { try? $0.prm_lockWhiteBalance(preset: preset) }
-        await refreshState()
+        await lockWhiteBalance(
+            AVCaptureDevice.PRMTemperatureAndTint(temperature: preset.temperature, tint: 0)
+        )
     }
 
     public func setFrameRate(_ fps: Float64, allowFormatChange: Bool = true) async {
@@ -237,6 +395,7 @@ public final class PRMCamera {
         at devicePoint: CGPoint,
         monitorSubjectAreaChange: Bool = false
     ) async {
+        intendedExposureMode = exposureMode
         await runOnDevice {
             try? $0.prm_setFocusAndExposure(
                 focusMode: focusMode,
@@ -270,16 +429,120 @@ public final class PRMCamera {
         await refreshState()
     }
 
-    /// Sets manual ISO at the current shutter speed.
+    /// Sets manual ISO and auto-updates shutter to preserve the auto-metered
+    /// light value (Tv/Av-priority style). When `autoExposureBaselineISO` and
+    /// `autoExposureBaselineDurationSeconds` are present (snapshotted while
+    /// the device was in continuous-auto, before the user entered custom),
+    /// the new duration is computed via classic reciprocity:
+    ///   `newDuration = baselineDuration × (baselineISO / newISO)`
+    /// so that `ISO × duration` (the light value, LV) stays at the
+    /// auto-metered product. If the computed duration falls outside the
+    /// active format's `[minExposureDuration, maxExposureDuration]` window,
+    /// it's clamped — and the user's requested ISO is also re-derived from
+    /// the clamped duration to preserve LV exactly. Without this dual-clamp
+    /// step, the slider would land at e.g. ISO 1667 + clamped duration 1/3s,
+    /// and the saved EV would silently drift from the metered target.
+    ///
+    /// If no baseline exists yet (cold launch with no auto frame), fall back
+    /// to `AVCaptureDevice.currentExposureDuration` — better than randomly
+    /// guessing.
+    /// User drags ISO → ISO is the **fixed** axis; duration is derived from
+    /// the LV target. Clamping ISO to the device range honors the user's
+    /// intent (the slider was set there); the derived duration also clamps
+    /// to the device's `[minExposureDuration, maxExposureDuration]`.
+    ///
+    /// Returns the user's exact ISO when in range, or the closest device-
+    /// supported ISO + the clamped reciprocal duration when out of range. LV
+    /// may drift only when the device envelope physically can't represent
+    /// the target product — the alternative would be to silently re-derive
+    /// the user's slider value to keep LV, which the user explicitly didn't
+    /// ask for.
     public func setISO(_ iso: Float) async {
-        await runOnDevice { try? $0.prm_setISO(iso) }
-        await refreshState()
+        guard let baselineISO = autoExposureBaselineISO,
+              let baselineDur = autoExposureBaselineDurationSeconds,
+              baselineISO > 0, iso > 0
+        else {
+            await setCustomExposure(duration: AVCaptureDevice.currentExposureDuration, iso: iso)
+            return
+        }
+        let targetLV = Double(baselineISO) * baselineDur
+        let (finalISO, finalDuration) = await Self.reciprocity(
+            fixedISO: iso,
+            fixedDurationSeconds: nil,
+            targetLV: targetLV,
+            session: session
+        )
+        let durationCM = CMTimeMakeWithSeconds(finalDuration, preferredTimescale: 1_000_000)
+        await setCustomExposure(duration: durationCM, iso: finalISO)
     }
 
-    /// Sets manual shutter speed (in seconds) at the current ISO.
+    /// User drags shutter → shutter is the **fixed** axis; ISO is derived
+    /// from the LV target. Same clamping rule as ``setISO(_:)``.
     public func setShutterSpeed(seconds: Double) async {
-        await runOnDevice { try? $0.prm_setShutterSpeed(seconds: seconds) }
-        await refreshState()
+        guard let baselineISO = autoExposureBaselineISO,
+              let baselineDur = autoExposureBaselineDurationSeconds,
+              baselineDur > 0, seconds > 0
+        else {
+            let durationCM = CMTimeMakeWithSeconds(seconds, preferredTimescale: 1_000_000)
+            await setCustomExposure(duration: durationCM, iso: AVCaptureDevice.currentISO)
+            return
+        }
+        let targetLV = Double(baselineISO) * baselineDur
+        let (finalISO, finalDuration) = await Self.reciprocity(
+            fixedISO: nil,
+            fixedDurationSeconds: seconds,
+            targetLV: targetLV,
+            session: session
+        )
+        let durationCM = CMTimeMakeWithSeconds(finalDuration, preferredTimescale: 1_000_000)
+        await setCustomExposure(duration: durationCM, iso: finalISO)
+    }
+
+    /// Compute `(iso, duration)` such that exactly one axis is honored as the
+    /// user's fixed input and the other is derived from `targetLV / fixed`.
+    /// Both axes are clamped to the active format's supported ranges. Exactly
+    /// one of `fixedISO` or `fixedDurationSeconds` must be non-nil.
+    ///
+    /// Why this can't be a two-pass clamp like the previous helper: when the
+    /// user explicitly drags the shutter slider, they expect that exact
+    /// shutter value to land — re-deriving shutter from a clamped ISO would
+    /// silently move the slider out from under them. So the fixed axis is
+    /// only clamped to the device range, never recomputed for LV.
+    private static func reciprocity(
+        fixedISO: Float?,
+        fixedDurationSeconds: Double?,
+        targetLV: Double,
+        session: PRMCameraSession
+    ) async -> (iso: Float, durationSeconds: Double) {
+        let bounds: (minISO: Float, maxISO: Float, minDur: Double, maxDur: Double)? =
+            await PRMCameraActor.shared.run {
+                guard let device = await session.videoDevice else { return nil }
+                let format = device.activeFormat
+                return (
+                    format.minISO,
+                    format.maxISO,
+                    CMTimeGetSeconds(format.minExposureDuration),
+                    CMTimeGetSeconds(format.maxExposureDuration)
+                )
+            }
+        let minISO = bounds?.minISO ?? 1
+        let maxISO = bounds?.maxISO ?? .greatestFiniteMagnitude
+        let minDur = bounds?.minDur ?? 0
+        let maxDur = bounds?.maxDur ?? .greatestFiniteMagnitude
+
+        if let userISO = fixedISO {
+            let iso = min(max(userISO, minISO), maxISO)
+            let derivedDur = iso > 0 ? targetLV / Double(iso) : maxDur
+            let duration = min(max(derivedDur, minDur), maxDur)
+            return (iso, duration)
+        }
+        if let userDuration = fixedDurationSeconds {
+            let duration = min(max(userDuration, minDur), maxDur)
+            let derivedISO = duration > 0 ? Float(targetLV / duration) : maxISO
+            let iso = min(max(derivedISO, minISO), maxISO)
+            return (iso, duration)
+        }
+        return (minISO, minDur)
     }
 
     /// Enables, disables, or restores auto for video HDR. `nil` returns to auto.
@@ -392,6 +655,83 @@ public final class PRMCamera {
         // the device, so a snapshot built from device state alone would always say false.
         var updated = snapshot
         updated.isInterrupted = state.isInterrupted
+
+        // Apply user-intent overrides for exposure mode and WB mode. These bridge
+        // the ~3 s window between the slider-driven AVFoundation setter call and
+        // its completion handler firing — without them, the 500 ms telemetry
+        // tick reads the stale mid-flight mode (`.continuousAutoExposure`) and
+        // the UI flips back to "(auto)" mid-drag. Clear the intent the moment
+        // the device has actually committed (mode matches) so future auto
+        // recovery via `setExposureMode(.continuousAuto)` works without lag.
+        if let intent = intendedExposureMode {
+            if updated.exposureMode == intent {
+                intendedExposureMode = nil
+            } else {
+                updated.exposureMode = intent
+            }
+        }
+        if let intent = intendedWhiteBalanceMode {
+            if updated.whiteBalanceMode == intent {
+                intendedWhiteBalanceMode = nil
+            } else {
+                updated.whiteBalanceMode = intent
+            }
+        }
+
+        // Pin ISO / shutter / WB Kelvin to the user-set values while the
+        // AVFoundation commit is in flight. Each axis clears its override
+        // independently the moment the device reports a value close enough to
+        // the intent (within 0.5 % for floating-point comparison), so the
+        // state snaps to the real device reading the instant AVF lands —
+        // without this convergence check the override would leak past the
+        // commit and the user couldn't drag the slider to a slightly different
+        // value (e.g. 800 → 801) because the override would keep painting 800.
+        if let intent = intendedISO {
+            if abs(updated.iso - intent) / max(intent, 1) < 0.005 {
+                intendedISO = nil
+            } else {
+                updated.iso = intent
+            }
+        }
+        if let intent = intendedExposureDurationSeconds {
+            if let actual = updated.exposureDurationSeconds,
+               actual > 0, abs(actual - intent) / intent < 0.05 {
+                intendedExposureDurationSeconds = nil
+            } else {
+                updated.exposureDurationSeconds = intent
+            }
+        }
+        if let intent = intendedWhiteBalanceTemperature {
+            if abs(updated.whiteBalanceTemperature - intent) / max(intent, 1) < 0.01 {
+                intendedWhiteBalanceTemperature = nil
+            } else {
+                updated.whiteBalanceTemperature = intent
+            }
+        }
+
+        // Snapshot the auto-exposure baseline whenever the device is settled in
+        // a continuous / auto exposure mode AND the user isn't actively driving
+        // any intent. The baseline is the reference point for `setISO` and
+        // `setShutterSpeed`'s reciprocity math (Tv/Av-priority): when the user
+        // drags one axis, the other is recomputed from this baseline so the
+        // overall light value the auto path was metering is preserved. The
+        // intent-null guard is important — without it, an in-flight custom
+        // commit's transient `.continuousAuto` reads would update the baseline
+        // mid-drag and the next axis change would compensate against the
+        // wrong reference.
+        let isAutoExposure = updated.exposureMode == .continuousAutoExposure
+            || updated.exposureMode == .autoExpose
+        let noActiveIntent = intendedExposureMode == nil
+            && intendedISO == nil
+            && intendedExposureDurationSeconds == nil
+        if isAutoExposure, noActiveIntent,
+           updated.iso > 0,
+           let durationSeconds = updated.exposureDurationSeconds,
+           durationSeconds > 0 {
+            autoExposureBaselineISO = updated.iso
+            autoExposureBaselineDurationSeconds = durationSeconds
+        }
+
         state = updated
         for continuation in stateContinuations.values {
             continuation.yield(state)
@@ -448,6 +788,21 @@ public final class PRMCamera {
             }
         }
         keyValueObservations.append(runningObservation)
+
+        // Route `setExposureModeCustom` / `setWhiteBalanceModeLocked` completion-handler
+        // posts to `refreshState`. The completion handler can't capture `self` (it
+        // crosses the @Sendable boundary from a non-Sendable @MainActor class), so the
+        // device-completion paths post to NotificationCenter and we observe here.
+        let commitObserver = NotificationCenter.default.addObserver(
+            forName: Self.deviceCommitNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                await self?.refreshState()
+            }
+        }
+        notificationObservers.append(commitObserver)
 
         let runtimeErrorObserver = NotificationCenter.default.addObserver(
             forName: AVCaptureSession.runtimeErrorNotification,

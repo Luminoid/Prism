@@ -87,13 +87,28 @@ final class DepthInspectorViewController: UIViewController {
         // tracks the color tile. Equal heights (was 0.45 / 0.40 — slightly uneven) keep
         // the rotated portrait frames the same physical size, so a point in the color
         // preview lines up vertically with the same point in the depth preview.
+        // Lay out from BOTTOM up so the toolbar + status block always fit. Top-down
+        // layout with `colorPreview.height = view.height * 0.42` + `depthPreview.height =
+        // colorPreview.height` + status + toolbar overflowed the bottom safe area on
+        // shorter devices (depth tile got clipped 20-40 pt). Bottom-up: toolbar pins to
+        // safeArea.bottom, status pins above toolbar, color + depth share the remaining
+        // top region equally.
+        toolbar.axis = .vertical
+        toolbar.spacing = 12
+        view.addSubview(toolbar)
+
+        statusLabel.text = "Checking depth support…"
+        statusLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        statusLabel.textColor = .white
+        statusLabel.numberOfLines = 0
+        view.addSubview(statusLabel)
+
         view.addSubview(colorPreview)
         colorPreview.rotation = .rotate90
         colorPreview.contentFit = .fit
         colorPreview.snp.makeConstraints {
             $0.top.equalTo(view.safeAreaLayoutGuide)
             $0.leading.trailing.equalToSuperview()
-            $0.height.equalToSuperview().multipliedBy(0.42)
         }
         addLabel("COLOR", on: colorPreview)
 
@@ -104,17 +119,15 @@ final class DepthInspectorViewController: UIViewController {
             $0.top.equalTo(colorPreview.snp.bottom)
             $0.leading.trailing.equalToSuperview()
             $0.height.equalTo(colorPreview)
+            // Anchor depth's bottom to the status label's top so the two previews share
+            // whatever vertical room is left after the toolbar + status block reserve
+            // their height. No more clipping on shorter devices.
+            $0.bottom.equalTo(statusLabel.snp.top).offset(-12)
         }
         addLabel("DEPTH", on: depthPreview)
 
-        // Bottom control bar.
-        statusLabel.text = "Checking depth support…"
-        statusLabel.font = .systemFont(ofSize: 13, weight: .medium)
-        statusLabel.textColor = .white
-        statusLabel.numberOfLines = 0
-        view.addSubview(statusLabel)
         statusLabel.snp.makeConstraints {
-            $0.top.equalTo(depthPreview.snp.bottom).offset(12)
+            $0.bottom.equalTo(toolbar.snp.top).offset(-12)
             $0.leading.equalToSuperview().offset(16)
             $0.trailing.equalToSuperview().offset(-16)
         }
@@ -126,6 +139,13 @@ final class DepthInspectorViewController: UIViewController {
         enabledRow.axis = .horizontal
         enabledRow.alignment = .center
         enabledRow.distribution = .equalSpacing
+        // Default ON: bootCamera() attaches the live depth output unconditionally when
+        // the device supports depth, so the depth tile is painting from the first frame.
+        // Starting the switch OFF made the toggle look broken — flipping it to ON had
+        // no visible effect because the preview was already active. Mirror reality: ON
+        // by default, flip OFF to mask the tile via alpha (delegate keeps publishing,
+        // we just gate at the view layer for a fast, allocation-free hide).
+        enabledSwitch.isOn = true
         enabledSwitch.addAction(UIAction { [weak self] _ in self?.toggleDepthEnabled() }, for: .valueChanged)
 
         filteringLabel.text = "Temporal smoothing (PRMDepthCapture.setFiltering)"
@@ -135,19 +155,17 @@ final class DepthInspectorViewController: UIViewController {
         filteringRow.axis = .horizontal
         filteringRow.alignment = .center
         filteringRow.distribution = .equalSpacing
-        filteringSwitch.isOn = true
+        // Default OFF so the user can compare raw depth jitter vs smoothed on demand —
+        // smoothing is a quality-of-life knob, not the default state of the API.
+        filteringSwitch.isOn = false
         filteringSwitch.addAction(UIAction { [weak self] _ in self?.toggleFiltering() }, for: .valueChanged)
 
-        toolbar.axis = .vertical
-        toolbar.spacing = 12
         toolbar.addArrangedSubview(enabledRow)
         toolbar.addArrangedSubview(filteringRow)
-        view.addSubview(toolbar)
         toolbar.snp.makeConstraints {
-            $0.top.equalTo(statusLabel.snp.bottom).offset(16)
             $0.leading.equalToSuperview().offset(16)
             $0.trailing.equalToSuperview().offset(-16)
-            $0.bottom.lessThanOrEqualTo(view.safeAreaLayoutGuide).offset(-16)
+            $0.bottom.equalTo(view.safeAreaLayoutGuide).offset(-16)
         }
     }
 
@@ -208,16 +226,26 @@ final class DepthInspectorViewController: UIViewController {
         await PRMCameraActor.shared.run { [self] in
             guard let photoOutput = await camera.session.photoOutput else { return }
             let supported = PRMDepthCapture.isSupported(on: photoOutput)
-            let enabled = PRMDepthCapture.isEnabled(on: photoOutput)
             await MainActor.run {
-                self.enabledSwitch.isOn = enabled
+                // Switch reflects the live-preview gate, NOT
+                // `AVCapturePhotoOutput.isDepthDataDeliveryEnabled` (which is photo-side
+                // and starts false until a capture requests depth). The live tile is
+                // painting from the first depth frame, so default the switch ON when
+                // depth is supported. Off means "stop painting depth on screen."
+                self.enabledSwitch.isOn = supported
                 self.enabledSwitch.isEnabled = supported
                 self.filteringSwitch.isEnabled = supported
+                self.depthPreview.alpha = supported ? 1.0 : 0.0
+                self.depthDelegate.isDeliveryEnabled = supported
                 self.statusLabel.text = supported
-                    ? "Depth supported. Toggle delivery + filtering to see live depth map."
+                    ? "Live depth preview on. Toggle smoothing to compare jitter."
                     : "This device's camera does not deliver depth data (no dual/triple/TrueDepth camera)."
             }
             guard supported else { return }
+            // Also flip the photo-output delivery on so a subsequent depth-aware
+            // capture would land — keeps the toggle's name ("Live depth preview")
+            // semantically aligned with both surfaces.
+            PRMDepthCapture.setEnabled(true, on: photoOutput)
             // Attach a live depth output so PRMPreviewView can render depth frames.
             if let session = await camera.session.session as AVCaptureSession?,
                let output = PRMDepthCapture.addDepthDataOutput(
@@ -225,7 +253,7 @@ final class DepthInspectorViewController: UIViewController {
                    delegate: depthDelegate,
                    queue: depthQueue
                ) {
-                PRMDepthCapture.setFiltering(true, on: output)
+                PRMDepthCapture.setFiltering(false, on: output)
                 await MainActor.run { self.depthOutput = output }
             }
         }

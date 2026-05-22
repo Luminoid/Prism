@@ -528,12 +528,20 @@ final class StudioViewController: UIViewController {
 
         do {
             var config = PRMCameraConfiguration()
-            // Start in Live-Photo-capable mode (no movie file output). `applyModeChange()`
-            // dynamically attaches `AVCaptureMovieFileOutput` when the user enters
-            // Video / Slo-Mo, and detaches it on return. Live Photo + Movie output are
-            // mutually exclusive on the same session — see PRMCameraSession.setMovieFileOutputAttached.
+            // Start in Live-Photo-capable session shape (no movie file output) but with
+            // Live Photo capture itself OFF. `applyModeChange()` flips Live Photo on when
+            // the user enters Live mode and back off elsewhere. Reason: the initial mode
+            // is `.photo` (not `.live`), and Live Photo capability is incompatible with
+            // manual exposure / WB lock — the photo output requires the sensor in a
+            // continuous-auto pipeline to retroactively bracket the Live Photo movie, so
+            // `device.exposureMode = .custom` and WB lock silently revert within a frame
+            // or two. AVCamManual (Apple's manual-controls sample) deliberately never
+            // enables Live Photo for the same reason. `setLivePhotoCaptureEnabled` (which
+            // we call on every mode change) is the runtime knob; leaving Live Photo off
+            // at configure time means the cold-start ISO / shutter / WB sliders work
+            // immediately without waiting for the first mode toggle.
             config.includesMovieFileOutput = false
-            config.enableLivePhoto = true
+            config.enableLivePhoto = false
             config.enableDepthDataDelivery = true
             config.enablePortraitEffectsMatteDelivery = true
             // Auto-deferred photo delivery conflicts with depth/matte on iPhone Pro
@@ -544,6 +552,24 @@ final class StudioViewController: UIViewController {
             // delivery in this example so portrait actually produces depth — apps
             // that don't need depth can opt back in via `PRMCameraConfiguration`.
             config.enableAutoDeferredPhotoDelivery = false
+            // Responsive Capture and Zero Shutter Lag both fight manual
+            // exposure on iPhone 14 Pro+: ZSL maintains a ring buffer of
+            // pre-shutter frames that AVFoundation pre-stabilizes via Smart
+            // HDR / Deep Fusion (so the photo at shutter time draws from a
+            // fused, multi-exposure pre-capture), and Responsive Capture
+            // overlaps frame processing so the in-flight frame at shutter time
+            // may belong to a *prior* auto-exposure pipeline state even after
+            // the user committed manual. Per WWDC23 session 10105, ZSL is
+            // documented to auto-disable for manual exposure — but the auto-
+            // disable only kicks in once `device.exposureMode == .custom` has
+            // committed on the *device*, which has a ~3 s lag (dev-forum
+            // 751112). For a Studio-style app the user pays nothing for going
+            // without ZSL / Responsive (the manual-shutter cadence is the
+            // bottleneck, not pipeline latency) and gets reliably-honored
+            // manual exposure in return. AVCamManual disables both for the
+            // same reason.
+            config.enableResponsiveCapture = false
+            config.enableZeroShutterLag = false
             try await camera.configure(config)
         } catch {
             PRMLogger.session.error("Camera configure failed: \(String(describing: error), privacy: .public)")
@@ -1079,6 +1105,87 @@ final class StudioViewController: UIViewController {
         }
     }
 
+    // MARK: - Manual-mode device switching
+
+    /// Device type Studio was on before the user first touched a manual slider.
+    /// Restored once *both* exposure and WB return to auto, so the lens chip
+    /// strip and multi-lens optical zoom come back. `nil` while we're either on
+    /// the default virtual device (no switch happened yet) or already committed
+    /// to wide for manual.
+    private var preManualDeviceType: AVCaptureDevice.DeviceType?
+
+    /// Switch to the physical `.builtInWideAngleCamera` before applying any
+    /// manual exposure / WB lock, if we're currently on a virtual multi-camera
+    /// device (`.builtInTripleCamera` / `.builtInDualCamera` /
+    /// `.builtInDualWideCamera`). Virtual devices compose frames across
+    /// multiple constituent physical cameras; per Apple's white-balance docs,
+    /// "exposure duration, ISO, aperture, white balance gains, or lens
+    /// position may change when the device switches from one camera to the
+    /// other," and `isLockingWhiteBalanceWithCustomDeviceGainsSupported` /
+    /// `setExposureModeCustom` can be silently rejected on the virtual device
+    /// while the constituent auto-AE / auto-AWB systems keep re-asserting.
+    /// User-visible symptom on iPhone 15 Pro Max: WB slider drag doesn't
+    /// change preview color, ISO / shutter sliders update labels but the
+    /// saved photo's EXIF shows continuous-auto values.
+    ///
+    /// On the wide camera (a physical AVCaptureDevice with no constituents),
+    /// `setExposureModeCustom` and `setWhiteBalanceModeLocked` land
+    /// immediately and stick. Called from every manual slider's
+    /// `.valueChanged` handler — idempotent (no-op when already on wide).
+    private func ensureWideCameraForManual() async {
+        guard let current = camera.device else { return }
+        let virtualDeviceTypes: Set<AVCaptureDevice.DeviceType> = [
+            .builtInTripleCamera, .builtInDualCamera, .builtInDualWideCamera,
+        ]
+        guard virtualDeviceTypes.contains(current.deviceType) else { return }
+        preManualDeviceType = current.deviceType
+        do {
+            pipeline.isEnabled = false
+            try await camera.switchDevice(
+                type: .builtInWideAngleCamera,
+                position: current.position
+            )
+            await applyConnectionRotation(90)
+            pipeline.isEnabled = true
+            rebuildLensStrip()
+            await rebindRotationCoordinator()
+        } catch {
+            pipeline.isEnabled = true
+            preManualDeviceType = nil
+            PRMLogger.session.error(
+                "Failed to switch to wide for manual mode: \(String(describing: error), privacy: .public)"
+            )
+        }
+    }
+
+    /// Inverse of `ensureWideCameraForManual`: restore the virtual device we
+    /// were on before any manual slider was touched, but only if both exposure
+    /// and WB are now back in auto modes. Idempotent.
+    private func restoreVirtualCameraIfFullyAuto() async {
+        guard let priorType = preManualDeviceType else { return }
+        let state = camera.state
+        let exposureIsAuto = state.exposureMode == .continuousAutoExposure
+            || state.exposureMode == .autoExpose
+        let wbIsAuto = state.whiteBalanceMode == .continuousAutoWhiteBalance
+            || state.whiteBalanceMode == .autoWhiteBalance
+        guard exposureIsAuto, wbIsAuto else { return }
+        preManualDeviceType = nil
+        let position = camera.device?.position ?? .back
+        do {
+            pipeline.isEnabled = false
+            try await camera.switchDevice(type: priorType, position: position)
+            await applyConnectionRotation(90)
+            pipeline.isEnabled = true
+            rebuildLensStrip()
+            await rebindRotationCoordinator()
+        } catch {
+            pipeline.isEnabled = true
+            PRMLogger.session.error(
+                "Failed to restore virtual camera from manual: \(String(describing: error), privacy: .public)"
+            )
+        }
+    }
+
     /// Updates the AUTO chip's label in the Night variant row to show the resolved
     /// duration (e.g. `AUTO 3s`). Re-evaluated each telemetry tick so the
     /// recommendation tracks light level. No-op outside Night mode.
@@ -1165,6 +1272,14 @@ final class StudioViewController: UIViewController {
             .autoRedEyeReduction(autoRedEyeReductionEnabled)
         if capMaxDimensions, let output = photoCapture?.output {
             settings = settings.maxDimensions(output.maxPhotoDimensions)
+        }
+        // Inject the user's manual ISO/shutter intent so PRMPhotoCapture can
+        // patch the saved photo's EXIF. PRMCamera's snapshot reflects the
+        // slider value (intent) rather than the lagging device read — fixes
+        // the saved photo showing auto-AE values even when the live preview
+        // and labels show the user's manual settings.
+        if let snapshot = camera.currentManualExposureSnapshot {
+            settings = settings.manualExposureOverride(iso: snapshot.iso, duration: snapshot.duration)
         }
         return settings
     }
@@ -1372,6 +1487,7 @@ final class StudioViewController: UIViewController {
         }
         return PRMImage.jpegDataPreservingMetadata(
             from: translated,
+            sourceExtent: translated.extent,
             originalProperties: properties,
             context: renderContext
         ) ?? data
@@ -1755,10 +1871,16 @@ extension StudioViewController {
                 Task { await self.camera.setExposureMode(.locked) }
             case 1:
                 row?.valueText = "auto"
-                Task { await self.camera.setExposureMode(.autoExpose) }
+                Task {
+                    await self.camera.setExposureMode(.autoExpose)
+                    await self.restoreVirtualCameraIfFullyAuto()
+                }
             case 2:
                 row?.valueText = "continuous"
-                Task { await self.camera.setExposureMode(.continuousAutoExposure) }
+                Task {
+                    await self.camera.setExposureMode(.continuousAutoExposure)
+                    await self.restoreVirtualCameraIfFullyAuto()
+                }
             case 3:
                 // `.custom` requires a (duration, iso) pair. Don't apply it from a bare
                 // segment tap — the API call would no-op. Roll the segmented back to the
@@ -1819,7 +1941,10 @@ extension StudioViewController {
             case 1: mode = .autoWhiteBalance; row?.valueText = "auto"
             default: mode = .continuousAutoWhiteBalance; row?.valueText = "continuous"
             }
-            Task { await self.camera.setWhiteBalanceMode(mode) }
+            Task {
+                await self.camera.setWhiteBalanceMode(mode)
+                await self.restoreVirtualCameraIfFullyAuto()
+            }
         }, for: .valueChanged)
         wbModeSegmented = segmented
         return row
@@ -2021,7 +2146,10 @@ extension StudioViewController {
         autoChip.onTap = { [weak self, weak row] in
             guard let self else { return }
             row?.valueText = "auto"
-            Task { await self.camera.setExposureMode(.continuousAutoExposure) }
+            Task {
+                await self.camera.setExposureMode(.continuousAutoExposure)
+                await self.restoreVirtualCameraIfFullyAuto()
+            }
         }
         slider.addAction(UIAction { [weak self, weak row] _ in
             guard let self, !isApplyingExternalUpdate else { return }
@@ -2032,7 +2160,10 @@ extension StudioViewController {
             // segmented (Custom segment). Also reset the Custom Exposure preset to "—"
             // since the user is now driving a free-form value, not one of the presets.
             customExposureSegmented?.selectedSegmentIndex = UISegmentedControl.noSegment
-            Task { await self.camera.setISO(iso) }
+            Task {
+                await self.ensureWideCameraForManual()
+                await self.camera.setISO(iso)
+            }
         }, for: .valueChanged)
         isoRow = row
         isoSlider = slider
@@ -2062,7 +2193,10 @@ extension StudioViewController {
             let seconds = shutterStops[index]
             row?.valueText = Self.formatShutter(seconds)
             customExposureSegmented?.selectedSegmentIndex = UISegmentedControl.noSegment
-            Task { await self.camera.setShutterSpeed(seconds: seconds) }
+            Task {
+                await self.ensureWideCameraForManual()
+                await self.camera.setShutterSpeed(seconds: seconds)
+            }
         }, for: .valueChanged)
         shutterRow = row
         shutterSlider = slider
@@ -2122,7 +2256,10 @@ extension StudioViewController {
                 isApplyingExternalUpdate = false
                 // `lockWhiteBalance` flips the device into `.locked` mode under the hood —
                 // the next state-stream tick will sync the WB Mode segmented to "Locked".
-                Task { await self.camera.lockWhiteBalance(preset: entry.preset) }
+                Task {
+                    await self.ensureWideCameraForManual()
+                    await self.camera.lockWhiteBalance(preset: entry.preset)
+                }
             }
             chips.addArrangedSubview(chip)
         }
@@ -2131,7 +2268,10 @@ extension StudioViewController {
             let kelvin = kelvinSlider.value
             row?.valueText = "\(Int(kelvin))K"
             let values = AVCaptureDevice.PRMTemperatureAndTint(temperature: kelvin, tint: 0)
-            Task { await self.camera.lockWhiteBalance(values) }
+            Task {
+                await self.ensureWideCameraForManual()
+                await self.camera.lockWhiteBalance(values)
+            }
         }, for: .valueChanged)
         stack.addArrangedSubview(kelvinSlider)
         stack.addArrangedSubview(chips)

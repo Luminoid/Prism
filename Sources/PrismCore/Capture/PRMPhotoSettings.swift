@@ -44,6 +44,20 @@ public struct PRMPhotoSettings: Sendable {
     /// alongside the still image (used by depth-based bokeh).
     public var portraitEffectsMatte: Bool?
 
+    /// User-intended ISO + exposure duration to bake into the captured
+    /// photo's EXIF (ExposureTime, ISOSpeedRatings, ShutterSpeedValue). When
+    /// non-nil, ``PRMPhotoCapture`` will patch the saved photo's metadata
+    /// with these values via `AVCapturePhotoFileDataRepresentationCustomizer`
+    /// — closing the race where `device.iso` / `device.exposureDuration`
+    /// still report stale auto values at the moment the capture pipeline
+    /// fires (Apple dev-forum 120427).
+    ///
+    /// Studio populates this from `PRMCamera.currentManualExposureSnapshot`
+    /// which reflects the user's intent rather than the device's lagging
+    /// reads, so even when the AVF commit hasn't fully landed yet the saved
+    /// photo's EXIF still shows the slider values.
+    public var manualExposureOverride: (iso: Float, duration: CMTime)?
+
     public init() {}
 
     // MARK: - Builder
@@ -108,12 +122,42 @@ public struct PRMPhotoSettings: Sendable {
         return copy
     }
 
+    /// See ``manualExposureOverride``.
+    public func manualExposureOverride(iso: Float, duration: CMTime) -> Self {
+        var copy = self
+        copy.manualExposureOverride = (iso, duration)
+        return copy
+    }
+
     // MARK: - Materialize
 
-    /// Builds an `AVCapturePhotoSettings` instance from this configuration.
+    /// Builds an `AVCapturePhotoSettings` instance from this configuration. Use the
+    /// `output`-taking overload below whenever a `PRMPhotoCapture` is available — it
+    /// validates the codec against the output's `availablePhotoCodecTypes` so HEVC
+    /// requests on devices without an HEVC encoder fall back to JPEG instead of
+    /// throwing `NSInvalidArgumentException`.
     public func makeAVSettings() -> AVCapturePhotoSettings {
-        let settings = if let codec {
-            AVCapturePhotoSettings(format: [AVVideoCodecKey: codec])
+        makeAVSettings(supportedCodecs: nil)
+    }
+
+    /// Codec-validated variant. Pass the photo output the settings will run against;
+    /// the codec is validated against `output.availablePhotoCodecTypes` and dropped
+    /// (falls back to JPEG) when unsupported. AVFoundation otherwise throws
+    /// `NSInvalidArgumentException` from `capturePhotoWithSettings:` for unsupported
+    /// codecs — the simulator has no HEVC encoder, and some older devices return
+    /// `[.jpeg]` only.
+    public func makeAVSettings(for output: AVCapturePhotoOutput) -> AVCapturePhotoSettings {
+        makeAVSettings(supportedCodecs: output.availablePhotoCodecTypes)
+    }
+
+    private func makeAVSettings(supportedCodecs: [AVVideoCodecType]?) -> AVCapturePhotoSettings {
+        let effectiveCodec: AVVideoCodecType? = {
+            guard let codec else { return nil }
+            if let supportedCodecs, !supportedCodecs.contains(codec) { return nil }
+            return codec
+        }()
+        let settings = if let effectiveCodec {
+            AVCapturePhotoSettings(format: [AVVideoCodecKey: effectiveCodec])
         } else {
             AVCapturePhotoSettings()
         }

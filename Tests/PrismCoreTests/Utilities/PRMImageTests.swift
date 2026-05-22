@@ -23,6 +23,7 @@ struct PRMImageTests {
         ]
         let data = PRMImage.jpegDataPreservingMetadata(
             from: image,
+            sourceExtent: image.extent,
             originalProperties: props,
             context: context
         )

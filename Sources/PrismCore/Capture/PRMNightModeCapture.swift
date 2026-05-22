@@ -123,6 +123,7 @@ public final class PRMNightModeCapture: @unchecked Sendable {
         let preservedProperties = first.properties.merging(lastPhoto.metadata) { _, new in new }
         guard let jpegData = PRMImage.jpegDataPreservingMetadata(
             from: accumulator,
+            sourceExtent: first.extent,
             originalProperties: preservedProperties,
             context: context
         ) else {

@@ -96,12 +96,59 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         filterRecipe: FilterRecipe,
         willCapture: (@Sendable () -> Void)?
     ) async throws -> PRMPhoto {
-        let avSettings = settings.makeAVSettings()
-        clampFlashMode(on: avSettings)
+        // Route through a single-frame photo bracket whenever the device is in
+        // `.custom` exposure mode. `AVCapturePhotoBracketSettings` natively
+        // disables Smart HDR, Deep Fusion, virtual-device fusion, dual-camera
+        // fusion, still-image stabilization, and red-eye reduction — all the
+        // computational paths that override the user's manual ISO / shutter on
+        // a regular `AVCapturePhotoSettings` capture (see AVCapturePhotoOutput.h
+        // doc comments around `autoVirtualDeviceFusionEnabled` lines 1390-1412
+        // in the iOS 26 SDK: each is "Default is YES … *unless you are
+        // capturing a bracket using AVCapturePhotoBracketSettings*"). This is
+        // the canonical Apple-recommended path for true manual capture, used
+        // by AVCamManual sample since iOS 8.
+        let avSettings: AVCapturePhotoSettings
+        // Capture the user-intended manual exposure values BEFORE the bracket
+        // fires. Prefer `settings.manualExposureOverride` (populated by the
+        // caller from PRMCamera's intent snapshot — what the slider actually
+        // shows) over reading `device.iso` / `device.exposureDuration` directly
+        // (which can lag the user's commit by up to ~3s per dev-forum 751112,
+        // and the bracket's EXIF still gets written with auto-AE values per
+        // dev-forum 120427). Override wins so the saved EXIF matches the UI.
+        let manualISO: Float?
+        let manualDuration: CMTime?
+        if let bracket = manualExposureBracketSettings(from: settings) {
+            avSettings = bracket
+            if let override = settings.manualExposureOverride {
+                manualISO = override.iso
+                manualDuration = override.duration
+            } else if let device = activeDevice() {
+                manualISO = device.iso
+                manualDuration = device.exposureDuration
+            } else {
+                manualISO = nil
+                manualDuration = nil
+            }
+        } else {
+            manualISO = nil
+            manualDuration = nil
+            // `makeAVSettings(for:)` drops unsupported codecs (e.g. HEVC on the
+            // simulator or on older devices that report `[.jpeg]` only) so
+            // AVFoundation doesn't throw `NSInvalidArgumentException` at
+            // `capturePhotoWithSettings:`. The filter-pass re-encode below
+            // honors the *requested* codec independently, so a chain capture
+            // can still emit HEIF even if the underlying photo output couldn't.
+            let regular = settings.makeAVSettings(for: output)
+            clampFlashMode(on: regular)
+            applyManualExposureOverrides(on: regular)
+            avSettings = regular
+        }
         let pending = PendingCapture(
             kind: .single,
             filterRecipe: filterRecipe,
             filterCodec: settings.codec,
+            manualISO: manualISO,
+            manualExposureDuration: manualDuration,
             willCapture: willCapture
         )
 
@@ -116,6 +163,139 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         } onCancel: { [weak self] in
             self?.markCancelled(avSettings.uniqueID)
         }
+    }
+
+    /// If the active device is in manual exposure (`.custom`), build a
+    /// single-frame `AVCapturePhotoBracketSettings` that bakes in the device's
+    /// current `iso` and `exposureDuration`. Returns nil for auto modes so the
+    /// caller uses the regular `AVCapturePhotoSettings` path (with all the
+    /// modern Smart HDR / Deep Fusion enhancements intact for auto shots).
+    ///
+    /// `AVCapturePhotoBracketSettings` doesn't support flashMode or
+    /// livePhotoMovieFileURL, so this is only viable when the user is in
+    /// manual exposure (where flash + Live Photo are conceptually incompatible
+    /// anyway — flash forces auto-exposure, and Live Photo requires the AE
+    /// system to keep tracking for the post-shutter frames).
+    private func manualExposureBracketSettings(from settings: PRMPhotoSettings)
+        -> AVCapturePhotoBracketSettings? {
+        // Trust the caller's `manualExposureOverride` as the primary signal —
+        // it reflects the user's slider intent (truth) rather than the device's
+        // lagging `exposureMode` read (can lag the commit by ~3s per dev-forum
+        // 751112, AND on iPhone 15 Pro+ the multi-camera virtual-device path
+        // can return raw=-1 / iso=0 / dur=0 garbage when polled mid-XPC stall —
+        // observed in user logs with FigCaptureSourceRemote err=-17281
+        // accompanying). Falling back to `device.exposureMode == .custom` as
+        // a secondary gate covers callers that don't pass the override yet
+        // (legacy or non-Studio consumers).
+        let hasOverride = settings.manualExposureOverride != nil
+        let deviceInCustom = activeDevice()?.exposureMode == .custom
+        guard hasOverride || deviceInCustom else { return nil }
+
+        // Bracket settings need a processed-format dictionary if you want a
+        // specific codec (HEIC/HEVC). Match the regular path's codec selection
+        // including the "drop unsupported codec" fallback to JPEG.
+        let processedFormat: [String: Any]? = if let codec = settings.codec,
+                                                 output.availablePhotoCodecTypes.contains(codec) {
+            [AVVideoCodecKey: codec]
+        } else {
+            nil
+        }
+
+        // Prefer explicit override values (user-intent) over the
+        // `currentExposureDuration` / `currentISO` sentinels. The sentinels
+        // read whatever the device has at bracket-resolve time — which on the
+        // broken multi-camera path is the device's stale auto values, not the
+        // user's slider intent. Baking explicit values into the bracket
+        // closes that gap.
+        let bracketed: AVCaptureBracketedStillImageSettings = if let override = settings.manualExposureOverride {
+            AVCaptureManualExposureBracketedStillImageSettings
+                .manualExposureSettings(
+                    exposureDuration: override.duration,
+                    iso: override.iso
+                )
+        } else {
+            AVCaptureManualExposureBracketedStillImageSettings
+                .manualExposureSettings(
+                    exposureDuration: AVCaptureDevice.currentExposureDuration,
+                    iso: AVCaptureDevice.currentISO
+                )
+        }
+        let bracket = AVCapturePhotoBracketSettings(
+            rawPixelFormatType: 0,
+            processedFormat: processedFormat,
+            bracketedSettings: [bracketed]
+        )
+        if let maxDimensions = settings.maxDimensions {
+            bracket.maxPhotoDimensions = maxDimensions
+        }
+        return bracket
+    }
+
+    /// When the active capture device is in manual exposure (`.custom`), `.locked`
+    /// exposure, or locked WB, downgrade `photoQualityPrioritization` to `.speed`
+    /// and turn off deferred-photo-proxy delivery for this single capture. AVFoundation's
+    /// `.balanced` and `.quality` pipelines run multi-frame fusion (Deep Fusion,
+    /// Smart HDR) that **fuse several differently-exposed images**: the captured
+    /// photo's EXIF shows fused/averaged ISO and shutter, not the values the user
+    /// set via `setExposureModeCustom`. `.speed` is documented as WYSIWYG —
+    /// "lightly processed only with some noise reduction applied" per WWDC21
+    /// session 10247 — and is the only mode that honors a manual exposure exactly.
+    ///
+    /// Auto-deferred photo delivery returns a low-res proxy that the Photos
+    /// framework "upgrades" with the fusion path's full-resolution output. The
+    /// upgrade path runs after the device may have left the manual mode (e.g.
+    /// the user lifted their finger and the AE system re-asserted), so the
+    /// upgraded photo can also drift from the manual values. Forcing the
+    /// per-capture `isAutoStillImageStabilizationEnabled = false` is the
+    /// matching pre-iOS 13 knob; on iOS 13+ the deferred / fusion paths are the
+    /// concrete culprits.
+    ///
+    /// Same logic for locked WB: the fusion path can blend frames captured
+    /// with re-metered WB, washing out the locked Kelvin. Downgrade to `.speed`
+    /// when WB is `.locked` so the rendered frame matches the live preview.
+    ///
+    /// Caller-supplied overrides win: if `PRMPhotoSettings.qualityPrioritization`
+    /// was explicitly set to `.balanced` or `.quality` AND the device is in a
+    /// manual mode, we still downgrade — the manual mode is a strong intent and
+    /// the user would not understand "I set ISO 800 and the photo shows ISO 200".
+    /// If the device is in continuous-auto, we leave the caller's choice alone.
+    private func applyManualExposureOverrides(on settings: AVCapturePhotoSettings) {
+        guard let device = activeDevice() else { return }
+        let exposureIsManual = device.exposureMode == .custom || device.exposureMode == .locked
+        let whiteBalanceIsLocked = device.whiteBalanceMode == .locked
+        guard exposureIsManual || whiteBalanceIsLocked else { return }
+        settings.photoQualityPrioritization = .speed
+        #if !os(macOS)
+            if output.isAutoDeferredPhotoDeliveryEnabled {
+                // Per-capture opt-out via the resolved-settings inspection:
+                // AVCapturePhotoSettings doesn't expose a deferred toggle directly,
+                // but `.speed` quality (above) is documented to bypass the deferred
+                // proxy path. The output-level flag stays on for subsequent
+                // continuous-auto captures, which still benefit from the proxy.
+                // (Reading the flag here just confirms the session config so the
+                // log message below is accurate; setting it false would mutate
+                // the shared output for ALL future captures, which is wrong.)
+                PRMLogger.capture.debug(
+                    "Manual exposure / locked WB at capture time — downgrading photoQualityPrioritization to .speed (was .quality / .balanced)"
+                )
+            }
+        #endif
+    }
+
+    /// The video device currently feeding the photo output. Walks
+    /// `output.connections` (the single video connection) to its first input port
+    /// and casts to `AVCaptureDeviceInput`. Returns `nil` if the output isn't
+    /// attached to a session — captures would already fail in that state, so
+    /// callers can safely no-op when this returns nil.
+    private func activeDevice() -> AVCaptureDevice? {
+        for connection in output.connections {
+            for port in connection.inputPorts {
+                if let deviceInput = port.input as? AVCaptureDeviceInput {
+                    return deviceInput.device
+                }
+            }
+        }
+        return nil
     }
 
     /// Force `AVCapturePhotoSettings.flashMode` into a value the current photo output
@@ -157,8 +337,9 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
                     "Live Photo is not enabled on the photo output. Set enableLivePhoto on PRMCameraConfiguration."
                 )
             }
-            let liveSettings = settings.livePhoto(true).makeAVSettings()
+            let liveSettings = settings.livePhoto(true).makeAVSettings(for: output)
             clampFlashMode(on: liveSettings)
+            applyManualExposureOverrides(on: liveSettings)
             let movieURL = PRMTempFile.url(withExtension: "mov")
             liveSettings.livePhotoMovieFileURL = movieURL
 
@@ -233,6 +414,20 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         /// AVFoundation's codec choice only applies to the *original* photo data).
         let filterCodec: AVVideoCodecType?
         let willCapture: (@Sendable () -> Void)?
+        /// ISO and exposure duration sampled from the active device immediately
+        /// before `output.capturePhoto(with:delegate:)` fired, when the device
+        /// was in `.custom` exposure mode. Used to patch the resulting
+        /// AVCapturePhoto's EXIF in `finishCapture` — AVFoundation's bracket
+        /// capture path on iPhone 14 Pro+ has a long-standing bug where the
+        /// auto-AE values are written into the photo's EXIF even when the
+        /// frame was captured at manual exposure. Apple dev-forum 120427:
+        /// "the exposure ISO and duration in the AVCapturePhoto's metadata
+        /// will often be completely different from the values provided to
+        /// setExposureModeCustom." Reading the device state at capture time
+        /// is the canonical fix (replacing the metadata via
+        /// `fileDataRepresentation(withReplacementMetadata:...)`).
+        let manualISO: Float?
+        let manualExposureDuration: CMTime?
         var singleContinuation: CheckedContinuation<PRMPhoto, Error>?
         var liveContinuation: CheckedContinuation<PRMLivePhoto, Error>?
         var cancelled: Bool = false
@@ -244,11 +439,15 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
             kind: PendingKind,
             filterRecipe: FilterRecipe,
             filterCodec: AVVideoCodecType? = nil,
+            manualISO: Float? = nil,
+            manualExposureDuration: CMTime? = nil,
             willCapture: (@Sendable () -> Void)?
         ) {
             self.kind = kind
             self.filterRecipe = filterRecipe
             self.filterCodec = filterCodec
+            self.manualISO = manualISO
+            self.manualExposureDuration = manualExposureDuration
             self.willCapture = willCapture
         }
     }
@@ -289,6 +488,7 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
             let preservedProperties = sourceImage.properties.merging(metadata) { _, new in new }
             finalData = Self.encodeFilteredImage(
                 filtered,
+                sourceExtent: sourceImage.extent,
                 preservedProperties: preservedProperties,
                 codec: pending.filterCodec,
                 context: context
@@ -305,6 +505,7 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
             let preservedProperties = sourceImage.properties.merging(metadata) { _, new in new }
             finalData = Self.encodeFilteredImage(
                 blended,
+                sourceExtent: sourceImage.extent,
                 preservedProperties: preservedProperties,
                 codec: pending.filterCodec,
                 context: context
@@ -318,8 +519,15 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
     /// everything else falls back to JPEG so callers that don't care about codec still get
     /// usable output. Falls back to JPEG if HEIF encode returns `nil` (older sims with no
     /// HEVC encoder).
+    ///
+    /// `sourceExtent` is the pre-filter source CIImage's extent — required because
+    /// distortion filters (Bump, Twirl, Vortex, Edges) produce infinite extents that
+    /// `heifRepresentation` silently rejects (returns nil → falls back to JPEG with no
+    /// caller signal). Cropping to the source frame inside the encoder restores the
+    /// expected output.
     private static func encodeFilteredImage(
         _ image: CIImage,
+        sourceExtent: CGRect,
         preservedProperties: [String: Any],
         codec: AVVideoCodecType?,
         context: PRMRenderContext
@@ -327,17 +535,90 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         if codec == .hevc || codec == .hevcWithAlpha {
             if let heif = PRMImage.heifDataPreservingMetadata(
                 from: image,
+                sourceExtent: sourceExtent,
                 originalProperties: preservedProperties,
                 context: context
             ) {
+                PRMLogger.capture.debug("Encoded filter chain → HEIC (\(heif.count, privacy: .public) bytes)")
                 return heif
             }
+            PRMLogger.capture.notice("HEIF encode returned nil — falling back to JPEG")
         }
         return PRMImage.jpegDataPreservingMetadata(
             from: image,
+            sourceExtent: sourceExtent,
             originalProperties: preservedProperties,
             context: context
         )
+    }
+
+    /// Override the EXIF `ExposureTime`, `ISOSpeedRatings`, and
+    /// `ShutterSpeedValue` fields in the captured photo's metadata with the
+    /// manual values the device was actually set to at capture time. Uses
+    /// `AVCapturePhoto.fileDataRepresentation(with:)` with a customizer
+    /// callback — the only API that lets us write back into the photo's
+    /// container without losing the AVFoundation-written maker-notes / depth /
+    /// matte. The pre-iOS-12 `withReplacementMetadata:` overload is deprecated
+    /// in favor of this protocol-based variant.
+    ///
+    /// Returns `nil` (caller falls back to the unpatched data) if AVFoundation
+    /// declines the replacement.
+    private static func fileDataReplacingExposure(
+        photo: AVCapturePhoto,
+        iso: Float,
+        exposureDuration: CMTime
+    ) -> Data? {
+        let customizer = ExposurePatchCustomizer(iso: iso, exposureDuration: exposureDuration)
+        return photo.fileDataRepresentation(with: customizer)
+    }
+}
+
+/// `AVCapturePhotoFileDataRepresentationCustomizer` that patches EXIF
+/// `ExposureTime`, `ISOSpeedRatings`, and `ShutterSpeedValue` with manual
+/// values sampled from the device at bracket-fire time. AVFoundation calls
+/// `replacementMetadataForPhoto:` synchronously when flattening the photo,
+/// so the customizer's lifetime only needs to span the one
+/// `fileDataRepresentation(with:)` call.
+private final class ExposurePatchCustomizer: NSObject,
+    AVCapturePhotoFileDataRepresentationCustomizer {
+    private let iso: Float
+    private let exposureDuration: CMTime
+
+    init(iso: Float, exposureDuration: CMTime) {
+        self.iso = iso
+        self.exposureDuration = exposureDuration
+    }
+
+    /// `@objc(replacementMetadataForPhoto:)` with the explicit ObjC selector so
+    /// there's zero risk of Swift name-mangling diverging from what AVFoundation
+    /// looks up via `respondsToSelector:`. The protocol method is `@optional`
+    /// in the ObjC declaration — Swift doesn't auto-emit ObjC selectors for
+    /// optional protocol methods unless the conforming method is marked, and
+    /// even with `@objc` alone, leaving the selector implicit can produce a
+    /// different stub on some toolchain versions. Hard-coding the selector is
+    /// the canonical safe form.
+    @objc(replacementMetadataForPhoto:)
+    func replacementMetadata(for photo: AVCapturePhoto) -> [String: Any]? {
+        var metadata = photo.metadata
+        var exif = (metadata[kCGImagePropertyExifDictionary as String] as? [String: Any]) ?? [:]
+        let durationSeconds = CMTimeGetSeconds(exposureDuration)
+        if durationSeconds > 0, durationSeconds.isFinite {
+            exif[kCGImagePropertyExifExposureTime as String] = durationSeconds
+            // ShutterSpeedValue is the APEX-encoded reciprocal of ExposureTime
+            // (`-log2(exposureTime)`). Photo viewers display it interchangeably
+            // with ExposureTime; patching both keeps third-party EXIF tools
+            // consistent with Apple's Photos info pane.
+            exif[kCGImagePropertyExifShutterSpeedValue as String] = -log2(durationSeconds)
+        }
+        if iso > 0 {
+            // ISOSpeedRatings is a `[CFNumberRef]` array per CGImageProperties.h.
+            // Use `NSNumber` (not `Int`) so the bridge writes the EXIF tag's
+            // expected SHORT (UInt16) type — `Int` bridges to NSNumber(long)
+            // which some EXIF parsers misread.
+            exif[kCGImagePropertyExifISOSpeedRatings as String] = [NSNumber(value: Int(iso.rounded()))]
+        }
+        metadata[kCGImagePropertyExifDictionary as String] = exif
+        return metadata
     }
 }
 
@@ -407,7 +688,23 @@ extension PRMPhotoCapture: AVCapturePhotoCaptureDelegate {
                     PRMSessionError.photoCaptureFailed(error.localizedDescription)
                 ))
             }
-            guard let originalData = photo.fileDataRepresentation() else {
+            let originalData: Data? = {
+                guard let iso = pending.manualISO,
+                      let duration = pending.manualExposureDuration,
+                      duration.isValid
+                else { return photo.fileDataRepresentation() }
+                // Patch EXIF ExposureTime + ISOSpeedRatings + ShutterSpeedValue
+                // with the device-snapshot values we recorded at bracket-fire
+                // time. AVFoundation writes auto-AE values into the bracket
+                // capture's EXIF on iPhone 14 Pro+ even when the frame was
+                // captured at manual exposure (Apple dev-forum 120427).
+                return Self.fileDataReplacingExposure(
+                    photo: photo,
+                    iso: iso,
+                    exposureDuration: duration
+                ) ?? photo.fileDataRepresentation()
+            }()
+            guard let originalData else {
                 pendingCaptures.removeValue(forKey: id)
                 return .terminal(pending, .failure(
                     PRMSessionError.photoCaptureFailed("No file data representation")

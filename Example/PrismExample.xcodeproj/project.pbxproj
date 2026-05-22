@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		0838F9FBA10453582A8B0D00 /* DepthInspectorViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A668D4255D7028246510B53E /* DepthInspectorViewController.swift */; };
 		168617B0DB22105D061CA978 /* ConfigurationLabViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 033F012A261FEFF4499FEB98 /* ConfigurationLabViewController.swift */; };
+		1A59AD5DB9DBEB0D72EB9BC0 /* SnapKit in Frameworks */ = {isa = PBXBuildFile; productRef = FC7913A55783E87E6169140C /* SnapKit */; };
 		2E271F3B4DF03489EF8BBB9C /* SceneDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7AFBED18985B4C42614023AD /* SceneDelegate.swift */; };
 		33670C16697D8621EE13129D /* PrismCore in Frameworks */ = {isa = PBXBuildFile; productRef = 5680A63FFF1B03FE637F1A01 /* PrismCore */; };
 		40258322CB68603979892393 /* RootCatalogViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1BFC379ED771940D5CB70AB /* RootCatalogViewController.swift */; };
@@ -39,6 +40,7 @@
 			files = (
 				33670C16697D8621EE13129D /* PrismCore in Frameworks */,
 				D81079311A19F1F0850894FD /* PrismUI in Frameworks */,
+				1A59AD5DB9DBEB0D72EB9BC0 /* SnapKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -103,6 +105,7 @@
 			packageProductDependencies = (
 				5680A63FFF1B03FE637F1A01 /* PrismCore */,
 				3C35934D9D337FA8B1F10B78 /* PrismUI */,
+				FC7913A55783E87E6169140C /* SnapKit */,
 			);
 			productName = PrismExample;
 			productReference = 486B33EDCCB72EDE25192E3F /* PrismExample.app */;
@@ -128,6 +131,7 @@
 			mainGroup = CBCA78E35E612ED93755C1D3;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
+				4CEB00C55783E014D19C8D71 /* XCRemoteSwiftPackageReference "SnapKit" */,
 				CDBD5315840276B35BD9819D /* XCLocalSwiftPackageReference ".." */,
 			);
 			projectDirPath = "";
@@ -344,6 +348,17 @@
 		};
 /* End XCLocalSwiftPackageReference section */
 
+/* Begin XCRemoteSwiftPackageReference section */
+		4CEB00C55783E014D19C8D71 /* XCRemoteSwiftPackageReference "SnapKit" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/SnapKit/SnapKit.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 5.7.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
 /* Begin XCSwiftPackageProductDependency section */
 		3C35934D9D337FA8B1F10B78 /* PrismUI */ = {
 			isa = XCSwiftPackageProductDependency;
@@ -352,6 +367,11 @@
 		5680A63FFF1B03FE637F1A01 /* PrismCore */ = {
 			isa = XCSwiftPackageProductDependency;
 			productName = PrismCore;
+		};
+		FC7913A55783E87E6169140C /* SnapKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 4CEB00C55783E014D19C8D71 /* XCRemoteSwiftPackageReference "SnapKit" */;
+			productName = SnapKit;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

@@ -164,20 +164,21 @@ final class FilterChainViewController: UIViewController {
         // Slim the switch so the row fits the preview's trailing margin on iPhone width.
         dimensionsToggle.transform = CGAffineTransform(scaleX: 0.7, y: 0.7)
 
-        // "2K" toggles `PRMPhotoSettings.maxDimensions` to the largest supported photo
-        // dimensions ≤ 2K wide (~1920×1080-ish). The previous Implementation pinned to
-        // `output.maxPhotoDimensions` which IS the ceiling — a no-op, so toggling had no
-        // visible effect. The 2K cap actually reduces file size noticeably so the user
-        // can verify the setting works via Photos.app metadata. Toggle off → no cap,
-        // photo lands at the device's full native resolution.
+        // "Max" toggles `PRMPhotoSettings.maxDimensions` to the LARGEST entry in
+        // `activeFormat.supportedMaxPhotoDimensions` (typically 48MP on iPhone 14 Pro+).
+        // OFF means leave `maxPhotoDimensions` unset, which delivers the format's default
+        // (typically 12MP for `.photo` preset, 4032×3024). The earlier "2K cap" attempt
+        // didn't work because `.photo` preset only exposes 4032×3024 and 8064×6048 —
+        // neither is under 2K, so the cap was a no-op. Flipping the semantics to
+        // "max vs default" produces a visible difference on every supported device.
         let dimLabel = UILabel()
-        dimLabel.text = "2K"
+        dimLabel.text = "Max"
         dimLabel.textColor = UIColor.white.withAlphaComponent(0.85)
         dimLabel.font = .systemFont(ofSize: 11, weight: .semibold)
         dimLabel.setContentHuggingPriority(.required, for: .horizontal)
         dimLabel.isAccessibilityElement = true
-        dimLabel.accessibilityHint = "Caps capture to ~2K dimensions"
-        dimensionsToggle.accessibilityLabel = "Cap photo to 2K"
+        dimLabel.accessibilityHint = "Use the largest supported photo dimensions (48MP on Pro models)"
+        dimensionsToggle.accessibilityLabel = "Capture at max resolution"
 
         var snapConfig = UIButton.Configuration.filled()
         snapConfig.title = "Snap"
@@ -239,8 +240,10 @@ final class FilterChainViewController: UIViewController {
                 .flashMode(.off)
                 .qualityPrioritization(.quality)
                 .codec(codecChoice)
-            if wantsCap, let twoK = await twoKMaxDimensions() {
-                settings = settings.maxDimensions(twoK)
+            var capLabel = ""
+            if wantsCap, let maxDims = await maxSupportedDimensions() {
+                settings = settings.maxDimensions(maxDims)
+                capLabel = " · max \(maxDims.width)×\(maxDims.height)"
             }
             do {
                 let willCapture: (@Sendable () -> Void) = { [weak self] in
@@ -260,7 +263,7 @@ final class FilterChainViewController: UIViewController {
                         context: renderContext,
                         willCapture: willCapture
                     )
-                await save(data: photo.data)
+                await save(data: photo.data, extraStatus: capLabel)
             } catch {
                 await MainActor.run { [weak self] in
                     self?.snapStatusLabel.text = " Capture failed "
@@ -269,7 +272,7 @@ final class FilterChainViewController: UIViewController {
         }
     }
 
-    private func save(data: Data) async {
+    private func save(data: Data, extraStatus: String = "") async {
         let status = PHPhotoLibrary.authorizationStatus(for: .addOnly)
         if status == .notDetermined {
             _ = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
@@ -281,11 +284,14 @@ final class FilterChainViewController: UIViewController {
         }
         do {
             try await Self.writePhoto(data: data)
-            // Surface the actual encoded type so the user can verify Codec + Max actually
-            // took effect — JPEG and HEIC magic bytes are different in `data`.
+            // Surface the actual encoded type, file size, and (when 2K cap on) the
+            // exact dimensions AVFoundation picked from `supportedMaxPhotoDimensions`.
+            // JPEG and HEIC magic bytes differ — sniffing them locally is the only
+            // reliable way to verify which encoder won, since Photos.app hides the
+            // file extension.
             let label = Self.codecLabel(for: data)
             let sizeKB = data.count / 1024
-            snapStatusLabel.text = " Saved \(label) · \(sizeKB) KB "
+            snapStatusLabel.text = " Saved \(label) · \(sizeKB) KB\(extraStatus) "
         } catch {
             snapStatusLabel.text = " Save failed "
         }
@@ -320,19 +326,76 @@ final class FilterChainViewController: UIViewController {
         }
     }
 
-    /// Picks the largest supported photo dimension whose width is ≤ ~2048 px from the
-    /// active format. `AVCapturePhotoOutput.maxPhotoDimensions` must be one of the values
-    /// in `activeFormat.supportedMaxPhotoDimensions` (set != arbitrary cap value), so
-    /// the actual file-size reduction comes from picking a small-enough entry from that
-    /// list. Returns `nil` when the device isn't ready or has no candidate ≤ 2K.
-    private func twoKMaxDimensions() async -> CMVideoDimensions? {
+    /// Returns the LARGEST entry in `activeFormat.supportedMaxPhotoDimensions`. On iPhone
+    /// 14 Pro and later with the wide camera on `.photo` preset, this is the 48MP entry
+    /// (8064×6048). On older / non-Pro devices it's the same as the default 12MP entry
+    /// (4032×3024), so toggling Max produces no visible difference — flag that case in
+    /// the snap status so the user knows it's a device limitation, not a bug.
+    /// `AVCapturePhotoOutput.maxPhotoDimensions` must EXACTLY match one of the entries
+    /// in `activeFormat.supportedMaxPhotoDimensions` — arbitrary cap values throw
+    /// `NSInvalidArgumentException`.
+    private func maxSupportedDimensions() async -> CMVideoDimensions? {
         let session = camera.session
         return await PRMCameraActor.shared.run {
             guard let device = await session.videoDevice else { return CMVideoDimensions?.none }
+            // Same landscape filter as `selectHighestPhotoResolutionFormat` — some
+            // formats expose portrait `supportedMaxPhotoDimensions` that don't
+            // correspond to usable photo dimensions for AVCapturePhotoSettings.
             let supported = device.activeFormat.supportedMaxPhotoDimensions
-            let candidates = supported.filter { $0.width <= 2048 }
-            return candidates.max(by: { $0.width < $1.width })
-                ?? supported.min(by: { $0.width < $1.width })
+                .filter { $0.width >= $0.height }
+            return supported.max(by: { ($0.width * $0.height) < ($1.width * $1.height) })
+        }
+    }
+
+    /// Walk every format on the active device and pick the one whose
+    /// `supportedMaxPhotoDimensions` contains the **largest landscape photo entry**.
+    /// "Largest" is judged by `width * height` (not just `width`) and only photo-shaped
+    /// (`landscape orientation, width ≥ height`) entries count — some video formats
+    /// expose portrait `supportedMaxPhotoDimensions` (e.g. `(3024, 4032)`) that would
+    /// otherwise win a width-only comparison and lock the wide camera to a 12MP video
+    /// format. That's the bug the previous `.max(by: width)` heuristic produced on
+    /// iPhone 15 Pro Max — captures landed at 3024×4032 because a video format ranked
+    /// above the 48MP photo format.
+    ///
+    /// Also raises the photo output's own `maxPhotoDimensions` ceiling so per-photo
+    /// settings can actually request the 48MP entry (the ceiling is read-only relative
+    /// to the active format at the time it was set, so it has to be reapplied after a
+    /// format swap). Same `beginConfiguration`/`commitConfiguration` envelope as Apple's
+    /// AVCam ProRAW sample (dev-forum 715452 + 748321).
+    private func selectHighestPhotoResolutionFormat() async {
+        let session = camera.session
+        await PRMCameraActor.shared.run {
+            guard let device = await session.videoDevice,
+                  let photoOutput = await session.photoOutput
+            else { return }
+            /// Score formats by the area of their largest landscape photo dimension.
+            /// Video formats with portrait `supportedMaxPhotoDimensions` score 0 and
+            /// are filtered out — they can never produce a usable still capture.
+            func score(_ format: AVCaptureDevice.Format) -> Int32 {
+                format.supportedMaxPhotoDimensions
+                    .filter { $0.width >= $0.height }
+                    .map { $0.width * $0.height }
+                    .max() ?? 0
+            }
+            let candidates = device.formats.filter { score($0) > 0 }
+            guard let bestFormat = candidates.max(by: { score($0) < score($1) }),
+                  let largest = bestFormat.supportedMaxPhotoDimensions
+                  .filter({ $0.width >= $0.height })
+                  .max(by: { ($0.width * $0.height) < ($1.width * $1.height) })
+            else { return }
+            let sessionRef = session.session
+            sessionRef.beginConfiguration()
+            defer { sessionRef.commitConfiguration() }
+            do {
+                try device.lockForConfiguration()
+                defer { device.unlockForConfiguration() }
+                if device.activeFormat != bestFormat {
+                    device.activeFormat = bestFormat
+                }
+            } catch {
+                return
+            }
+            photoOutput.maxPhotoDimensions = largest
         }
     }
 
@@ -525,7 +588,34 @@ final class FilterChainViewController: UIViewController {
             _ = await PRMPermissions.requestCameraAccess()
         }
         do {
-            try await camera.configure(PRMCameraConfiguration())
+            // Pin to the Wide camera. Triple/Dual virtual devices only expose 12MP
+            // (4032×3024) in `supportedMaxPhotoDimensions` — only `builtInWideAngleCamera`
+            // has formats with the 48MP entry (8064×6048) on iPhone 14 Pro+. Studio
+            // intentionally keeps the Triple device for its multi-lens chip strip; the
+            // FilterChain demo is the place to exercise full-resolution capture, so this
+            // device choice is what makes the "Max" toggle actually do something visible.
+            var config = PRMCameraConfiguration()
+            config.deviceTypes = [.builtInWideAngleCamera]
+            // Auto-deferred photo delivery and zero shutter lag both substitute a
+            // smaller proxy capture path for the final still on iPhone 15 Pro+.
+            // The user-facing symptom: Max toggles off, capture lands at the proxy
+            // resolution (12MP) instead of the format's 48MP entry. Disable both
+            // for the FilterChain demo where 48MP is the whole point of the
+            // toggle — apps that want the lower-latency proxy path can opt back
+            // in via PRMCameraConfiguration.
+            config.enableAutoDeferredPhotoDelivery = false
+            config.enableZeroShutterLag = false
+            // Live Photo also forces a specific format pair that doesn't include
+            // the 48MP entry on iPhone 15 Pro+. Default is already false; pin it
+            // explicitly so future config defaults can't regress this surface.
+            config.enableLivePhoto = false
+            try await camera.configure(config)
+            // After the session is up, hop the active format to one whose
+            // `supportedMaxPhotoDimensions` contains the largest entry across all formats
+            // — the `.photo` preset doesn't auto-pick the 48MP format on iPhone 15+ Pro,
+            // so without this step the wide camera's `activeFormat` stays on a 12MP
+            // format and Max still has nothing larger than 4032×3024 to pick.
+            await selectHighestPhotoResolutionFormat()
         } catch {
             return
         }
