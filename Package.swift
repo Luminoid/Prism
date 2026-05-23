@@ -6,7 +6,6 @@ let package = Package(
     name: "Prism",
     platforms: [
         .iOS(.v18),
-        .macCatalyst(.v18),
     ],
     products: [
         .library(name: "PrismCore", targets: ["PrismCore"]),

@@ -5,78 +5,108 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.1.0] - 2026-05-22
 
-### Added (full settings surface + new capture modes)
+Initial release. Camera pipeline Swift Package for iOS 18+, built on Swift 6.2 strict concurrency.
 
-- **PrismCore/Capture**: `PRMLivePhoto` (paired still + movie sidecar), `PRMPortraitPhoto` (still + depth + portrait effects matte), `PRMNightModeCapture` (multi-frame averaging long-exposure), burst helper `PRMPhotoCapture.captureBurst(count:)`
-- **PrismCore/Filter**: `PRMPortraitBokehFilter` (matte or depth-driven `CIDepthBlurEffect`)
-- **PrismCore/Device**: `AVCaptureDevice+ISO.swift` (`prm_setISO`, `prm_setShutterSpeed`, `prm_isoRange`, `prm_shutterSpeedRange`), `AVCaptureDevice+Lens.swift` (`prm_setFocusMode`, `prm_setLensPosition`, `prm_setLensPositionAsync`), `AVCaptureDevice+HDR.swift` (`prm_setVideoHDR`, `prm_setLowLightBoost`, `prm_isLowLightBoostActive`)
-- **PrismCore/Camera**: `PRMCamera` gains `setLensPosition(_:)`, `setISO(_:)`, `setShutterSpeed(seconds:)`, `setVideoHDR(_:)`, `setLowLightBoost(_:)`; `PRMCameraConfiguration` gains `enableLivePhoto`, `enableDepthDataDelivery`, `enablePortraitEffectsMatteDelivery`, `preferredVideoStabilizationMode`; `PRMCameraState` gains `lensPosition`, `isVideoHDREnabled`, `isLowLightBoostActive`; `PRMPhotoSettings` gains `livePhoto`, `portraitEffectsMatte`, `constantColorEnabled` builder methods
-- **PrismUI/Components**: `PRMSettingsDrawerView` (slide-in right-edge drawer with sectioned scroll), `PRMSettingsRow` (collapsible row with SF Symbol header, value label, and arbitrary content view)
-- **Example Studio**: full settings drawer wires every supported API (EV/ISO/shutter sliders, WB Kelvin slider + preset chips, manual focus lens-position slider, HDR auto/on/off, low-light boost, stabilization mode, codec); mode strip extends to PHOTO/LIVE/PORTRAIT/PANO/VIDEO/SLO-MO/NIGHT; top bar gains timer (3s/10s/off), burst toggle, and settings (`slider.horizontal.3`) chip
+### Targets
 
-### Notes
+- **PrismCore** (no UI dependency): Camera, Capture, Device extensions, Filter pipeline, Utilities.
+- **PrismUI** (depends on PrismCore, `defaultIsolation(MainActor)`): Metal preview view + UIKit camera components. Raw `NSLayoutConstraint` only, no SnapKit.
 
-- Panorama mode is wired into the UI but currently shows a "stitching not yet implemented" toast — frame accumulation + Vision stitching is a follow-up
-- Live Photo capture requires `enableLivePhoto = true` on `PRMCameraConfiguration`; portrait depth requires `enableDepthDataDelivery` + `enablePortraitEffectsMatteDelivery`
+### Camera (PrismCore/Camera)
 
-### Breaking redesign — full API rewrite
+- `PRMCameraActor` global actor serializing every `AVCaptureSession` mutation.
+- `PRMCameraSession` (`@PRMCameraActor`) owns the AVCaptureSession + outputs. Format-selection logic split into `PRMCameraSession+Format.swift` (48MP promotion, Live-Photo-compatible reconciliation, depth/matte format selection).
+- `PRMCamera` `@MainActor` facade with async/await mutations and `AsyncStream` event delivery: `stateStream()`, `errorStream()`, `interruptionStream()`. Observers wired in `PRMCamera+Observers.swift` (session.isRunning KVO, device-commit, runtime error, interruption).
+- `PRMRotationCoordinator` wraps iOS 17+ `AVCaptureDevice.RotationCoordinator` with `AsyncStream<CGFloat>` for preview + capture angles. Replaces the legacy `UIDeviceOrientation`-based path.
+- `PRMCameraConfiguration` exposes `maxPhotoQualityPrioritization`, `enableResponsiveCapture`, `enableAutoDeferredPhotoDelivery`, `enableZeroShutterLag`, `enableMultitaskingCameraAccess`, `enableLivePhoto`, `enableDepthDataDelivery`, `enablePortraitEffectsMatteDelivery`, `preferredVideoStabilizationMode`, configurable device-type preference list (triple / dual / dual-wide / wide-angle).
+- `PRMCameraDevice` Sendable snapshot of device identity + capabilities.
+- `PRMCameraState` live telemetry (zoom, exposure, ISO, shutter, WB Kelvin/tint, lens position, focus mode, HDR/low-light state).
+- `PRMPermissions` async camera + microphone authorization.
+- `PRMSessionError` typed error surface.
 
-Every public type has been reshaped against current Apple guidance (iOS 17+ `RotationCoordinator`, iOS 17/18 photo APIs, Swift 6.2 strict concurrency, WWDC '20 Core Image best practices). No source-compatible upgrade path; consumers should adopt the new API.
+### Capture (PrismCore/Capture)
 
-### Added
+- `PRMPhotoCapture` async/await still capture (`capturePhoto`, `capturePhotoData`), Live Photo (`captureLivePhoto`), Portrait (`capturePortraitPhoto`), burst (`captureBurst`), Night-mode (`captureNight`). Lock-protected `pendingCaptures` dictionary keyed by `AVCaptureResolvedPhotoSettings.uniqueID`. Cancellable.
+- `PRMPhotoSettings` fluent builder: format, flash, redEyeReduction, qualityPrioritization, livePhoto, portraitEffectsMatte, depth, constantColor, autoVirtualDeviceFusion, autoStillImageStabilization.
+- `PRMPhoto` / `PRMLivePhoto` / `PRMPortraitPhoto` result types. `PRMNightModeCapture` for multi-frame averaging long-exposure composites.
+- `PRMVideoRecorder` async start/stop with `PRMRecording` result + URL.
+- `PRMDepthCapture` enables/configures depth data delivery on the photo output.
 
-- **PrismCore/Camera**: `PRMCameraActor` (global actor serializing session work), `PRMCameraSession` (actor-isolated AVCaptureSession owner), `PRMCamera` (MainActor facade with `AsyncStream<PRMCameraState>`, async-await mutations), `PRMCameraDevice` (Sendable snapshot), `PRMCameraState` (live telemetry), `PRMRotationCoordinator` (wraps iOS 17+ `AVCaptureDevice.RotationCoordinator` with `AsyncStream<CGFloat>`), `PRMPermissions` (async camera/mic access), `PRMSessionError`
-- **PrismCore/Capture**: `PRMPhotoCapture` (async-await `try await capturePhoto(...) -> PRMPhoto`), `PRMPhotoSettings` (fluent builder), `PRMPhoto`, `PRMVideoRecorder` (async start/stop), `PRMRecording`, `PRMDepthCapture`
-- **PrismCore/Device**: namespace extensions on `AVCaptureDevice` (`prm_setZoom`, `prm_setTorch`, `prm_setExposureBias`, `prm_setExposureMode`, `prm_setCustomExposure`, `prm_setFocusAndExposure`, `prm_setWhiteBalanceMode`, `prm_lockWhiteBalance`, `prm_setFrameRate`, `prm_resetFrameRate`, `prm_lenses`, `prm_focalLength35mm`, `prm_currentTemperatureAndTint`, `prm_supportsSlowMotion`) and `AVCaptureConnection` (`prm_setStabilization`); `PRMLens` struct
-- **PrismCore/Filter**: `PRMFilter` value-type protocol (`func render(_:) -> CIImage`, non-optional), `PRMRenderContext` (one Metal-backed `CIContext` per pipeline per Apple's WWDC '20 guidance), `PRMVideoFrame` Sendable struct, 17 built-in filter structs (Brightness/Contrast/Saturation/Hue/Grayscale/Sepia/Vignette/GaussianBlur/MotionBlur/ZoomBlur/Pixellate/Comic/Pointillize/Edges/Bump/Twirl/Pinch/Vortex), `PRMFilterChain` with **correct per-filter intensity blending** via `CIBlendWithMask`, `PRMBasicFilterRenderer` that accepts an injected render context, `PRMFilterPipeline` with both callback and `AsyncStream<PRMVideoFrame>` delivery
-- **PrismCore/Utilities**: `PRMTempFile` (scoped to `<tmp>/Prism/` instead of nuking the whole tmp directory), `PRMImage` (takes a `PRMRenderContext`)
-- **PrismCore/Configuration**: `PRMCameraConfiguration` now exposes `maxPhotoQualityPrioritization`, `enableResponsiveCapture`, `enableAutoDeferredPhotoDelivery`, `enableZeroShutterLag`, `enableMultitaskingCameraAccess`, configurable device-type preference list including triple/dual/wide-angle
-- **PrismUI/Preview**: `PRMPreviewView` replaces `PRMPreviewMetalView` with simpler threading — a single lock-protected latest-frame buffer drawn on `MTKView`'s display link (no per-frame MainActor hop)
-- **PrismUI/Components**: `PRMShutterButton` (photo / video / recording-active states with tap + long-press), `PRMFocusIndicatorView`, `PRMGridView` (now includes **Fibonacci spiral**), `PRMAspectRatioMaskView`, `PRMCaptureEventHelper` (iOS 17.2+ camera control button)
-- **Example app**: collapsed from 8 screens to 3 — Permissions, **Studio** (DSLR-grade camera in one screen: lens picker, telemetry strip, photo/video/slow-mo modes, tap-to-focus, pinch-to-zoom, drag-to-bias-exposure), and Filter Chain (interactive multi-filter editor with intensity sheet)
+### Device extensions (PrismCore/Device)
 
-### Changed (breaking)
+Namespace extensions on `AVCaptureDevice` (`prm_`) and `AVCaptureConnection`:
 
-- `PRMCameraSessionManager` → split into `PRMCameraSession` (actor) + `PRMCamera` (MainActor facade). State changes are now `AsyncStream<PRMCameraState>` instead of `PRMCameraDelegate` callbacks
-- `PRMCameraFilter` (`AnyObject`, returns optional `CIImage?`) → `PRMFilter` (Sendable struct, returns non-optional `CIImage`)
-- `PRMCameraFilterRenderer` → `PRMFilterRenderer`
-- `PRMPhotoCaptureProcessor` (NSObject + four callbacks) → `PRMPhotoCapture` with `try await capturePhoto(settings:applying:context:willCapture:) -> PRMPhoto`
-- `PRMPhotoSettingsBuilder` → `PRMPhotoSettings` (drops deprecated `isAutoStillImageStabilizationEnabled` flag; replaced by `qualityPrioritization`)
-- `PRMVideoCaptureHelper` → `PRMVideoRecorder` with async `start` / `stop`
-- `PRMDepthHelper` → `PRMDepthCapture` (semantic same)
-- `PRMPermissionHelper` → `PRMPermissions` (semantic same)
-- `PRMFileHelper` → `PRMTempFile` (now scopes cleanup to a `Prism/` subdirectory; the old `clearTemporaryFiles()` deleted **everything** in `NSTemporaryDirectory()`)
-- `PRMImageHelper` → `PRMImage` (now accepts a `PRMRenderContext`)
-- `PRMPreviewMetalView` → `PRMPreviewView` (lighter threading)
-- `PRMCameraButton` → `PRMShutterButton` (adds press-and-hold for video)
-- `PRMCameraFocusView` → `PRMFocusIndicatorView`
-- `PRMGridOverlayView` → `PRMGridView`
-- `PRMAspectRatioOverlayView` → `PRMAspectRatioMaskView`
-- `PRMCaptureControlHelper` → `PRMCaptureEventHelper`
-- `PRMZoomHelper.LensInfo` → `PRMLens` (no longer applies the lowest-focal-length snap heuristic by default; call `lens.snapping()` to opt in)
-- All six `PRM*Helper` enums (`PRMZoomHelper`, `PRMTorchHelper`, `PRMExposureHelper`, `PRMWhiteBalanceHelper`, `PRMStabilizationHelper`, `PRMFrameRateHelper`) → extension methods on `AVCaptureDevice` / `AVCaptureConnection`
-- `AVCapture+PRM.swift` rotation-angle constants → removed (superseded by `PRMRotationCoordinator`)
-- All 15 built-in filter classes (`final class @unchecked Sendable`) → structs (zero `@unchecked` annotations remaining in the built-in filter set)
-- Platform support narrowed from `iOS / macCatalyst / macOS` to `iOS 18+ / macCatalyst 18+` (most camera AVFoundation APIs are unavailable on macOS native, and Mac Catalyst is the supported Mac path)
+- **Zoom**: `prm_setZoom`, `prm_lenses`, `prm_focalLength35mm`.
+- **Torch**: `prm_setTorch`.
+- **Exposure**: `prm_setExposureBias`, `prm_setExposureMode`, `prm_setCustomExposure`, `prm_setFocusAndExposure`.
+- **WhiteBalance**: `prm_setWhiteBalanceMode`, `prm_lockWhiteBalance`, `prm_currentTemperatureAndTint`.
+- **FrameRate**: `prm_setFrameRate`, `prm_resetFrameRate`, `prm_supportsSlowMotion`.
+- **ISO + Shutter**: `prm_setISO`, `prm_setShutterSpeed`, `prm_isoRange`, `prm_shutterSpeedRange`.
+- **Lens**: `prm_setFocusMode`, `prm_setLensPosition`, `prm_setLensPositionAsync`.
+- **HDR + Low-light**: `prm_setVideoHDR`, `prm_setLowLightBoost`, `prm_isLowLightBoostActive`.
+- **Stabilization**: `AVCaptureConnection.prm_setStabilization`.
+- `PRMLens` Sendable struct (focal length + position + opt-in `snapping()` heuristic).
 
-### Fixed
+### Filter pipeline (PrismCore/Filter)
 
-- **Filter chain intensity blending**: the previous implementation called `composited(over:)` followed by `applyingFilter("CISourceOverCompositing", parameters: [:])` (no `inputBackgroundImage` — a no-op) and then composited the result back over the **original** source image instead of the previous filter's output. Multi-filter chains with intermediate intensities silently discarded upstream work. The new implementation uses `CIBlendWithMask` against the previous step's output for a correct `mix(prev, filtered, intensity)` per step
-- **`PRMFileHelper.clearTemporaryFiles()`** deleted every file in `NSTemporaryDirectory()`, not just Prism's. The replacement `PRMTempFile.clearAll()` only touches `<tmp>/Prism/`
-- **Per-renderer `CIContext()`**: every `PRMBasicFilterRenderer` and `PRMFilterChain` allocated its own context. Now they share one `PRMRenderContext` per pipeline, bound to a Metal command queue with `.cacheIntermediates: false` per Apple's WWDC '20 guidance
-- **Per-frame MainActor hop in preview**: `PRMPreviewMetalView.requestDraw()` dispatched a `Task @MainActor` per frame (60 hops/sec at 60 fps). The new `PRMPreviewView` uses an `MTKView` display link that polls a lock-protected latest buffer
-- **Deprecated `isAutoStillImageStabilizationEnabled`**: removed from the photo settings builder (the property was deprecated in iOS 13 and ignored as of iOS 18)
+- `PRMFilter` Sendable value-type protocol, `func render(_ image: CIImage) -> CIImage`. No `AnyObject` requirement.
+- `PRMRenderContext` wraps a shared Metal-backed `CIContext` (`.cacheIntermediates: false`, per WWDC '20). One context per pipeline.
+- `PRMVideoFrame` Sendable struct of `CVPixelBuffer` + presentation timestamp.
+- 20 built-in filter structs:
+  - **Color** (7): Brightness, Contrast, Saturation, HueRotation, Grayscale, Sepia, Vignette.
+  - **Blur** (3): GaussianBlur, MotionBlur, ZoomBlur.
+  - **Stylize** (4): Pixellate, Comic, Pointillize, Edges.
+  - **Distortion** (4): BumpDistortion, TwirlDistortion, PinchDistortion, VortexDistortion.
+  - **PortraitBokeh** (1): matte- or depth-driven `CIDepthBlurEffect`.
+  - **PassThrough** (1): identity filter for testing or chain endpoints.
+- `PRMFilterChain` with correct per-filter intensity blending via `CIBlendWithMask` against the previous step's output. Exposes both `count` and `isEmpty`. Thread-safe.
+- `PRMBasicFilterRenderer` accepts an injected `PRMRenderContext` and a `filterFactory: @Sendable () -> any PRMFilter` closure, composition over inheritance with no per-filter subclasses.
+- `PRMFilterPipeline` is the `AVCaptureVideoDataOutputSampleBufferDelegate`, delivers frames via callback (`onFrame`) and `AsyncStream<PRMVideoFrame>`. Runs on `PRMCameraSession.dataOutputQueue`. `discardsLateVideoFrames = true`.
+- `PRMBufferPoolAllocator` reuses `CVPixelBuffer` allocations through a `CVPixelBufferPool`.
 
-### Removed
+### Utilities (PrismCore/Utilities)
 
-- `PRMCameraSessionManager`, `PRMCameraDelegate`, `PRMSessionSetupResult`, `PRMPhotoCaptureProcessor`, `PRMPhotoSettingsBuilder`, `PRMVideoCaptureHelper`, `PRMDepthHelper`, `PRMZoomHelper` / `PRMTorchHelper` / `PRMExposureHelper` / `PRMWhiteBalanceHelper` / `PRMStabilizationHelper` / `PRMFrameRateHelper`, `PRMCameraFilter`, `PRMCameraFilterRenderer`, `PRMFileHelper`, `PRMImageHelper`, `PRMPreviewMetalView`, `PRMCameraButton`, `PRMCameraFocusView`, `PRMGridOverlayView`, `PRMAspectRatioOverlayView`, `PRMCaptureControlHelper`, manual `PRMVideoRotationAngle` constants in `AVCapture+PRM`
-- macOS native target (use Mac Catalyst instead)
+- `PRMLogger` typed logging (`PRMLogCategory` enum) with `isVerboseTracingEnabled` build-time flag + `trace(_:_:)` autoclosure helper for AVF state-truth instrumentation.
+- `PRMStreamRegistry<Element>` UUID-keyed continuation registry consolidating the `AsyncStream` plumbing used by `PRMCamera`, `PRMRotationCoordinator`, and `PRMFilterPipeline`.
+- `PRMTempFile` scoped to `<tmp>/Prism/` (does not touch unrelated files in `NSTemporaryDirectory()`).
+- `PRMImage` takes an injected `PRMRenderContext`; HEIF/JPEG encode helpers with sRGB color-space + extent-aware crop (handles infinite/empty extents from distortion filters).
 
-### Stats after redesign
+### Preview view (PrismUI/Preview)
 
-- 44 PrismCore source files + 9 PrismUI source files
-- 41 test files / 138 tests across 44 suites, all passing on iOS Simulator
-- Zero SwiftLint or SwiftFormat violations
-- 3 example screens (down from 8)
+- `PRMPreviewView: MTKView` with lock-protected `latestPixelBuffer`; `MTKView`'s display link polls the latest frame so there is no per-frame Task or MainActor hop.
+- `PassThrough.metal` shader for direct CVPixelBuffer to drawable blit.
+
+### Components (PrismUI/Components)
+
+- `PRMShutterButton` photo / video / recording-active states with tap + long-press for video.
+- `PRMFocusIndicatorView` tap-to-focus + AF-converged animation.
+- `PRMGridView` rule-of-thirds, golden ratio, square, Fibonacci spiral overlays.
+- `PRMLevelIndicatorView` horizon level with cardinal-snap visual feedback.
+- `PRMAspectRatioMaskView` letterbox mask for non-native aspect ratios.
+- `PRMCaptureEventHelper` iOS 17.2+ camera-control button via `AVCaptureEventInteraction` (memoized).
+- `PRMSettingsDrawerView` slide-in right-edge drawer with sectioned scroll, configurable fonts, mode handling.
+- `PRMSettingsRow` collapsible row with SF Symbol header, value label, arbitrary content view.
+
+### Tests
+
+- 142 tests across 44 suites, Swift Testing (`@Test`, `#expect`).
+- Tests mirror source structure exactly.
+- Filter-chain intensity blend correctness verified with golden pixel-comparison tests.
+- Device-touching paths covered via value-type tests, API-surface KeyPath locks, and Sendable round-trip checks (full hardware paths exercise via Example app and manual test plan, since `AVCaptureDevice.default(for:)` returns nil on simulator).
+
+### Example app
+
+- `Example/PrismExample.xcodeproj` (XcodeGen, edit `Example/project.yml`). Three screens:
+  - `PermissionsViewController`.
+  - `StudioViewController`, DSLR-grade camera in one screen, lens picker, telemetry strip, photo / live / portrait / pano / video / slo-mo / night modes, tap-to-focus, pinch-to-zoom, drag-to-bias-exposure, full settings drawer (EV / ISO / shutter sliders, WB Kelvin slider + preset chips, manual focus lens-position, HDR, low-light boost, stabilization, codec), 48MP toggle, burst, timer.
+  - `FilterChainViewController`, interactive multi-filter editor with per-filter intensity sheet.
+- Example app uses SnapKit for its own layout (private demo dependency, not a library one).
+
+### Package
+
+- `Package.swift`, `swift-tools-version: 6.2`, `.iOS(.v18)` only. Mac Catalyst was scoped in early development but dropped before v0.1.0, `AVCaptureDeferredPhotoProxy`, Live Photo, and `AVCapturePhotoOutput.captureReadiness` are `API_UNAVAILABLE(macCatalyst)`.
+- No external SPM dependencies.
+- PrismCore, `enableExperimentalFeature("StrictConcurrency")`.
+- PrismUI, `defaultIsolation(MainActor)` + `enableExperimentalFeature("StrictConcurrency")`.
