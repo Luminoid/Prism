@@ -622,23 +622,24 @@ final class StudioViewController: UIViewController {
             self?.previewView.update(frame.pixelBuffer)
         }
 
-        await PRMCameraActor.shared.run {
-            if let photoOutput = await self.camera.session.photoOutput {
-                let capture = PRMPhotoCapture(output: photoOutput)
-                let context = self.renderContext
-                await MainActor.run {
-                    self.photoCapture = capture
-                    self.nightCapture = PRMNightModeCapture(capture: capture, context: context)
-                }
-            }
-            // Use the session-based init so the recorder transparently survives
-            // format-swap-driven movie output replacements (e.g. slo-mo activation
-            // re-attaches the output internally). The recorder resolves
-            // `session.movieFileOutput` afresh at every `start()` call.
-            await MainActor.run {
-                self.videoRecorder = PRMVideoRecorder(session: self.camera.session)
-            }
-        }
+        // Use the session-based inits so both wrappers transparently survive
+        // reconfigure-driven output replacements: `PRMPhotoCapture` re-resolves
+        // `session.photoOutput` at every capture entry point (covers Live-Photo
+        // recovery on virtual devices), and `PRMVideoRecorder` re-resolves
+        // `session.movieFileOutput` at every `start()` (covers slo-mo format
+        // swaps). Neither wrapper needs to be rebuilt after a `swapInput` /
+        // `setFrameRate` / `setLivePhotoCaptureEnabled` mutation.
+        let capture = PRMPhotoCapture(session: camera.session)
+        let context = renderContext
+        photoCapture = capture
+        nightCapture = PRMNightModeCapture(capture: capture, context: context)
+        videoRecorder = PRMVideoRecorder(session: camera.session)
+
+        // Seed the `maxPhotoDimensions` cache that `makePhotoSettings(...)`
+        // reads when the user opts into the Max Dimensions cap. Subsequent
+        // device swaps / photo-output re-attaches refresh it via
+        // `refreshOutputCeilings()` at their call sites.
+        await refreshOutputCeilings()
 
         rebuildLensStrip()
         populateModeStrip()
@@ -1109,11 +1110,15 @@ final class StudioViewController: UIViewController {
             // runtime-error stream even though recording still proceeds. Apple's own
             // Camera app drops the photo output for slo-mo for exactly this reason
             // (slo-mo never offers Live Photo). The cached `photoCapture` /
-            // `nightCapture` wrappers stay valid because they hold the OLD output
-            // instance; we rebuild them on slo-mo exit via the existing capture-entry
-            // `refreshPhotoCaptureIfOutputChanged()` calls (slo-mo doesn't shoot
-            // stills, so no path through them while detached).
+            // `nightCapture` wrappers stay valid because they re-resolve
+            // `session.photoOutput` at every capture entry point (session-based
+            // `PRMPhotoCapture(session:)` init); slo-mo doesn't shoot stills, so
+            // they're inert while detached and pick up the fresh output on exit.
             try? await camera.setPhotoOutputAttached(false)
+            // Photo output is detached — clear the cached ceiling so any
+            // mid-slo-mo `makePhotoSettings(...)` call (shouldn't happen, but
+            // guard anyway) doesn't clamp against stale dimensions.
+            await refreshOutputCeilings()
             try await camera.switchDevice(type: .builtInWideAngleCamera, position: current.position)
             // Re-seed the portrait baseline before the rotation coordinator catches up.
             // A fresh device's video-data-output connection comes up at raw sensor
@@ -1149,10 +1154,14 @@ final class StudioViewController: UIViewController {
             try await camera.switchDevice(type: priorType, position: position)
             // Re-attach the photo output that `switchToSlowMoDevice` detached. The
             // new instance is a fresh `AVCapturePhotoOutput`; cached
-            // `PRMPhotoCapture` wrappers (photoCapture / nightCapture) will be
-            // identity-rebuilt on the next capture call via
-            // `refreshPhotoCaptureIfOutputChanged()`.
+            // `PRMPhotoCapture` wrappers (photoCapture / nightCapture) pick it
+            // up automatically — they re-resolve `session.photoOutput` at every
+            // capture entry point (session-based init).
             try? await camera.setPhotoOutputAttached(true)
+            // Refresh the cached `maxPhotoDimensions` snapshot — the fresh
+            // photo output's per-format ceilings may differ from the old one's,
+            // and `makePhotoSettings(...)` reads the cache synchronously.
+            await refreshOutputCeilings()
             // See `switchToSlowMoDevice` — same baseline re-seed for the rebuilt
             // connection.
             await applyConnectionRotation(90)
@@ -1236,6 +1245,9 @@ final class StudioViewController: UIViewController {
                 await camera.setExposureBias(priorBias)
             }
             await applyConnectionRotation(90)
+            // The Live-Photo-recovery path inside `swapInput` may have
+            // recreated the photo output — refresh the cached ceiling.
+            await refreshOutputCeilings()
             pipeline.isEnabled = true
             rebuildLensStrip()
             await rebindRotationCoordinator()
@@ -1265,6 +1277,9 @@ final class StudioViewController: UIViewController {
             pipeline.isEnabled = false
             try await camera.switchDevice(type: priorType, position: position)
             await applyConnectionRotation(90)
+            // The Live-Photo-recovery path inside `swapInput` may have
+            // recreated the photo output — refresh the cached ceiling.
+            await refreshOutputCeilings()
             pipeline.isEnabled = true
             rebuildLensStrip()
             await rebindRotationCoordinator()
@@ -1352,8 +1367,29 @@ final class StudioViewController: UIViewController {
     private var capMaxDimensions: Bool = false
     private var autoRedEyeReductionEnabled: Bool = false
 
+    /// Most recently-refreshed `maxPhotoDimensions` snapshot for the active
+    /// photo output. Updated by `refreshOutputCeilings()` after configure and
+    /// every device swap so `makePhotoSettings(...)` can stay synchronous.
+    private var cachedMaxPhotoDimensions: CMVideoDimensions?
+
+    /// Pulls `session.photoOutput.maxPhotoDimensions` onto the main actor.
+    /// Called after configure, `switchDevice`, and `setPhotoOutputAttached(true)`
+    /// — basically anywhere the active photo output might have been replaced.
+    /// Nil-safe: clears the cache if the photo output is currently detached.
+    private func refreshOutputCeilings() async {
+        cachedMaxPhotoDimensions = await camera.session.photoOutput?.maxPhotoDimensions
+    }
+
     /// Builds a `PRMPhotoSettings` honoring the drawer knobs so PRMPhotoSettings.codec /
     /// .maxDimensions / .autoRedEyeReduction actually take effect.
+    ///
+    /// The `capMaxDimensions` cap reads `cachedMaxPhotoDimensions`, refreshed
+    /// after every `configure` / `switchDevice` via `refreshOutputCeilings()`.
+    /// We can't read `photoCapture.output.maxPhotoDimensions` synchronously
+    /// here — the session-based `PRMPhotoCapture(session:)` wrapper returns a
+    /// placeholder `AVCapturePhotoOutput()` (with `(0, 0)` ceiling) before any
+    /// capture has resolved one, and clamping the photo to zero dimensions
+    /// would produce an empty file.
     private func makePhotoSettings(
         flash: AVCaptureDevice.FlashMode,
         quality: AVCapturePhotoOutput.QualityPrioritization
@@ -1363,8 +1399,8 @@ final class StudioViewController: UIViewController {
             .qualityPrioritization(quality)
             .codec(photoCodec)
             .autoRedEyeReduction(autoRedEyeReductionEnabled)
-        if capMaxDimensions, let output = photoCapture?.output {
-            settings = settings.maxDimensions(output.maxPhotoDimensions)
+        if capMaxDimensions, let dims = cachedMaxPhotoDimensions {
+            settings = settings.maxDimensions(dims)
         }
         // Inject the user's manual ISO/shutter intent so PRMPhotoCapture can
         // patch the saved photo's EXIF. PRMCamera's snapshot reflects the
@@ -1378,13 +1414,6 @@ final class StudioViewController: UIViewController {
     }
 
     private func capturePhoto() {
-        Task {
-            await refreshPhotoCaptureIfOutputChanged()
-            await MainActor.run { self.capturePhotoOnCurrent() }
-        }
-    }
-
-    private func capturePhotoOnCurrent() {
         guard let photoCapture else { return }
         let settings = makePhotoSettings(flash: flashSetting.avMode, quality: .quality)
 
@@ -1411,13 +1440,6 @@ final class StudioViewController: UIViewController {
     }
 
     private func captureBurst() {
-        Task {
-            await refreshPhotoCaptureIfOutputChanged()
-            await MainActor.run { self.captureBurstOnCurrent() }
-        }
-    }
-
-    private func captureBurstOnCurrent() {
         guard let photoCapture else { return }
         let settings = makePhotoSettings(flash: flashSetting.avMode, quality: .speed)
         flashOverlay()
@@ -1435,33 +1457,6 @@ final class StudioViewController: UIViewController {
     }
 
     private func captureLivePhoto() {
-        Task {
-            await refreshPhotoCaptureIfOutputChanged()
-            await MainActor.run { self.captureLivePhotoOnCurrent() }
-        }
-    }
-
-    /// Refresh `photoCapture` if the session's current `AVCapturePhotoOutput` is a
-    /// different instance from the one we cached at boot. Necessary because the
-    /// Live-Photo-recovery reconfigure path in `PRMCameraSession.swapInput` tears
-    /// down + recreates the photo output to restore `isLivePhotoCaptureSupported`
-    /// on virtual devices — if Studio kept using the pre-reconfigure instance, its
-    /// `isLivePhotoCaptureSupported` would silently read false (the old output is
-    /// no longer in the session) and every Live capture would fail at the gate.
-    private func refreshPhotoCaptureIfOutputChanged() async {
-        let currentOutput = await camera.session.photoOutput
-        guard let currentOutput else { return }
-        if photoCapture?.output !== currentOutput {
-            let renderContext = renderContext
-            let newCapture = PRMPhotoCapture(output: currentOutput)
-            await MainActor.run {
-                self.photoCapture = newCapture
-                self.nightCapture = PRMNightModeCapture(capture: newCapture, context: renderContext)
-            }
-        }
-    }
-
-    private func captureLivePhotoOnCurrent() {
         guard let photoCapture else { return }
         let settings = makePhotoSettings(flash: flashSetting.avMode, quality: .quality)
         flashOverlay()
@@ -1480,13 +1475,6 @@ final class StudioViewController: UIViewController {
     }
 
     private func capturePortraitPhoto() {
-        Task {
-            await refreshPhotoCaptureIfOutputChanged()
-            await MainActor.run { self.capturePortraitPhotoOnCurrent() }
-        }
-    }
-
-    private func capturePortraitPhotoOnCurrent() {
         guard let photoCapture else { return }
         let settings = makePhotoSettings(flash: .off, quality: .quality)
         flashOverlay()
@@ -1527,15 +1515,6 @@ final class StudioViewController: UIViewController {
             defer {
                 Task { await self.camera.setExposureMode(priorExposureMode) }
             }
-            // Rebuild the night capture wrapper if a session reconfigure since boot
-            // replaced the photo output instance (e.g. the Live-Photo-recovery path
-            // in `swapInput` for the wide→triple hop on the way into night mode).
-            // Same gate `captureLivePhotoOnCurrent` uses; without it the cached
-            // `nightCapture.capture.output` points at the detached pre-reconfigure
-            // instance whose `maxPhotoDimensions` reads (0, 0) and
-            // `connection(with: .video)` returns nil — every night capture then
-            // fails with "no video connection" even though the session is healthy.
-            await refreshPhotoCaptureIfOutputChanged()
             guard let nightCapture = await MainActor.run(body: { self.nightCapture }) else { return }
             await camera.setCustomExposure(duration: duration, iso: params.iso)
             do {

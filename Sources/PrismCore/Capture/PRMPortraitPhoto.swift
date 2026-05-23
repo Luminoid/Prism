@@ -38,6 +38,14 @@ public extension PRMPhotoCapture {
         context: PRMRenderContext? = nil,
         willCapture: (@Sendable () -> Void)? = nil
     ) async throws -> PRMPortraitPhoto {
+        // Read against the public `output` (which for session-based wrappers
+        // returns the most recent capture resolution). The downstream
+        // `capturePhoto` call below re-resolves a fresh reference internally,
+        // so these property reads are only used to seed the settings builder —
+        // they don't gate the actual capture. The reads happen at capture-call
+        // time rather than wrapper-init time, so a session reconfigure between
+        // the first capture and this one already updates the cached snapshot.
+        let output = output
         var portraitSettings = settings
         // Force HEIC for Portrait. The iOS Photos.app's Portrait UI (badge + Edit-mode
         // depth slider) only fires for HEIC files with Apple-written maker-note + depth

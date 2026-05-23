@@ -6,8 +6,10 @@ import Testing
 /// running `AVCaptureSession` is undefined (Apple's docs say "the photo output must be added
 /// to a session"). We test the bits that don't require an active session:
 ///
-/// - Initialization with a bare `AVCapturePhotoOutput`.
-/// - Output property is the same instance that was injected.
+/// - Initialization with a bare `AVCapturePhotoOutput` (legacy `init(output:)`).
+/// - Initialization with a `PRMCameraSession` (session-based `init(session:)`).
+/// - Output property is the same instance that was injected (fixed resolver).
+/// - Output property returns a non-nil placeholder before any capture has resolved a session-bound output.
 /// - Type is `Sendable` across actor hops.
 /// - Public API key paths exist (schema lock).
 struct PRMPhotoCaptureTests {
@@ -26,6 +28,39 @@ struct PRMPhotoCaptureTests {
         let captureB = PRMPhotoCapture(output: outB)
         #expect(captureA.output !== captureB.output)
         #expect(captureA !== captureB)
+    }
+
+    @Test
+    func `Session-based init produces a placeholder output before any capture`() {
+        // The session-based `init(session:)` doesn't eagerly resolve — the
+        // first resolution happens at the entry of the first capture call. The
+        // public `output` property still has to be non-nil for back-compat
+        // (e.g. `PRMNightModeCapture` reads it through its `.capture.output`
+        // identity), so the wrapper returns a placeholder `AVCapturePhotoOutput`
+        // instance instead of trapping. The placeholder's identity is stable
+        // across reads — but it is NOT the same instance as the session's
+        // current photoOutput (the simulator session has no inputs, so no
+        // photoOutput has been attached either).
+        let session = PRMCameraSession()
+        let capture = PRMPhotoCapture(session: session)
+        let first = capture.output
+        let second = capture.output
+        #expect(type(of: first) == AVCapturePhotoOutput.self)
+        #expect(type(of: second) == AVCapturePhotoOutput.self)
+    }
+
+    @Test
+    func `Session-based and output-based wrappers can coexist with distinct identities`() {
+        // Two independent wrappers around independent sessions don't share
+        // resolver state — covers the case where a consuming app holds both
+        // legacy and session-based wrappers during a migration.
+        let legacyOutput = AVCapturePhotoOutput()
+        let legacy = PRMPhotoCapture(output: legacyOutput)
+        let session = PRMCameraSession()
+        let modern = PRMPhotoCapture(session: session)
+        #expect(legacy !== modern)
+        #expect(legacy.output === legacyOutput)
+        #expect(modern.output !== legacyOutput)
     }
 
     @Test

@@ -11,19 +11,81 @@ import Foundation
 /// tracked by its `AVCaptureResolvedPhotoSettings.uniqueID`, so concurrent captures don't
 /// step on each other.
 ///
+/// Two initializers are exposed:
+///
+/// **Session-based (recommended)** — the wrapper resolves the *current*
+/// `AVCapturePhotoOutput` from a `PRMCameraSession` at every capture entry point.
+/// Survives the full-session-reconfigure paths that detach + re-attach the photo
+/// output (Live-Photo recovery after a virtual-device swap; format swaps that
+/// rebuild the secondary movie pipeline). Consuming apps don't have to
+/// identity-check (`!==`) the session's current output before every capture.
+///
 /// ```swift
-/// let capturer = PRMPhotoCapture(output: photoOutput)
+/// let capturer = PRMPhotoCapture(session: camera.session)
 /// let photo = try await capturer.capturePhoto(
 ///     settings: PRMPhotoSettings().flashMode(.auto),
 ///     applying: SepiaFilter(intensity: 0.8),
 ///     context: renderContext
 /// )
-/// // photo.data is filtered JPEG with original EXIF preserved
+/// ```
+///
+/// **Output-based (legacy)** — bound to a single `AVCapturePhotoOutput` instance for
+/// its lifetime. Captures will silently fail at the AVFoundation gate if Prism later
+/// detaches that output (the `isLivePhotoCaptureSupported` / `maxPhotoDimensions` /
+/// `connection(with: .video)` reads all return the dead values). Keep only if you
+/// own the output yourself and it will never be replaced.
+///
+/// ```swift
+/// let capturer = PRMPhotoCapture(output: photoOutput)
 /// ```
 public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
+    // MARK: - Resolver
+
+    /// Resolution strategy for the underlying `AVCapturePhotoOutput`.
+    private enum OutputResolver: @unchecked Sendable {
+        /// Fixed output instance. Used by the legacy `init(output:)`.
+        case fixed(AVCapturePhotoOutput)
+        /// Dynamic lookup against a session. Used by `init(session:)` — re-resolves
+        /// at every capture entry point so reconfigure-driven output re-attaches
+        /// (Live-Photo recovery on virtual devices, format swaps that rebuild the
+        /// secondary movie pipeline) don't strand the wrapper against a dead
+        /// output instance whose `isLivePhotoCaptureSupported` reads false and
+        /// `maxPhotoDimensions` reads (0, 0).
+        case dynamic(@Sendable () async -> AVCapturePhotoOutput?)
+    }
+
     // MARK: - Properties
 
-    public let output: AVCapturePhotoOutput
+    private let resolver: OutputResolver
+
+    /// The output the wrapper was constructed against (legacy init) or — for the
+    /// session-based init — the output snapshotted by the most recent capture
+    /// resolution. The session-based init resolves the LIVE output at every
+    /// capture entry point; reading this property between captures may return
+    /// the previous capture's snapshot.
+    ///
+    /// Production callers should not need to read this directly — every capture
+    /// entry point resolves a fresh reference internally. Exposed for
+    /// back-compat with code that read `.output` once at construction time, and
+    /// for downstream helpers like ``PRMNightModeCapture`` that share this
+    /// wrapper.
+    public var output: AVCapturePhotoOutput {
+        if case let .fixed(out) = resolver {
+            return out
+        }
+        if let cached = sessionCachedOutput {
+            return cached
+        }
+        // Safe fallback: a fresh empty output. Should never be used in practice
+        // because session-based callers go through a capture entry point that
+        // calls the dynamic resolver. This branch only fires if a caller reads
+        // `.output` before any capture has resolved one.
+        return AVCapturePhotoOutput()
+    }
+
+    /// Cached output from the most recent capture entry point's resolution
+    /// (session-based init only). Updated under `lock`.
+    private var sessionCachedOutput: AVCapturePhotoOutput?
 
     /// Pending captures keyed by resolved settings ID.
     private var pendingCaptures: [Int64: PendingCapture] = [:]
@@ -31,9 +93,72 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
 
     // MARK: - Init
 
+    /// Legacy init. The wrapper is bound to `output` permanently — if Prism later
+    /// detaches that output (e.g. on a Live-Photo-recovery reconfigure after a
+    /// virtual-device swap), every capture will silently fail at the AVFoundation
+    /// gate. Prefer ``init(session:)`` for any session that may reconfigure.
     public init(output: AVCapturePhotoOutput) {
-        self.output = output
+        resolver = .fixed(output)
         super.init()
+    }
+
+    /// Session-based init. The wrapper resolves `session.photoOutput` at every
+    /// capture entry point, so reconfigure-driven output replacements (Live-Photo
+    /// recovery on virtual devices, format-swap-driven rebuilds of the secondary
+    /// movie pipeline) are invisible to the caller.
+    ///
+    /// Capture entry points throw ``PRMSessionError/photoCaptureFailed`` if the
+    /// session has no photo output attached at capture time.
+    public init(session: PRMCameraSession) {
+        // `nonisolated(unsafe)` is safe here — the closure only reads the actor-
+        // isolated `photoOutput` snapshot through `await`, never mutates it.
+        // The `@PRMCameraActor` isolation on the read ensures consistency with
+        // any concurrent session reconfigure.
+        resolver = .dynamic { [weak session] in
+            guard let session else { return nil }
+            return await session.photoOutput
+        }
+        super.init()
+    }
+
+    // MARK: - Resolution
+
+    /// Returns the live `AVCapturePhotoOutput` per the configured resolver.
+    /// Synchronous for `init(output:)`, actor-isolated read for `init(session:)`.
+    ///
+    /// For session-based wrappers, the resolved instance is cached under `lock`
+    /// so subsequent reads of the public `output` property between captures
+    /// observe the most recent snapshot. This also keeps identity-comparison
+    /// (`===`) by downstream helpers (``PRMNightModeCapture``) stable across
+    /// captures within a single session lifetime.
+    ///
+    /// Throws ``PRMSessionError/photoCaptureFailed`` when the session-based
+    /// resolver returns nil — i.e. the consuming app hasn't attached a photo
+    /// output to the session (`setPhotoOutputAttached(true)`) or the session
+    /// has been torn down.
+    private func resolveCurrentOutput() async throws -> AVCapturePhotoOutput {
+        switch resolver {
+        case let .fixed(out):
+            return out
+        case let .dynamic(resolve):
+            guard let resolved = await resolve() else {
+                throw PRMSessionError.photoCaptureFailed(
+                    "AVCapturePhotoOutput is not attached to the session — call setPhotoOutputAttached(true) before capturing"
+                )
+            }
+            cacheResolvedOutput(resolved)
+            return resolved
+        }
+    }
+
+    /// Non-async cache update under the wrapper's lock. Extracted into a
+    /// `nonisolated` helper because `NSLock.lock` is not available in async
+    /// contexts; the critical section is one pointer store, too small to
+    /// justify an actor.
+    private nonisolated func cacheResolvedOutput(_ output: AVCapturePhotoOutput) {
+        lock.lock()
+        defer { lock.unlock() }
+        sessionCachedOutput = output
     }
 
     // MARK: - Capture
@@ -96,9 +221,20 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         filterRecipe: FilterRecipe,
         willCapture: (@Sendable () -> Void)?
     ) async throws -> PRMPhoto {
-        let maxDim = output.maxPhotoDimensions
-        let live = output.isLivePhotoCaptureEnabled
-        let depth = output.isDepthDataDeliveryEnabled
+        // Resolve the live photo output. For session-based wrappers this picks
+        // up the CURRENT `session.photoOutput`, which is critical because
+        // Prism's full-session-reconfigure paths (Live-Photo recovery after a
+        // virtual-device swap, format-swap-driven secondary movie pipeline
+        // rebuilds) detach and re-attach the underlying `AVCapturePhotoOutput`.
+        // A stale capture against the detached instance would read
+        // `isLivePhotoCaptureSupported = false`, `maxPhotoDimensions = (0, 0)`,
+        // and `connection(with: .video) = nil`, then fail at the AVFoundation
+        // gate with no obvious cause. For legacy `init(output:)` wrappers the
+        // resolver returns the fixed reference.
+        let liveOutput = try await resolveCurrentOutput()
+        let maxDim = liveOutput.maxPhotoDimensions
+        let live = liveOutput.isLivePhotoCaptureEnabled
+        let depth = liveOutput.isDepthDataDeliveryEnabled
         PRMLogger.trace(
             .capture,
             "capturePhoto entry: maxDim=\(maxDim.width)×\(maxDim.height), live=\(live), depth=\(depth)"
@@ -124,12 +260,12 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         // dev-forum 120427). Override wins so the saved EXIF matches the UI.
         let manualISO: Float?
         let manualDuration: CMTime?
-        if let bracket = manualExposureBracketSettings(from: settings) {
+        if let bracket = manualExposureBracketSettings(from: settings, output: liveOutput) {
             avSettings = bracket
             if let override = settings.manualExposureOverride {
                 manualISO = override.iso
                 manualDuration = override.duration
-            } else if let device = activeDevice() {
+            } else if let device = activeDevice(of: liveOutput) {
                 manualISO = device.iso
                 manualDuration = device.exposureDuration
             } else {
@@ -145,9 +281,9 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
             // `capturePhotoWithSettings:`. The filter-pass re-encode below
             // honors the *requested* codec independently, so a chain capture
             // can still emit HEIF even if the underlying photo output couldn't.
-            let regular = settings.makeAVSettings(for: output)
-            clampFlashMode(on: regular)
-            applyManualExposureOverrides(on: regular)
+            let regular = settings.makeAVSettings(for: liveOutput)
+            clampFlashMode(on: regular, output: liveOutput)
+            applyManualExposureOverrides(on: regular, output: liveOutput)
             avSettings = regular
         }
         let pending = PendingCapture(
@@ -191,7 +327,7 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         // pipeline is immediately ready (typical case). 3 s covers the worst-case
         // Triple-Camera-after-SLO-MO rebuild observed empirically. If the poll
         // exhausts, we surface the typed error instead of crashing.
-        try await waitForVideoConnection(timeout: 3.0)
+        try await waitForVideoConnection(timeout: 3.0, output: liveOutput)
         // After the connection returns, `maxPhotoDimensions` may still read
         // (0, 0) — the same Live-Photo-toggle invalidation that broke the
         // connection also resets the per-format ceiling. Re-derive from the
@@ -200,7 +336,7 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         // assignment lands. Skip when the ceiling is already populated (the
         // common case — only the post-toggle first-capture path goes through
         // this branch).
-        healMaxPhotoDimensionsIfNeeded()
+        healMaxPhotoDimensionsIfNeeded(output: liveOutput)
 
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -208,7 +344,7 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
                 lock.lock()
                 pendingCaptures[avSettings.uniqueID] = pending
                 lock.unlock()
-                output.capturePhoto(with: avSettings, delegate: self)
+                liveOutput.capturePhoto(with: avSettings, delegate: self)
             }
         } onCancel: { [weak self] in
             self?.markCancelled(avSettings.uniqueID)
@@ -226,8 +362,10 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
     /// manual exposure (where flash + Live Photo are conceptually incompatible
     /// anyway — flash forces auto-exposure, and Live Photo requires the AE
     /// system to keep tracking for the post-shutter frames).
-    private func manualExposureBracketSettings(from settings: PRMPhotoSettings)
-        -> AVCapturePhotoBracketSettings? {
+    private func manualExposureBracketSettings(
+        from settings: PRMPhotoSettings,
+        output: AVCapturePhotoOutput
+    ) -> AVCapturePhotoBracketSettings? {
         // Trust the caller's `manualExposureOverride` as the primary signal —
         // it reflects the user's slider intent (truth) rather than the device's
         // lagging `exposureMode` read (can lag the commit by ~3s per dev-forum
@@ -238,7 +376,7 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         // a secondary gate covers callers that don't pass the override yet
         // (legacy or non-Studio consumers).
         let hasOverride = settings.manualExposureOverride != nil
-        let deviceInCustom = activeDevice()?.exposureMode == .custom
+        let deviceInCustom = activeDevice(of: output)?.exposureMode == .custom
         guard hasOverride || deviceInCustom else { return nil }
 
         // Bracket settings need a processed-format dictionary if you want a
@@ -309,8 +447,11 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
     /// manual mode, we still downgrade — the manual mode is a strong intent and
     /// the user would not understand "I set ISO 800 and the photo shows ISO 200".
     /// If the device is in continuous-auto, we leave the caller's choice alone.
-    private func applyManualExposureOverrides(on settings: AVCapturePhotoSettings) {
-        guard let device = activeDevice() else { return }
+    private func applyManualExposureOverrides(
+        on settings: AVCapturePhotoSettings,
+        output: AVCapturePhotoOutput
+    ) {
+        guard let device = activeDevice(of: output) else { return }
         let exposureIsManual = device.exposureMode == .custom || device.exposureMode == .locked
         let whiteBalanceIsLocked = device.whiteBalanceMode == .locked
         guard exposureIsManual || whiteBalanceIsLocked else { return }
@@ -361,7 +502,10 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
     /// the Triple-Camera-after-SLO-MO rebuild observed empirically; if it
     /// exhausts, the session is in a non-recoverable state and the consuming
     /// app should reconfigure.
-    private func waitForVideoConnection(timeout: TimeInterval) async throws {
+    private func waitForVideoConnection(
+        timeout: TimeInterval,
+        output: AVCapturePhotoOutput
+    ) async throws {
         let pollStep: UInt64 = 50_000_000 // 50 ms in nanoseconds
         let deadline = Date().addingTimeInterval(timeout)
         var lastFailureReason: String?
@@ -413,10 +557,10 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
     /// No-op when `maxPhotoDimensions` is already non-zero (the common case;
     /// only the first capture immediately after a virtual-device toggle hits the
     /// `(0, 0)` path).
-    private func healMaxPhotoDimensionsIfNeeded() {
+    private func healMaxPhotoDimensionsIfNeeded(output: AVCapturePhotoOutput) {
         let current = output.maxPhotoDimensions
         guard current.width == 0 || current.height == 0 else { return }
-        guard let device = activeDevice() else { return }
+        guard let device = activeDevice(of: output) else { return }
         let supported = device.activeFormat.supportedMaxPhotoDimensions
             .filter { $0.width >= $0.height }
         guard let largest = supported.max(by: {
@@ -428,12 +572,12 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         )
     }
 
-    /// The video device currently feeding the photo output. Walks
+    /// The video device currently feeding the given photo output. Walks
     /// `output.connections` (the single video connection) to its first input port
     /// and casts to `AVCaptureDeviceInput`. Returns `nil` if the output isn't
     /// attached to a session — captures would already fail in that state, so
     /// callers can safely no-op when this returns nil.
-    private func activeDevice() -> AVCaptureDevice? {
+    private func activeDevice(of output: AVCapturePhotoOutput) -> AVCaptureDevice? {
         for connection in output.connections {
             for port in connection.inputPorts {
                 if let deviceInput = port.input as? AVCaptureDeviceInput {
@@ -451,7 +595,10 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
     /// "Auto flash isn't firing" look like a Prism bug when it's really an unsupported
     /// request. When `.auto` is unsupported we fall through to `.on` (closest behavioral
     /// match — "fire flash when shutter opens"), then `.off` as a last resort.
-    private func clampFlashMode(on settings: AVCapturePhotoSettings) {
+    private func clampFlashMode(
+        on settings: AVCapturePhotoSettings,
+        output: AVCapturePhotoOutput
+    ) {
         let supported = output.supportedFlashModes
         guard !supported.contains(settings.flashMode) else { return }
         let fallback: AVCaptureDevice.FlashMode = if supported.contains(.auto) {
@@ -478,9 +625,15 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         #if os(macOS)
             throw PRMSessionError.photoCaptureFailed("Live Photo is unavailable on macOS")
         #else
-            guard output.isLivePhotoCaptureSupported, output.isLivePhotoCaptureEnabled else {
-                let supported = output.isLivePhotoCaptureSupported
-                let enabled = output.isLivePhotoCaptureEnabled
+            // See `capturePhoto` for the full rationale on resolving the LIVE
+            // output before any property read. Live Photo is especially
+            // sensitive to stale references because the Live-Photo-recovery
+            // reconfigure path in `PRMCameraSession.swapInput` is the dominant
+            // source of detached photo-output instances.
+            let liveOutput = try await resolveCurrentOutput()
+            guard liveOutput.isLivePhotoCaptureSupported, liveOutput.isLivePhotoCaptureEnabled else {
+                let supported = liveOutput.isLivePhotoCaptureSupported
+                let enabled = liveOutput.isLivePhotoCaptureEnabled
                 PRMLogger.capture.error(
                     "captureLivePhoto: refused — isLivePhotoCaptureSupported=\(supported, privacy: .public), isLivePhotoCaptureEnabled=\(enabled, privacy: .public)"
                 )
@@ -490,11 +643,11 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
             }
             PRMLogger.trace(
                 .capture,
-                "captureLivePhoto entry: supported=\(output.isLivePhotoCaptureSupported), enabled=\(output.isLivePhotoCaptureEnabled)"
+                "captureLivePhoto entry: supported=\(liveOutput.isLivePhotoCaptureSupported), enabled=\(liveOutput.isLivePhotoCaptureEnabled)"
             )
-            let liveSettings = settings.livePhoto(true).makeAVSettings(for: output)
-            clampFlashMode(on: liveSettings)
-            applyManualExposureOverrides(on: liveSettings)
+            let liveSettings = settings.livePhoto(true).makeAVSettings(for: liveOutput)
+            clampFlashMode(on: liveSettings, output: liveOutput)
+            applyManualExposureOverrides(on: liveSettings, output: liveOutput)
             let movieURL = PRMTempFile.url(withExtension: "mov")
             liveSettings.livePhotoMovieFileURL = movieURL
 
@@ -509,12 +662,12 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
             // session begin/commit (Live Photo toggle, swapInput rebuild). See
             // the `capturePhoto` companion site for the full rationale.
             do {
-                try await waitForVideoConnection(timeout: 3.0)
+                try await waitForVideoConnection(timeout: 3.0, output: liveOutput)
             } catch {
                 PRMTempFile.remove(movieURL)
                 throw error
             }
-            healMaxPhotoDimensionsIfNeeded()
+            healMaxPhotoDimensionsIfNeeded(output: liveOutput)
 
             return try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { continuation in
@@ -522,7 +675,7 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
                     lock.lock()
                     pendingCaptures[liveSettings.uniqueID] = pending
                     lock.unlock()
-                    output.capturePhoto(with: liveSettings, delegate: self)
+                    liveOutput.capturePhoto(with: liveSettings, delegate: self)
                 }
             } onCancel: { [weak self] in
                 self?.markCancelled(liveSettings.uniqueID)
