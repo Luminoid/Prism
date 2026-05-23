@@ -31,8 +31,8 @@ public final class PRMRotationCoordinator {
     private var previewObservation: NSKeyValueObservation?
     private var captureObservation: NSKeyValueObservation?
 
-    private var previewContinuations: [UUID: AsyncStream<CGFloat>.Continuation] = [:]
-    private var captureContinuations: [UUID: AsyncStream<CGFloat>.Continuation] = [:]
+    private let previewAngles = PRMStreamRegistry<CGFloat>()
+    private let captureAngles = PRMStreamRegistry<CGFloat>()
 
     /// Creates a rotation coordinator for the given device. Pass the preview layer (if any)
     /// so the system can rotate it automatically — otherwise pass `nil` and apply the angle
@@ -45,43 +45,19 @@ public final class PRMRotationCoordinator {
     deinit {
         previewObservation?.invalidate()
         captureObservation?.invalidate()
-        for continuation in previewContinuations.values {
-            continuation.finish()
-        }
-        for continuation in captureContinuations.values {
-            continuation.finish()
-        }
+        // Registry `deinit` finishes its own subscribers; no explicit teardown needed.
     }
 
     // MARK: - Streams
 
     /// Async stream of rotation angles for the **preview layer**, in degrees.
     public func previewRotationAngles() -> AsyncStream<CGFloat> {
-        AsyncStream { continuation in
-            let id = UUID()
-            previewContinuations[id] = continuation
-            // Emit current value immediately.
-            continuation.yield(coordinator.videoRotationAngleForHorizonLevelPreview)
-            continuation.onTermination = { @Sendable [weak self] _ in
-                Task { @MainActor [weak self] in
-                    self?.previewContinuations.removeValue(forKey: id)
-                }
-            }
-        }
+        previewAngles.makeStream(initial: coordinator.videoRotationAngleForHorizonLevelPreview)
     }
 
     /// Async stream of rotation angles for the **capture connection**, in degrees.
     public func captureRotationAngles() -> AsyncStream<CGFloat> {
-        AsyncStream { continuation in
-            let id = UUID()
-            captureContinuations[id] = continuation
-            continuation.yield(coordinator.videoRotationAngleForHorizonLevelCapture)
-            continuation.onTermination = { @Sendable [weak self] _ in
-                Task { @MainActor [weak self] in
-                    self?.captureContinuations.removeValue(forKey: id)
-                }
-            }
-        }
+        captureAngles.makeStream(initial: coordinator.videoRotationAngleForHorizonLevelCapture)
     }
 
     // MARK: - One-shot angle reads
@@ -109,10 +85,7 @@ public final class PRMRotationCoordinator {
         ) { [weak self] _, change in
             guard let angle = change.newValue else { return }
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                for continuation in self.previewContinuations.values {
-                    continuation.yield(angle)
-                }
+                self?.previewAngles.yield(angle)
             }
         }
 
@@ -122,10 +95,7 @@ public final class PRMRotationCoordinator {
         ) { [weak self] _, change in
             guard let angle = change.newValue else { return }
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                for continuation in self.captureContinuations.values {
-                    continuation.yield(angle)
-                }
+                self?.captureAngles.yield(angle)
             }
         }
     }

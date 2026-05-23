@@ -1,5 +1,4 @@
 #if canImport(UIKit)
-    import SnapKit
     import UIKit
 
     /// A slide-in side drawer that hosts a vertically-scrolling stack of settings.
@@ -11,7 +10,12 @@
         // MARK: - Configuration
 
         /// Width of the drawer when open. Defaults to 280pt.
-        public var drawerWidth: CGFloat = 280
+        public var drawerWidth: CGFloat = 280 {
+            didSet {
+                containerWidthConstraint?.constant = drawerWidth
+                containerTrailingConstraint?.constant = isOpen ? -drawerWidth : 0
+            }
+        }
 
         /// Whether the drawer is currently open.
         public private(set) var isOpen: Bool = false
@@ -40,7 +44,11 @@
         private let titleLabel = UILabel()
         private let closeButton = UIButton(type: .system)
 
-        private var containerTrailingConstraint: Constraint?
+        /// Drives the slide-in animation. Container's `leading` is pinned to the
+        /// drawer's `trailing` plus this constant — `0` parks it off-screen, `-drawerWidth`
+        /// slides it on.
+        private var containerTrailingConstraint: NSLayoutConstraint?
+        private var containerWidthConstraint: NSLayoutConstraint?
 
         // MARK: - Init
 
@@ -61,32 +69,45 @@
             backgroundColor = .clear
 
             addSubview(backdropView)
+            backdropView.translatesAutoresizingMaskIntoConstraints = false
             backdropView.backgroundColor = UIColor.black.withAlphaComponent(0.4)
             backdropView.alpha = 0
-            backdropView.snp.makeConstraints { $0.edges.equalToSuperview() }
+            NSLayoutConstraint.activate([
+                backdropView.topAnchor.constraint(equalTo: topAnchor),
+                backdropView.bottomAnchor.constraint(equalTo: bottomAnchor),
+                backdropView.leadingAnchor.constraint(equalTo: leadingAnchor),
+                backdropView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            ])
             let backdropTap = UITapGestureRecognizer(target: self, action: #selector(handleBackdropTap))
             backdropView.addGestureRecognizer(backdropTap)
 
             addSubview(containerView)
+            containerView.translatesAutoresizingMaskIntoConstraints = false
             containerView.backgroundColor = UIColor.black.withAlphaComponent(0.85)
             containerView.layer.cornerRadius = 16
             containerView.layer.cornerCurve = .continuous
             containerView.layer.maskedCorners = [.layerMinXMinYCorner, .layerMinXMaxYCorner]
             containerView.clipsToBounds = true
-            containerView.snp.makeConstraints {
-                $0.top.bottom.equalToSuperview()
-                $0.width.equalTo(drawerWidth)
-                containerTrailingConstraint = $0.leading.equalTo(snp.trailing).constraint
-            }
+            let trailing = containerView.leadingAnchor.constraint(equalTo: trailingAnchor)
+            let width = containerView.widthAnchor.constraint(equalToConstant: drawerWidth)
+            containerTrailingConstraint = trailing
+            containerWidthConstraint = width
+            NSLayoutConstraint.activate([
+                containerView.topAnchor.constraint(equalTo: topAnchor),
+                containerView.bottomAnchor.constraint(equalTo: bottomAnchor),
+                width,
+                trailing,
+            ])
 
             titleLabel.text = title
             titleLabel.textColor = .white
             titleLabel.font = titleFont
+            titleLabel.translatesAutoresizingMaskIntoConstraints = false
             containerView.addSubview(titleLabel)
-            titleLabel.snp.makeConstraints {
-                $0.top.equalTo(containerView.safeAreaLayoutGuide).offset(16)
-                $0.leading.equalToSuperview().offset(16)
-            }
+            NSLayoutConstraint.activate([
+                titleLabel.topAnchor.constraint(equalTo: containerView.safeAreaLayoutGuide.topAnchor, constant: 16),
+                titleLabel.leadingAnchor.constraint(equalTo: containerView.leadingAnchor, constant: 16),
+            ])
 
             // 44×44 hit target per HIG; the 28pt glyph stays visually centered via
             // UIButton.Configuration's content insets (the old `contentEdgeInsets` API is
@@ -99,34 +120,42 @@
                 top: inset, leading: inset, bottom: inset, trailing: inset
             )
             closeButton.configuration = config
+            closeButton.translatesAutoresizingMaskIntoConstraints = false
             containerView.addSubview(closeButton)
-            closeButton.snp.makeConstraints {
-                $0.centerY.equalTo(titleLabel)
-                $0.trailing.equalToSuperview().offset(-4)
-                $0.size.equalTo(CGSize(width: 44, height: 44))
-            }
+            NSLayoutConstraint.activate([
+                closeButton.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+                closeButton.trailingAnchor.constraint(equalTo: containerView.trailingAnchor, constant: -4),
+                closeButton.widthAnchor.constraint(equalToConstant: 44),
+                closeButton.heightAnchor.constraint(equalToConstant: 44),
+            ])
             closeButton.addAction(UIAction { [weak self] _ in
                 self?.setOpen(false, animated: true)
                 self?.onClose?()
             }, for: .touchUpInside)
 
-            containerView.addSubview(scrollView)
+            scrollView.translatesAutoresizingMaskIntoConstraints = false
             scrollView.showsVerticalScrollIndicator = false
-            scrollView.snp.makeConstraints {
-                $0.top.equalTo(titleLabel.snp.bottom).offset(8)
-                $0.leading.trailing.equalToSuperview()
-                $0.bottom.equalTo(containerView.safeAreaLayoutGuide)
-            }
+            containerView.addSubview(scrollView)
+            NSLayoutConstraint.activate([
+                scrollView.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 8),
+                scrollView.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
+                scrollView.trailingAnchor.constraint(equalTo: containerView.trailingAnchor),
+                scrollView.bottomAnchor.constraint(equalTo: containerView.safeAreaLayoutGuide.bottomAnchor),
+            ])
 
             stackView.axis = .vertical
             stackView.spacing = 4
             stackView.alignment = .fill
             stackView.distribution = .fill
+            stackView.translatesAutoresizingMaskIntoConstraints = false
             scrollView.addSubview(stackView)
-            stackView.snp.makeConstraints {
-                $0.edges.equalToSuperview()
-                $0.width.equalToSuperview()
-            }
+            NSLayoutConstraint.activate([
+                stackView.topAnchor.constraint(equalTo: scrollView.topAnchor),
+                stackView.bottomAnchor.constraint(equalTo: scrollView.bottomAnchor),
+                stackView.leadingAnchor.constraint(equalTo: scrollView.leadingAnchor),
+                stackView.trailingAnchor.constraint(equalTo: scrollView.trailingAnchor),
+                stackView.widthAnchor.constraint(equalTo: scrollView.widthAnchor),
+            ])
         }
 
         // MARK: - Open / close
@@ -135,7 +164,7 @@
             guard open != isOpen else { return }
             isOpen = open
             isUserInteractionEnabled = open
-            containerTrailingConstraint?.update(offset: open ? -drawerWidth : 0)
+            containerTrailingConstraint?.constant = open ? -drawerWidth : 0
             let block: () -> Void = { [self] in
                 superview?.layoutIfNeeded()
                 backdropView.alpha = (open && dimsBackdrop) ? 1 : 0
@@ -203,13 +232,14 @@
             label.textColor = UIColor.white.withAlphaComponent(0.55)
             label.font = font
             label.letterSpacing = 1.2
+            label.translatesAutoresizingMaskIntoConstraints = false
             addSubview(label)
-            label.snp.makeConstraints {
-                $0.leading.equalToSuperview().offset(16)
-                $0.trailing.equalToSuperview().offset(-16)
-                $0.top.equalToSuperview().offset(12)
-                $0.bottom.equalToSuperview().offset(-4)
-            }
+            NSLayoutConstraint.activate([
+                label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+                label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+                label.topAnchor.constraint(equalTo: topAnchor, constant: 12),
+                label.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
+            ])
         }
 
         @available(*, unavailable)

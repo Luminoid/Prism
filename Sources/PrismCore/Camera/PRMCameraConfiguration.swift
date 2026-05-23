@@ -146,4 +146,75 @@ public struct PRMCameraConfiguration: Sendable {
             ]
         #endif
     }
+
+    /// Logs `.warning`-level diagnostics for known-incompatible flag combinations. Called
+    /// from ``PRMCameraSession/configure(_:)`` so misconfigurations surface in Console
+    /// without making the init throwing (the constructor stays infallible — these are
+    /// "will silently misbehave", not "cannot be constructed"). In DEBUG builds the
+    /// hard-conflict cases also `assertionFailure` so the misuse fails fast under the
+    /// debugger.
+    ///
+    /// Conflicts:
+    /// - `prefersMaxPhotoDimensionsFormat` + `enableLivePhoto` — the 48MP photo format
+    ///   doesn't carry the parallel movie pipeline Live Photo needs. The format
+    ///   promotion wins and Live Photo silently fails.
+    /// - `prefersMaxPhotoDimensionsFormat` + (`enableZeroShutterLag` /
+    ///   `enableAutoDeferredPhotoDelivery`) — both substitute 12MP proxy captures
+    ///   regardless of the active format.
+    /// - `prefersMaxPhotoDimensionsFormat` on a `deviceTypes` list that includes virtual
+    ///   multi-cameras (`.builtInTripleCamera`, `.builtInDualCamera`, `.builtInDualWideCamera`)
+    ///   without `.builtInWideAngleCamera` first — virtual devices cap at 12MP regardless
+    ///   of the format chosen, so the promotion is a silent no-op until the consumer
+    ///   `switchDevice(type: .builtInWideAngleCamera)` themselves.
+    func validate() {
+        guard prefersMaxPhotoDimensionsFormat else { return }
+        if enableLivePhoto {
+            PRMLogger.session.warning(
+                """
+                PRMCameraConfiguration: prefersMaxPhotoDimensionsFormat=true is incompatible \
+                with enableLivePhoto=true — the 48MP photo format does not stream the parallel \
+                movie pipeline Live Photo requires. The format promotion will win and Live Photo \
+                will silently fail. Toggle high-res via PRMCamera.setHighResolutionPhotoFormat(_:) \
+                per user action instead.
+                """
+            )
+            assertionFailure("prefersMaxPhotoDimensionsFormat + enableLivePhoto are mutually exclusive")
+        }
+        if enableZeroShutterLag {
+            PRMLogger.session.warning(
+                """
+                PRMCameraConfiguration: prefersMaxPhotoDimensionsFormat=true substitutes 12MP proxy captures \
+                when combined with enableZeroShutterLag=true; the 48MP capture you toggled on never actually fires.
+                """
+            )
+        }
+        if enableAutoDeferredPhotoDelivery {
+            PRMLogger.session.warning(
+                """
+                PRMCameraConfiguration: prefersMaxPhotoDimensionsFormat=true substitutes 12MP proxy captures \
+                when combined with enableAutoDeferredPhotoDelivery=true; the 48MP capture you toggled on \
+                never actually fires.
+                """
+            )
+        }
+        #if !os(macOS)
+            let virtualTypes: Set<AVCaptureDevice.DeviceType> = [
+                .builtInTripleCamera,
+                .builtInDualCamera,
+                .builtInDualWideCamera,
+            ]
+            if deviceTypes.first.map({ virtualTypes.contains($0) }) == true,
+               !deviceTypes.contains(.builtInWideAngleCamera) {
+                PRMLogger.session.warning(
+                    """
+                    PRMCameraConfiguration: prefersMaxPhotoDimensionsFormat=true but deviceTypes \
+                    starts with a virtual multi-camera and does not list .builtInWideAngleCamera. \
+                    Virtual devices cap at 12MP regardless of activeFormat — the high-res promotion \
+                    will silently no-op. Pair with deviceTypes: [.builtInWideAngleCamera] or call \
+                    PRMCamera.switchDevice(type: .builtInWideAngleCamera) before enabling high-res.
+                    """
+                )
+            }
+        #endif
+    }
 }

@@ -1,5 +1,4 @@
 #if canImport(UIKit)
-    import SnapKit
     import UIKit
 
     /// A single row inside ``PRMSettingsDrawerView``. Configured with an SF Symbol, title,
@@ -99,11 +98,14 @@
         private func setup() {
             backgroundColor = .clear
 
+            headerButton.translatesAutoresizingMaskIntoConstraints = false
             addSubview(headerButton)
-            headerButton.snp.makeConstraints {
-                $0.top.leading.trailing.equalToSuperview()
-                $0.height.equalTo(44)
-            }
+            NSLayoutConstraint.activate([
+                headerButton.topAnchor.constraint(equalTo: topAnchor),
+                headerButton.leadingAnchor.constraint(equalTo: leadingAnchor),
+                headerButton.trailingAnchor.constraint(equalTo: trailingAnchor),
+                headerButton.heightAnchor.constraint(equalToConstant: 44),
+            ])
             headerButton.addAction(UIAction { [weak self] _ in
                 guard let self else { return }
                 self.isExpanded.toggle()
@@ -113,63 +115,78 @@
             symbolView.image = UIImage(systemName: symbolName)
             symbolView.tintColor = .white
             symbolView.contentMode = .center
+            symbolView.translatesAutoresizingMaskIntoConstraints = false
             headerButton.addSubview(symbolView)
-            symbolView.snp.makeConstraints {
-                $0.leading.equalToSuperview().offset(12)
-                $0.centerY.equalToSuperview()
-                $0.size.equalTo(CGSize(width: 22, height: 22))
-            }
+            NSLayoutConstraint.activate([
+                symbolView.leadingAnchor.constraint(equalTo: headerButton.leadingAnchor, constant: 12),
+                symbolView.centerYAnchor.constraint(equalTo: headerButton.centerYAnchor),
+                symbolView.widthAnchor.constraint(equalToConstant: 22),
+                symbolView.heightAnchor.constraint(equalToConstant: 22),
+            ])
 
             titleLabel.text = title
             titleLabel.textColor = .white
             titleLabel.font = titleFont
+            titleLabel.translatesAutoresizingMaskIntoConstraints = false
             headerButton.addSubview(titleLabel)
-            titleLabel.snp.makeConstraints {
-                $0.leading.equalTo(symbolView.snp.trailing).offset(10)
-                $0.centerY.equalToSuperview()
-            }
+            NSLayoutConstraint.activate([
+                titleLabel.leadingAnchor.constraint(equalTo: symbolView.trailingAnchor, constant: 10),
+                titleLabel.centerYAnchor.constraint(equalTo: headerButton.centerYAnchor),
+            ])
 
             valueLabel.text = valueText
             valueLabel.textColor = UIColor.white.withAlphaComponent(0.7)
             valueLabel.font = valueFont
             valueLabel.textAlignment = .right
+            valueLabel.translatesAutoresizingMaskIntoConstraints = false
             headerButton.addSubview(valueLabel)
 
             chevronView.image = UIImage(systemName: "chevron.down")
             chevronView.tintColor = UIColor.white.withAlphaComponent(0.6)
             chevronView.contentMode = .center
+            chevronView.translatesAutoresizingMaskIntoConstraints = false
             headerButton.addSubview(chevronView)
-            chevronView.snp.makeConstraints {
-                $0.trailing.equalToSuperview().offset(-12)
-                $0.centerY.equalToSuperview()
-                $0.size.equalTo(CGSize(width: 18, height: 18))
-            }
-            valueLabel.snp.makeConstraints {
-                $0.trailing.equalTo(chevronView.snp.leading).offset(-8)
-                $0.centerY.equalToSuperview()
-                $0.leading.greaterThanOrEqualTo(titleLabel.snp.trailing).offset(8)
-            }
+            NSLayoutConstraint.activate([
+                chevronView.trailingAnchor.constraint(equalTo: headerButton.trailingAnchor, constant: -12),
+                chevronView.centerYAnchor.constraint(equalTo: headerButton.centerYAnchor),
+                chevronView.widthAnchor.constraint(equalToConstant: 18),
+                chevronView.heightAnchor.constraint(equalToConstant: 18),
+            ])
+            NSLayoutConstraint.activate([
+                valueLabel.trailingAnchor.constraint(equalTo: chevronView.leadingAnchor, constant: -8),
+                valueLabel.centerYAnchor.constraint(equalTo: headerButton.centerYAnchor),
+                valueLabel.leadingAnchor.constraint(greaterThanOrEqualTo: titleLabel.trailingAnchor, constant: 8),
+            ])
 
-            addSubview(contentContainer)
             contentContainer.clipsToBounds = true
-            contentContainer.snp.makeConstraints {
-                $0.top.equalTo(headerButton.snp.bottom)
-                $0.leading.trailing.equalToSuperview()
-                $0.bottom.equalToSuperview()
-            }
+            contentContainer.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(contentContainer)
+            NSLayoutConstraint.activate([
+                contentContainer.topAnchor.constraint(equalTo: headerButton.bottomAnchor),
+                contentContainer.leadingAnchor.constraint(equalTo: leadingAnchor),
+                contentContainer.trailingAnchor.constraint(equalTo: trailingAnchor),
+                contentContainer.bottomAnchor.constraint(equalTo: bottomAnchor),
+            ])
+            contentView.translatesAutoresizingMaskIntoConstraints = false
             contentContainer.addSubview(contentView)
-            contentView.snp.makeConstraints {
-                $0.leading.equalToSuperview().offset(12)
-                $0.trailing.equalToSuperview().offset(-12)
-                $0.top.equalToSuperview().offset(2)
-                $0.bottom.equalToSuperview().offset(-10)
-            }
+            NSLayoutConstraint.activate([
+                contentView.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor, constant: 12),
+                contentView.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor, constant: -12),
+                contentView.topAnchor.constraint(equalTo: contentContainer.topAnchor, constant: 2),
+                contentView.bottomAnchor.constraint(equalTo: contentContainer.bottomAnchor, constant: -10),
+            ])
 
             // Transparent control overlay above `contentView` — only enabled when the row
             // is disabled. Intercepts taps so the underlying slider/segmented don't react,
             // forwards them to `onDisabledTap` for the host VC to surface a toast.
+            disabledOverlay.translatesAutoresizingMaskIntoConstraints = false
             contentContainer.addSubview(disabledOverlay)
-            disabledOverlay.snp.makeConstraints { $0.edges.equalTo(contentView) }
+            NSLayoutConstraint.activate([
+                disabledOverlay.topAnchor.constraint(equalTo: contentView.topAnchor),
+                disabledOverlay.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
+                disabledOverlay.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
+                disabledOverlay.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
+            ])
             disabledOverlay.isHidden = true
             disabledOverlay.backgroundColor = .clear
             disabledOverlay.addAction(UIAction { [weak self] _ in

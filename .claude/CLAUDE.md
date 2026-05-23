@@ -8,7 +8,9 @@
 | Target | Dependencies | MainActor | Contents |
 |--------|-------------|-----------|----------|
 | PrismCore | — | No (mix of `@PRMCameraActor`, `@MainActor`, and free types) | Camera (actor + facade), Capture, Device extensions, Filter pipeline, Utilities |
-| PrismUI | PrismCore, SnapKit | Yes (`defaultIsolation(MainActor)`) | Metal preview view + UIKit camera components |
+| PrismUI | PrismCore | Yes (`defaultIsolation(MainActor)`) | Metal preview view + UIKit camera components |
+
+**No external SPM dependencies.** The package was previously dependent on SnapKit; PrismUI's three components that used it (`PRMSettingsDrawerView`, `PRMSettingsRow`, `PRMLevelIndicatorView`'s docstring example) were converted to raw `NSLayoutConstraint`. The Example app continues to use SnapKit for its own layout — that's a private demo dependency, not a library one.
 
 ## Concurrency model
 
@@ -34,9 +36,9 @@
 
 ```
 Sources/PrismCore/
-├── Camera/      PRMCameraActor, PRMCamera, PRMCameraSession, PRMCameraConfiguration,
-│                PRMCameraDevice, PRMCameraState, PRMRotationCoordinator,
-│                PRMPermissions, PRMSessionError
+├── Camera/      PRMCameraActor, PRMCamera, PRMCamera+Observers, PRMCameraSession,
+│                PRMCameraSession+Format, PRMCameraConfiguration, PRMCameraDevice,
+│                PRMCameraState, PRMRotationCoordinator, PRMPermissions, PRMSessionError
 ├── Capture/     PRMPhotoCapture (still / Live Photo / Portrait / burst),
 │                PRMPhotoSettings, PRMPhoto, PRMLivePhoto, PRMPortraitPhoto,
 │                PRMNightModeCapture, PRMVideoRecorder, PRMRecording, PRMDepthCapture
@@ -46,7 +48,7 @@ Sources/PrismCore/
 │                PRMFilterChain, PRMFilterPipeline, PRMBufferPoolAllocator,
 │                PRMRenderContext, PRMVideoFrame,
 │                Filters/{Color,Blur,Stylize,Distortion,PortraitBokeh}
-└── Utilities/   PRMLogger, PRMTempFile, PRMImage
+└── Utilities/   PRMLogger, PRMStreamRegistry, PRMTempFile, PRMImage
 
 Sources/PrismUI/
 ├── Preview/     PRMPreviewView, Shaders/PassThrough.metal
@@ -54,6 +56,11 @@ Sources/PrismUI/
                  PRMLevelIndicatorView, PRMAspectRatioMaskView, PRMCaptureEventHelper,
                  PRMSettingsDrawerView, PRMSettingsRow
 ```
+
+**File-organization notes:**
+- `PRMCamera+Observers.swift` owns the four KVO + NotificationCenter wirings (session.isRunning, device-commit, runtime error, interruption). Split off the main facade to keep `PRMCamera.swift` focused on device-mutation public methods.
+- `PRMCameraSession+Format.swift` owns the high-res / Live-Photo-compatible / depth-capable format-selection logic (the 48MP promotion path + Live-Photo restore + auxiliary-flag reconciliation). Pulled out so the session file stays focused on lifecycle.
+- `PRMStreamRegistry<T>` consolidates the UUID-keyed continuation dictionary + `onTermination` cleanup pattern used by ``PRMCamera`` (state / error / interruption), ``PRMRotationCoordinator`` (preview / capture angles), and ``PRMFilterPipeline`` (frames).
 
 ## Build & Test
 
@@ -70,7 +77,7 @@ make check   # SwiftLint + SwiftFormat
 
 ## Test Structure
 
-- **44 test suites, 138 tests** — Swift Testing (`@Test`, `#expect`, `@Suite`)
+- **44 test suites, 142 tests** — Swift Testing (`@Test`, `#expect`, `@Suite`)
 - Tests mirror source structure exactly
 - The intensity-blend correctness fix is verified with golden pixel-comparison tests in `PRMFilterChainTests`
 - Device-touching paths (`AVCaptureDevice` extensions, `PRMPhotoCapture`/`PRMVideoRecorder`/`PRMDepthCapture` start/stop) can't run on simulator — `AVCaptureDevice.default(for:)` returns `nil`. Those modules are covered via **value-type tests** (enums, structs, presets), **API surface locks** (`KeyPath` lookups that fail to compile on signature drift), and **Sendable conformance checks** (`Task.detached` round-trips). Full hardware paths are exercised via the example app + manual test plan.
@@ -101,4 +108,4 @@ make check   # SwiftLint + SwiftFormat
 
 ---
 
-*Last updated 2026-05-18 — full settings surface (drawer + every supported AVFoundation API) and new capture modes (Live Photo, Portrait + depth, burst, night-mode composite). 138 tests across 44 suites.*
+*Last updated 2026-05-22 — SnapKit removed from the library (Example app keeps its own SnapKit dep). Format-management split into `PRMCameraSession+Format.swift`, observer wiring into `PRMCamera+Observers.swift`, and async-stream plumbing consolidated behind `PRMStreamRegistry<T>`. PrismUI components rewritten on raw `NSLayoutConstraint`. 142 tests across 44 suites.*

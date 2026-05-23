@@ -1,4 +1,5 @@
 #if canImport(UIKit)
+    import PrismCore
     import UIKit
 
     // MARK: - PRMShutterButton
@@ -32,19 +33,30 @@
         public var recordingFillColor: UIColor = .systemRed { didSet { applyMode(animated: false) } }
 
         /// Intrinsic width + height of the shutter button. Default `76` matches the
-        /// iOS Camera app shutter. **Must stay ≥ 44pt** per Apple HIG hit-target rules:
-        /// VoiceOver users and any user with motor accessibility needs the full 44pt
-        /// touch target to reliably activate the control. Sizes smaller than 44pt are
-        /// rejected at runtime (debug-only assertion); host apps that want a visually
-        /// smaller button should keep `buttonSize` at 44+ and shrink only the inner
-        /// circle/ring via the color/width knobs above.
-        public var buttonSize: CGFloat = 76 {
-            didSet {
-                assert(buttonSize >= 44, "PRMShutterButton.buttonSize (\(buttonSize)) is below the 44pt HIG hit-target minimum.")
+        /// iOS Camera app shutter. **Silently clamped to ≥ 44pt** per Apple HIG hit-target
+        /// rules: VoiceOver users and any user with motor accessibility needs the full
+        /// 44pt touch target to reliably activate the control. Assigning a smaller value
+        /// is accepted (so callers writing literal `48` don't crash on release builds)
+        /// but the effective size used for layout and intrinsic content size is at least
+        /// 44. Host apps that want a visually smaller button should keep `buttonSize` at
+        /// 44+ and shrink only the inner circle/ring via the color/width knobs above.
+        public var buttonSize: CGFloat {
+            get { effectiveButtonSize }
+            set {
+                let clamped = max(newValue, 44)
+                if clamped != newValue {
+                    PRMLogger.general.warning(
+                        "PRMShutterButton.buttonSize (\(newValue, privacy: .public)) below 44pt HIG minimum; clamped to 44."
+                    )
+                }
+                guard clamped != effectiveButtonSize else { return }
+                effectiveButtonSize = clamped
                 invalidateIntrinsicContentSize()
                 setNeedsLayout()
             }
         }
+
+        private var effectiveButtonSize: CGFloat = 76
 
         public var onTap: (() -> Void)?
         public var onLongPressBegan: (() -> Void)?

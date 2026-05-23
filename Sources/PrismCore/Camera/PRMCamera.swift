@@ -27,7 +27,7 @@ public final class PRMCamera {
     /// to `refreshState` on MainActor, so the state stream sees AVFoundation's
     /// committed values without us having to cross the `@MainActor` ↔ `@Sendable`
     /// boundary with `weak self` from the completion-handler closure.
-    fileprivate nonisolated static let deviceCommitNotification = Notification.Name("com.luminoid.Prism.deviceCommit")
+    nonisolated static let deviceCommitNotification = Notification.Name("com.luminoid.Prism.deviceCommit")
 
     /// Underlying session — escape hatch for advanced AVFoundation work.
     public let session: PRMCameraSession
@@ -36,14 +36,24 @@ public final class PRMCamera {
     public private(set) var device: PRMCameraDevice?
 
     /// Most recent observed state. Updated by ``refreshState()`` and by mutation methods.
-    public private(set) var state = PRMCameraState()
+    /// The setter is `internal` (not `private(set)`) so the observer extension in
+    /// ``PRMCamera+Observers.swift`` can update interruption / running flags from
+    /// notification callbacks; external consumers still see a read-only surface.
+    public internal(set) var state = PRMCameraState()
 
-    private var stateContinuations: [UUID: AsyncStream<PRMCameraState>.Continuation] = [:]
-    private var errorContinuations: [UUID: AsyncStream<PRMSessionError>.Continuation] = [:]
-    private var interruptionContinuations: [UUID: AsyncStream<Bool>.Continuation] = [:]
+    /// Subscriber registries for the three async streams exposed by this camera.
+    /// See ``PRMStreamRegistry`` for the cleanup contract — registry's deinit finishes
+    /// outstanding subscribers, so this class's deinit can stay minimal. `internal`
+    /// rather than `private` so the observer-installation extension in
+    /// ``PRMCamera+Observers.swift`` can yield into them.
+    let stateStreams = PRMStreamRegistry<PRMCameraState>()
+    let errorStreams = PRMStreamRegistry<PRMSessionError>()
+    let interruptionStreams = PRMStreamRegistry<Bool>()
 
-    private var keyValueObservations: [NSKeyValueObservation] = []
-    private var notificationObservers: [any NSObjectProtocol] = []
+    /// KVO and `NotificationCenter` registrations installed by ``installObservers()``.
+    /// `internal` so the same extension can append/invalidate them.
+    var keyValueObservations: [NSKeyValueObservation] = []
+    var notificationObservers: [any NSObjectProtocol] = []
 
     // User-driven mode intents that override AVFoundation's lagging device
     // reads during the ~3 s window between the slider-driven setter call and
@@ -120,15 +130,8 @@ public final class PRMCamera {
         for obs in notificationObservers {
             NotificationCenter.default.removeObserver(obs)
         }
-        for continuation in stateContinuations.values {
-            continuation.finish()
-        }
-        for continuation in errorContinuations.values {
-            continuation.finish()
-        }
-        for continuation in interruptionContinuations.values {
-            continuation.finish()
-        }
+        // PRMStreamRegistry's own deinit finishes outstanding subscribers; no explicit
+        // teardown needed here.
     }
 
     // MARK: - Lifecycle
@@ -167,6 +170,14 @@ public final class PRMCamera {
         // the override doesn't keep painting the old custom state on the new lens.
         clearIntendedState()
         _ = try await session.switchCamera(to: position)
+        // Wait for AVF's async pipeline rebuild to settle before returning, so the
+        // consuming app's follow-up mutations (mode-change handlers that toggle
+        // Live Photo / movie output) don't land on an in-flight rebuild — which on
+        // virtual devices leaves `captureReadiness` permanently stuck at
+        // `.notReadyMomentarily`. See `PRMCameraSession.awaitPhotoOutputReady`.
+        #if !os(macOS)
+            _ = await session.awaitPhotoOutputReady()
+        #endif
         await refreshDevice()
         await refreshState()
     }
@@ -182,6 +193,10 @@ public final class PRMCamera {
         PRMLogger.trace(.session, "PRMCamera.switchDevice(type=\(type.rawValue), pos=\(position?.rawValue.description ?? "nil"))")
         clearIntendedState()
         _ = try await session.switchDevice(type: type, position: position)
+        // See `switchCamera` for the readiness-wait rationale.
+        #if !os(macOS)
+            _ = await session.awaitPhotoOutputReady()
+        #endif
         await refreshDevice()
         await refreshState()
     }
@@ -189,9 +204,43 @@ public final class PRMCamera {
     /// Toggle the movie file output between video-recording mode (attached, Live Photo
     /// unavailable) and Live-Photo-capable mode (detached). See
     /// ``PRMCameraSession/setMovieFileOutputAttached(_:)`` for the rationale.
-    public func setMovieFileOutputAttached(_ attached: Bool) async throws {
-        PRMLogger.trace(.session, "PRMCamera.setMovieFileOutputAttached(\(attached))")
-        try await session.setMovieFileOutputAttached(attached)
+    /// Toggle the photo output's attachment to the session. Use when entering a
+    /// stills-incompatible workflow that's bumping the ISP budget (e.g. 240 fps
+    /// slo-mo with movie output attached, which triggers `AVError -11872 "Cannot
+    /// Record"`). See ``PRMCameraSession/setPhotoOutputAttached(_:)`` for the
+    /// full rationale. Consumers must rebuild cached ``PRMPhotoCapture``
+    /// wrappers after re-attach (the new photo output is a fresh instance).
+    public func setPhotoOutputAttached(_ attached: Bool) async throws {
+        PRMLogger.trace(.session, "PRMCamera.setPhotoOutputAttached(\(attached))")
+        try await session.setPhotoOutputAttached(attached)
+        // Attach/detach is a session begin/commit; wait for AVF's async pipeline
+        // rebuild before returning. See `switchCamera` for the rationale.
+        #if !os(macOS)
+            _ = await session.awaitPhotoOutputReady()
+        #endif
+    }
+
+    /// Toggle the movie file output between video-recording mode (attached, Live
+    /// Photo unavailable) and Live-Photo-capable mode (detached). Optional
+    /// `targetLivePhoto:` lets the caller bake the desired Live Photo state into
+    /// the same begin/commit — strongly recommended when entering a mode that
+    /// doesn't want Live Photo (e.g. NIGHT, PORTRAIT) to avoid the back-to-back
+    /// toggle storm that strands the secondary movie pipeline on virtual devices.
+    /// See ``PRMCameraSession/setMovieFileOutputAttached(_:targetLivePhoto:)`` for
+    /// the full rationale.
+    public func setMovieFileOutputAttached(_ attached: Bool, targetLivePhoto: Bool? = nil) async throws {
+        PRMLogger.trace(
+            .session,
+            "PRMCamera.setMovieFileOutputAttached(\(attached), targetLivePhoto=\(targetLivePhoto.map(String.init(describing:)) ?? "nil"))"
+        )
+        try await session.setMovieFileOutputAttached(attached, targetLivePhoto: targetLivePhoto)
+        // Movie-output attach/detach toggles `isLivePhotoCaptureEnabled` as a
+        // mutual-exclusion side-effect, which kicks off AVF's lengthy capture
+        // render pipeline rebuild. Wait for it to settle before returning so the
+        // consuming app's next mutation doesn't pile up on the in-flight rebuild.
+        #if !os(macOS)
+            _ = await session.awaitPhotoOutputReady()
+        #endif
     }
 
     /// Runtime toggle for Live Photo capability on the photo output. See
@@ -201,6 +250,13 @@ public final class PRMCamera {
     public func setLivePhotoCaptureEnabled(_ enabled: Bool) async {
         PRMLogger.trace(.session, "PRMCamera.setLivePhotoCaptureEnabled(\(enabled))")
         await session.setLivePhotoCaptureEnabled(enabled)
+        // The Live Photo toggle is exactly the trigger Apple documents as requiring
+        // "a lengthy reconfiguration of the capture render pipeline." Wait for AVF
+        // to finish that rebuild before returning — see `switchCamera` for the
+        // pipeline-stack-up rationale.
+        #if !os(macOS)
+            _ = await session.awaitPhotoOutputReady()
+        #endif
     }
 
     /// Promotes the device's `activeFormat` to the format with the largest landscape
@@ -217,6 +273,27 @@ public final class PRMCamera {
     /// `.builtInWideAngleCamera` via ``switchDevice(type:position:)`` first.
     public func setHighResolutionPhotoFormat(_ enabled: Bool) async {
         PRMLogger.trace(.session, "PRMCamera.setHighResolutionPhotoFormat(\(enabled))")
+        if enabled {
+            // Log a single .warning before we even touch the session if the active
+            // device is virtual. The format-swap helpers below will scan device.formats
+            // and pick the "best" one regardless, but virtual devices' formats cap at
+            // 12MP — the promotion is a silent no-op and the caller will wonder why
+            // captures stay at 12MP. Surface the cause once, here, with the fix path
+            // (`switchDevice(type: .builtInWideAngleCamera)`).
+            let isVirtual = await PRMCameraActor.shared.run { [session] in
+                await session.videoDevice?.prm_isVirtualMultiCameraDevice ?? false
+            }
+            if isVirtual {
+                PRMLogger.session.warning(
+                    """
+                    setHighResolutionPhotoFormat(true) called on a virtual multi-camera device — \
+                    virtual devices (.builtInTripleCamera / .builtInDualCamera / .builtInDualWideCamera) \
+                    cap at 12MP regardless of activeFormat. The promotion will silently no-op. \
+                    Call switchDevice(type: .builtInWideAngleCamera) first to access 48MP capture.
+                    """
+                )
+            }
+        }
         await PRMCameraActor.shared.run { [session] in
             if enabled {
                 await session.applyHighResolutionPhotoFormat()
@@ -224,6 +301,11 @@ public final class PRMCamera {
                 await session.applyLivePhotoCompatibleFormat()
             }
         }
+        // Format swap with aux-flag reconciliation is a session begin/commit;
+        // wait for AVF's async pipeline rebuild before returning. See `switchCamera`.
+        #if !os(macOS)
+            _ = await session.awaitPhotoOutputReady()
+        #endif
         await refreshDevice()
         await refreshState()
     }
@@ -359,13 +441,122 @@ public final class PRMCamera {
 
     public func setFrameRate(_ fps: Float64, allowFormatChange: Bool = true) async {
         PRMLogger.trace(.session, "PRMCamera.setFrameRate(\(fps), allowFormatChange=\(allowFormatChange))")
-        await runOnDevice { _ = try? $0.prm_setFrameRate(fps, allowFormatChange: allowFormatChange) }
+        // Whole transition (preset switch + format swap + movie-output re-attach) runs
+        // inside ONE `PRMCameraActor.shared.run` block so the actor stays exclusively
+        // held across all three steps. Without that, an external shutter tap can hop
+        // onto the actor between our `setMovieFileOutputAttached(false)` and
+        // `(true)` calls and observe `movieFileOutput == nil` — the user-visible
+        // symptom is `PRMVideoRecorder.start` failing with "is not attached to the
+        // session" right after the user just enabled slo-mo.
+        //
+        // **Critical preset rule**: `AVCaptureSession.Preset.photo` (and most other
+        // named presets) imposes session-level constraints that REJECT non-matching
+        // `activeFormat` choices. When a custom format is active under `.photo`,
+        // AVFoundation silently invalidates `AVCaptureMovieFileOutput`'s video
+        // connection — `output.connection(with: .video)` returns `nil` even though
+        // the output is still in `session.outputs`. This is the documented behavior
+        // since iOS 7 (see Apple dev-forum thread 87110 and the high-frame-rate API
+        // docs): *"If you don't manually set captureSession.sessionPreset to
+        // .inputPriority, your captured FPS will be the default, and setting
+        // device.activeVideoMinFrameDuration / activeVideoMaxFrameDuration won't
+        // have any effects."*
+        //
+        // The fix is to switch the session preset to `.inputPriority` for any
+        // `setFrameRate` call that's allowed to change format. The preset switch +
+        // format change happen inside the same `beginConfiguration` /
+        // `commitConfiguration` so AVF sees them atomically.
+        await PRMCameraActor.shared.run { [session] in
+            guard let device = await session.videoDevice else { return }
+            let avSession = session.session
+            let movieAttachedBefore = await session.movieFileOutput != nil
+
+            avSession.beginConfiguration()
+            // Relax to input-priority BEFORE the format swap. Skip the preset write
+            // if we're already there to avoid log noise and AVF re-validation churn.
+            if allowFormatChange, avSession.sessionPreset != .inputPriority {
+                if avSession.canSetSessionPreset(.inputPriority) {
+                    PRMLogger.session.notice(
+                        "setFrameRate: switching sessionPreset \(avSession.sessionPreset.rawValue, privacy: .public) → inputPriority to allow custom format"
+                    )
+                    avSession.sessionPreset = .inputPriority
+                } else {
+                    PRMLogger.session.warning(
+                        "setFrameRate: session does not support .inputPriority preset; format swap may invalidate AVCaptureMovieFileOutput connection"
+                    )
+                }
+            }
+            let change = try? device.prm_setFrameRate(fps, allowFormatChange: allowFormatChange)
+            avSession.commitConfiguration()
+
+            // Even with the `.inputPriority` preset switch, AVFoundation tears down
+            // `AVCaptureMovieFileOutput`'s video connection during the `activeFormat`
+            // swap and the same-instance rebuild doesn't always restore an active
+            // connection. Detach + re-attach forces a fresh output instance whose
+            // video connection is built from scratch against the now-current
+            // `activeFormat`. The detach/reattach has to happen inside the SAME
+            // actor block so an external shutter tap can't race into the gap and
+            // observe a transiently missing output. Both setters do their own
+            // session begin/commit; nesting them under the same actor hold is fine
+            // (the begin/commit pairs are sequential, not nested).
+            let didChangeFormat = change?.formatChanged ?? false
+            if movieAttachedBefore, didChangeFormat {
+                PRMLogger.session.notice("setFrameRate: format changed — re-attaching movieFileOutput against new active format")
+                try? await session.setMovieFileOutputAttached(false)
+                try? await session.setMovieFileOutputAttached(true)
+            }
+        }
+        // Wait for AVF's async pipeline rebuild to settle so the next consumer
+        // call doesn't stack a mutation onto an in-flight rebuild. The preset
+        // switch + format swap + (optional) movie-output cycle all trigger the
+        // "lengthy reconfiguration of the capture render pipeline" Apple docs
+        // for `isLivePhotoCaptureEnabled`. See `switchCamera` for the rationale.
+        #if !os(macOS)
+            _ = await session.awaitPhotoOutputReady()
+        #endif
         await refreshState()
     }
 
     public func resetFrameRate() async {
         PRMLogger.trace(.session, "PRMCamera.resetFrameRate")
-        await runOnDevice { try? $0.prm_resetFrameRate() }
+        // Restore the session preset that was active at `configure(_:)` time AND
+        // clear the device's custom min/max frame duration. `setFrameRate(_:)`
+        // may have switched the preset to `.inputPriority` for slo-mo; leaving the
+        // session in input-priority mode when the consuming app returns to a photo
+        // workflow can leave `AVCapturePhotoOutput` without an active video
+        // connection — the next `capturePhoto` call then crashes with an uncaught
+        // `NSInvalidArgumentException: No active and enabled video connection`.
+        // Restoring the documented preset re-validates every output against the
+        // preset's rules and rebuilds the photo output's connection.
+        //
+        // The restore is best-effort: if `canSetSessionPreset` returns false on
+        // the current device (e.g. portrait-only formats after `enableDepthFormat`
+        // that aren't `.photo`-preset-compatible), we leave the preset alone and
+        // log a warning rather than crashing.
+        await PRMCameraActor.shared.run { [session] in
+            guard let device = await session.videoDevice else { return }
+            let avSession = session.session
+            let originalPreset = await session.configuredSessionPreset
+            avSession.beginConfiguration()
+            if let originalPreset, avSession.sessionPreset != originalPreset {
+                if avSession.canSetSessionPreset(originalPreset) {
+                    PRMLogger.session.notice(
+                        "resetFrameRate: restoring sessionPreset \(avSession.sessionPreset.rawValue, privacy: .public) → \(originalPreset.rawValue, privacy: .public)"
+                    )
+                    avSession.sessionPreset = originalPreset
+                } else {
+                    PRMLogger.session.warning(
+                        "resetFrameRate: cannot restore sessionPreset \(originalPreset.rawValue, privacy: .public) on current device — staying on \(avSession.sessionPreset.rawValue, privacy: .public)"
+                    )
+                }
+            }
+            try? device.prm_resetFrameRate()
+            avSession.commitConfiguration()
+        }
+        // The preset restore is a session begin/commit; wait for AVF's async
+        // pipeline rebuild to settle before returning. See `switchCamera`.
+        #if !os(macOS)
+            _ = await session.awaitPhotoOutputReady()
+        #endif
         await refreshState()
     }
 
@@ -418,6 +609,11 @@ public final class PRMCamera {
             avSession.commitConfiguration()
             return didEnable
         }
+        // Depth-format swap + depth/matte flag re-toggle is a session begin/commit;
+        // wait for AVF's async pipeline rebuild before returning. See `switchCamera`.
+        #if !os(macOS)
+            _ = await session.awaitPhotoOutputReady()
+        #endif
         await refreshState()
         return result
     }
@@ -602,12 +798,6 @@ public final class PRMCamera {
 
     // MARK: - Streams
 
-    // Cleanup tasks in the `onTermination` blocks below are deliberately fire-and-forget:
-    // they run a single MainActor hop to remove the continuation entry and exit. Storing
-    // these handles would only complicate cancellation without changing behavior — the work
-    // is short-lived, uses `[weak self]`, and is harmless if `self` has deinited (the
-    // dictionary is gone too).
-
     /// Async stream of state snapshots.
     ///
     /// Yields the current ``state`` immediately on subscribe, then a new value on every
@@ -615,24 +805,15 @@ public final class PRMCamera {
     /// interruption streams only emit on actual events.
     ///
     /// **Subscriber cardinality is unbounded.** Each call creates a fresh stream and
-    /// stores its continuation in a per-camera dictionary keyed by UUID; the entry is
-    /// removed when the stream's iterator finishes (via `onTermination`). Typical usage
-    /// is 1–3 concurrent subscribers (HUD, drawer, telemetry strip). The dictionary
-    /// will grow if subscribers leak their iteration tasks — every `Task { for await
-    /// state in camera.stateStream() {...} }` must be stored and cancelled when the
-    /// owning view controller goes away, otherwise the continuation stays alive (and
-    /// keeps receiving values) until the camera itself deinits.
+    /// registers its continuation in a ``PRMStreamRegistry``; the entry is removed when
+    /// the stream's iterator finishes (via the registry's `onTermination` cleanup).
+    /// Typical usage is 1–3 concurrent subscribers (HUD, drawer, telemetry strip). The
+    /// registry will grow if subscribers leak their iteration tasks — every `Task {
+    /// for await state in camera.stateStream() {...} }` must be stored and cancelled
+    /// when the owning view controller goes away, otherwise the continuation stays alive
+    /// (and keeps receiving values) until the camera itself deinits.
     public func stateStream() -> AsyncStream<PRMCameraState> {
-        AsyncStream { continuation in
-            let id = UUID()
-            stateContinuations[id] = continuation
-            continuation.yield(state)
-            continuation.onTermination = { @Sendable [weak self] _ in
-                Task { @MainActor [weak self] in
-                    self?.stateContinuations.removeValue(forKey: id)
-                }
-            }
-        }
+        stateStreams.makeStream(initial: state)
     }
 
     /// Async stream of runtime errors emitted by the session.
@@ -641,15 +822,7 @@ public final class PRMCamera {
     /// already in flight before you subscribe are lost; subscribe before
     /// ``configure(_:)``/``start()`` to catch boot-time failures.
     public func errorStream() -> AsyncStream<PRMSessionError> {
-        AsyncStream { continuation in
-            let id = UUID()
-            errorContinuations[id] = continuation
-            continuation.onTermination = { @Sendable [weak self] _ in
-                Task { @MainActor [weak self] in
-                    self?.errorContinuations.removeValue(forKey: id)
-                }
-            }
-        }
+        errorStreams.makeStream()
     }
 
     /// Async stream of interruption events. `true` = interrupted, `false` = resumed.
@@ -657,15 +830,7 @@ public final class PRMCamera {
     /// Does **not** yield an initial value — to read the current interruption status,
     /// check ``state``.`isInterrupted` directly.
     public func interruptionStream() -> AsyncStream<Bool> {
-        AsyncStream { continuation in
-            let id = UUID()
-            interruptionContinuations[id] = continuation
-            continuation.onTermination = { @Sendable [weak self] _ in
-                Task { @MainActor [weak self] in
-                    self?.interruptionContinuations.removeValue(forKey: id)
-                }
-            }
-        }
+        interruptionStreams.makeStream()
     }
 
     // MARK: - State helpers
@@ -785,9 +950,7 @@ public final class PRMCamera {
         }
 
         state = updated
-        for continuation in stateContinuations.values {
-            continuation.yield(state)
-        }
+        stateStreams.yield(state)
     }
 
     private func refreshDevice() async {
@@ -852,113 +1015,6 @@ public final class PRMCamera {
     /// rejection from ``AVCaptureDevice/prm_setCustomExposure(duration:iso:completion:)``)
     /// so consumers see a signal instead of a silently dropped command.
     private func emitError(_ error: PRMSessionError) {
-        for continuation in errorContinuations.values {
-            continuation.yield(error)
-        }
-    }
-
-    // MARK: - Observers
-
-    private func installObservers() async {
-        // The KVO/notification closures below hop to MainActor via `Task { @MainActor in ... }`.
-        // These tasks are fire-and-forget by design: each one's body is a single short MainActor
-        // dispatch that yields a stream value. Storing handles would only add bookkeeping with
-        // no observable behavior change — `[weak self]` ensures the task no-ops if the camera
-        // has deinited, and the underlying observers are invalidated in `deinit` so no new tasks
-        // are spawned after teardown.
-        //
-        // Re-entrant: a follow-up `configure(_:)` call re-runs this method. Drop the
-        // previous observers first so we don't end up with duplicates yielding the same
-        // state twice per change (and re-adding them on every Apply tap in the
-        // ConfigurationLab example).
-        for obs in keyValueObservations {
-            obs.invalidate()
-        }
-        keyValueObservations.removeAll()
-        for obs in notificationObservers {
-            NotificationCenter.default.removeObserver(obs)
-        }
-        notificationObservers.removeAll()
-        let underlyingSession = session.session
-
-        let runningObservation = underlyingSession.observe(\.isRunning, options: .new) { [weak self] _, change in
-            guard let isRunning = change.newValue else { return }
-            Task { @MainActor [weak self] in
-                guard let self else { return }
-                state.isRunning = isRunning
-                for continuation in stateContinuations.values {
-                    continuation.yield(state)
-                }
-            }
-        }
-        keyValueObservations.append(runningObservation)
-
-        // Route `setExposureModeCustom` / `setWhiteBalanceModeLocked` completion-handler
-        // posts to `refreshState`. The completion handler can't capture `self` (it
-        // crosses the @Sendable boundary from a non-Sendable @MainActor class), so the
-        // device-completion paths post to NotificationCenter and we observe here.
-        let commitObserver = NotificationCenter.default.addObserver(
-            forName: Self.deviceCommitNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                await self?.refreshState()
-            }
-        }
-        notificationObservers.append(commitObserver)
-
-        let runtimeErrorObserver = NotificationCenter.default.addObserver(
-            forName: AVCaptureSession.runtimeErrorNotification,
-            object: underlyingSession,
-            queue: .main
-        ) { [weak self] notification in
-            let avError = notification.userInfo?[AVCaptureSessionErrorKey] as? AVError
-            Task { @MainActor [weak self] in
-                guard let self, let avError else { return }
-                for continuation in errorContinuations.values {
-                    continuation.yield(.runtime(avError))
-                }
-            }
-        }
-        notificationObservers.append(runtimeErrorObserver)
-
-        #if !os(macOS)
-            let interruptionObserver = NotificationCenter.default.addObserver(
-                forName: AVCaptureSession.wasInterruptedNotification,
-                object: underlyingSession,
-                queue: .main
-            ) { [weak self] _ in
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    state.isInterrupted = true
-                    for continuation in interruptionContinuations.values {
-                        continuation.yield(true)
-                    }
-                    for continuation in stateContinuations.values {
-                        continuation.yield(state)
-                    }
-                }
-            }
-            notificationObservers.append(interruptionObserver)
-
-            let endedObserver = NotificationCenter.default.addObserver(
-                forName: AVCaptureSession.interruptionEndedNotification,
-                object: underlyingSession,
-                queue: .main
-            ) { [weak self] _ in
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    state.isInterrupted = false
-                    for continuation in interruptionContinuations.values {
-                        continuation.yield(false)
-                    }
-                    for continuation in stateContinuations.values {
-                        continuation.yield(state)
-                    }
-                }
-            }
-            notificationObservers.append(endedObserver)
-        #endif
+        errorStreams.yield(error)
     }
 }

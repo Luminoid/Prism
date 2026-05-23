@@ -127,8 +127,14 @@ public enum PRMBufferPoolAllocator: Sendable {
         return colorSpace
     }
 
+    /// Walks the pool up to its `kCVPixelBufferPoolAllocationThresholdKey` ceiling by
+    /// creating `threshold` buffers in succession, then lets them release as the local
+    /// array goes out of scope. The point isn't to keep the buffers — it's to force the
+    /// pool to internally grow to its working set size at allocator-construction time,
+    /// so the first real frame doesn't pay the lazy-growth cost.
     private static func preallocate(pool: CVPixelBufferPool, threshold: Int) {
         var buffers: [CVPixelBuffer] = []
+        buffers.reserveCapacity(threshold)
         let aux = [kCVPixelBufferPoolAllocationThresholdKey as String: threshold] as NSDictionary
 
         var result: CVReturn = kCVReturnSuccess
@@ -139,7 +145,8 @@ public enum PRMBufferPoolAllocator: Sendable {
             )
             if let buffer { buffers.append(buffer) }
         }
-        buffers.removeAll()
+        // `buffers` deinit at the end of scope drops every ref; the pool keeps the
+        // internal capacity it just grew to. No explicit `removeAll()` needed.
     }
 
     private static func deriveFormat(

@@ -175,7 +175,7 @@
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.luminoid.PrismExample;
 				SDKROOT = iphoneos;
-				SWIFT_VERSION = 6.0;
+				SWIFT_VERSION = 6.2;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
 			name = Debug;
@@ -194,7 +194,7 @@
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.luminoid.PrismExample;
 				SDKROOT = iphoneos;
-				SWIFT_VERSION = 6.0;
+				SWIFT_VERSION = 6.2;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
 			name = Release;

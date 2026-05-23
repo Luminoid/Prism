@@ -631,9 +631,12 @@ final class StudioViewController: UIViewController {
                     self.nightCapture = PRMNightModeCapture(capture: capture, context: context)
                 }
             }
-            if let movieOutput = await self.camera.session.movieFileOutput {
-                let recorder = PRMVideoRecorder(output: movieOutput)
-                await MainActor.run { self.videoRecorder = recorder }
+            // Use the session-based init so the recorder transparently survives
+            // format-swap-driven movie output replacements (e.g. slo-mo activation
+            // re-attaches the output internally). The recorder resolves
+            // `session.movieFileOutput` afresh at every `start()` call.
+            await MainActor.run {
+                self.videoRecorder = PRMVideoRecorder(session: self.camera.session)
             }
         }
 
@@ -999,22 +1002,24 @@ final class StudioViewController: UIViewController {
             // Toggle the movie output based on whether the current mode actually needs to
             // record video. Photo / Live / Portrait / Night detach the movie output so
             // Live Photo and Portrait matte work; Video / Slo-Mo re-attach it.
+            //
+            // **Bake the desired Live Photo state into `setMovieFileOutputAttached`'s
+            // own begin/commit via `targetLivePhoto:`** instead of following it with a
+            // separate `setLivePhotoCaptureEnabled` call. Two back-to-back toggles
+            // (detach's mutual-exclusion side-effect, then the explicit setter) strand
+            // the secondary movie pipeline on virtual devices — see PRMCameraSession's
+            // `setMovieFileOutputAttached(_:targetLivePhoto:)` doc for the full
+            // rationale. Manual sliders / WB lock only behave when the photo output
+            // isn't advertising Live Photo (Live Photo's continuous-auto pipeline
+            // re-asserts the AE/AWB system), so any non-Live mode needs Live Photo OFF.
             let needsMovieOutput = (mode == .video || mode == .slowMo)
+            let needsLivePhoto = (mode == .live)
             do {
-                try await camera.setMovieFileOutputAttached(needsMovieOutput)
+                try await camera.setMovieFileOutputAttached(needsMovieOutput, targetLivePhoto: needsLivePhoto)
                 await refreshVideoRecorder()
             } catch {
                 reportError(error, context: "Mode switch")
             }
-
-            // Live Photo capability has to be *off* in every non-Live mode. Leaving it on
-            // makes AVFoundation silently revert manual exposure (custom ISO/shutter) and
-            // WB lock back to auto within a frame or two — the photo output requires the
-            // sensor in a continuous-auto pipeline to be able to retroactively bracket
-            // the Live Photo movie. Manual sliders only behave when the photo output
-            // isn't advertising Live Photo. Apple Camera's own UX matches: Live mode auto-
-            // enables Live Photo, switching away disables it. Studio mirrors that.
-            await camera.setLivePhotoCaptureEnabled(mode == .live)
 
             // Pro iPhones expose 120/240 fps slo-mo formats only on the physical wide
             // camera, not on the virtual triple. Hop devices on slo-mo entry / exit so
@@ -1096,6 +1101,19 @@ final class StudioViewController: UIViewController {
         preSlowMoDeviceType = current.deviceType
         do {
             pipeline.isEnabled = false
+            // Detach the photo output BEFORE switching to wide + bumping to 240 fps.
+            // Wide camera + photo output (with its Live Photo secondary movie pipeline)
+            // + video data output + movie output + 240 fps exceeds the ISP bandwidth
+            // budget per WWDC19 session 249 — AVF surfaces `AVError -11872 "Cannot
+            // Record — Too many camera hardware resources were requested"` via the
+            // runtime-error stream even though recording still proceeds. Apple's own
+            // Camera app drops the photo output for slo-mo for exactly this reason
+            // (slo-mo never offers Live Photo). The cached `photoCapture` /
+            // `nightCapture` wrappers stay valid because they hold the OLD output
+            // instance; we rebuild them on slo-mo exit via the existing capture-entry
+            // `refreshPhotoCaptureIfOutputChanged()` calls (slo-mo doesn't shoot
+            // stills, so no path through them while detached).
+            try? await camera.setPhotoOutputAttached(false)
             try await camera.switchDevice(type: .builtInWideAngleCamera, position: current.position)
             // Re-seed the portrait baseline before the rotation coordinator catches up.
             // A fresh device's video-data-output connection comes up at raw sensor
@@ -1129,6 +1147,12 @@ final class StudioViewController: UIViewController {
         do {
             pipeline.isEnabled = false
             try await camera.switchDevice(type: priorType, position: position)
+            // Re-attach the photo output that `switchToSlowMoDevice` detached. The
+            // new instance is a fresh `AVCapturePhotoOutput`; cached
+            // `PRMPhotoCapture` wrappers (photoCapture / nightCapture) will be
+            // identity-rebuilt on the next capture call via
+            // `refreshPhotoCaptureIfOutputChanged()`.
+            try? await camera.setPhotoOutputAttached(true)
             // See `switchToSlowMoDevice` — same baseline re-seed for the rebuilt
             // connection.
             await applyConnectionRotation(90)
@@ -1282,14 +1306,17 @@ final class StudioViewController: UIViewController {
         return .oneSecond
     }
 
-    /// Rebuilds `videoRecorder` to point at the *current* `movieFileOutput` (which is
-    /// recreated each time the movie output is reattached). Sets to nil when the output is
-    /// detached so `startRecording()` exits cleanly with a toast instead of using a stale
-    /// AVCaptureMovieFileOutput that AVFoundation has already torn down.
+    /// Sets `videoRecorder` to nil when the movie output is detached so
+    /// `startRecording()` exits cleanly with a toast, or keeps the existing
+    /// session-bound recorder when the output is present. The session-based
+    /// `PRMVideoRecorder(session:)` resolves the live output at every `start()`,
+    /// so we no longer need to recreate the recorder on every output reattach.
     private func refreshVideoRecorder() async {
         let movieOutput = await camera.session.movieFileOutput
-        if let movieOutput {
-            videoRecorder = PRMVideoRecorder(output: movieOutput)
+        if movieOutput != nil {
+            if videoRecorder == nil {
+                videoRecorder = PRMVideoRecorder(session: camera.session)
+            }
         } else {
             videoRecorder = nil
         }
@@ -1488,7 +1515,6 @@ final class StudioViewController: UIViewController {
     }
 
     private func captureNight() {
-        guard let nightCapture else { return }
         let resolved: NightDuration = nightDuration == .auto ? resolveAutoNightDuration() : nightDuration
         let params = resolved.capture
         let priorExposureMode = camera.state.exposureMode
@@ -1501,6 +1527,16 @@ final class StudioViewController: UIViewController {
             defer {
                 Task { await self.camera.setExposureMode(priorExposureMode) }
             }
+            // Rebuild the night capture wrapper if a session reconfigure since boot
+            // replaced the photo output instance (e.g. the Live-Photo-recovery path
+            // in `swapInput` for the wide→triple hop on the way into night mode).
+            // Same gate `captureLivePhotoOnCurrent` uses; without it the cached
+            // `nightCapture.capture.output` points at the detached pre-reconfigure
+            // instance whose `maxPhotoDimensions` reads (0, 0) and
+            // `connection(with: .video)` returns nil — every night capture then
+            // fails with "no video connection" even though the session is healthy.
+            await refreshPhotoCaptureIfOutputChanged()
+            guard let nightCapture = await MainActor.run(body: { self.nightCapture }) else { return }
             await camera.setCustomExposure(duration: duration, iso: params.iso)
             do {
                 let photo = try await nightCapture.capture(
@@ -2228,12 +2264,13 @@ extension StudioViewController {
                     // Max ON disables Live / Burst / Portrait at the session level. If the
                     // user was already in one of those modes when they toggle Max on, the
                     // picker chip becomes disabled but `self.mode` still points at it —
-                    // and `applyModeChange` is the only path that calls
-                    // `camera.setLivePhotoCaptureEnabled(mode == .live)`. Without dropping
-                    // the mode back to `.photo` here, a subsequent capture fails with
-                    // `Live Photo is not enabled on the photo output` even though the
-                    // user's last chip tap selected Live. The system Camera app handles
-                    // the same cross-feature conflict by silently moving the mode picker.
+                    // and `applyModeChange` is the only path that updates the photo
+                    // output's Live Photo state (via `setMovieFileOutputAttached(_:
+                    // targetLivePhoto: mode == .live)`). Without dropping the mode back
+                    // to `.photo` here, a subsequent capture fails with `Live Photo is
+                    // not enabled on the photo output` even though the user's last chip
+                    // tap selected Live. The system Camera app handles the same cross-
+                    // feature conflict by silently moving the mode picker.
                     if toggle.isOn, self.mode == .live || self.mode == .portrait {
                         PRMLogger.session.notice(
                             "Studio: Max ON forces mode \(self.mode.label, privacy: .public) → photo (incompatible with Max Dimensions)"

@@ -11,11 +11,14 @@
     ///
     /// ```swift
     /// let level = PRMLevelIndicatorView()
+    /// level.translatesAutoresizingMaskIntoConstraints = false
     /// cameraView.addSubview(level)
-    /// level.snp.makeConstraints { make in
-    ///     make.center.equalToSuperview()
-    ///     make.width.height.equalTo(140)
-    /// }
+    /// NSLayoutConstraint.activate([
+    ///     level.centerXAnchor.constraint(equalTo: cameraView.centerXAnchor),
+    ///     level.centerYAnchor.constraint(equalTo: cameraView.centerYAnchor),
+    ///     level.widthAnchor.constraint(equalToConstant: 140),
+    ///     level.heightAnchor.constraint(equalToConstant: 140),
+    /// ])
     /// level.isActive = true  // Starts motion updates
     /// ```
     ///
@@ -49,8 +52,20 @@
         /// Uses hysteresis: enters level state at this threshold, exits at `levelThreshold + 0.5`.
         public var levelThreshold: Double = 1.0
 
-        /// Smoothing factor for the low-pass filter (0.0–1.0).
-        /// Lower values = smoother but laggier; higher = more responsive but jittery.
+        /// Smoothing factor `α` for the exponential low-pass filter applied to the raw
+        /// roll signal (`filtered = α * raw + (1 - α) * filtered_prev`). Range `0.0–1.0`.
+        ///
+        /// Trade-off:
+        /// - `α → 0`: maximum smoothing, but the indicator visibly lags the device by
+        ///   100–300 ms when the user tilts quickly.
+        /// - `α → 1`: zero smoothing, but raw `CMDeviceMotion` jitter shows up as ±0.5°
+        ///   line wobble even on a still device.
+        ///
+        /// `0.05–0.20` is the practical band for hand-held photography UI; the default
+        /// `0.15` matches the iOS Camera app's perceived responsiveness. Smaller values
+        /// (`0.05–0.10`) make sense if the indicator drives a deliberate "is level"
+        /// snap-and-hold UX; larger values (`0.20–0.30`) if you're driving a continuous
+        /// numeric readout next to the line.
         public var smoothingFactor: Double = 0.15
 
         /// Whether the level indicator is actively tracking device motion.

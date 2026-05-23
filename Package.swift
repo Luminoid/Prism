@@ -12,9 +12,7 @@ let package = Package(
         .library(name: "PrismCore", targets: ["PrismCore"]),
         .library(name: "PrismUI", targets: ["PrismUI"]),
     ],
-    dependencies: [
-        .package(url: "https://github.com/SnapKit/SnapKit.git", from: "5.7.0"),
-    ],
+    dependencies: [],
     targets: [
         .target(
             name: "PrismCore",
@@ -28,7 +26,6 @@ let package = Package(
             name: "PrismUI",
             dependencies: [
                 "PrismCore",
-                .product(name: "SnapKit", package: "SnapKit"),
             ],
             path: "Sources/PrismUI",
             swiftSettings: [

@@ -159,6 +159,49 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
             willCapture: willCapture
         )
 
+        // Validate the video connection exists AND is active BEFORE calling
+        // `capturePhoto`. AVFoundation's underlying ObjC implementation throws an
+        // **uncaught** `NSInvalidArgumentException` ("*** -[AVCapturePhotoOutput
+        // capturePhotoWithSettings:delegate:] No active and enabled video
+        // connection") when no active connection exists — same crash class as
+        // `AVCaptureMovieFileOutput.startRecording`. Swift's `try / catch` cannot
+        // intercept an ObjC exception thrown from an async continuation context;
+        // the process terminates. Surfacing a typed `PRMSessionError` here lets
+        // the consuming app present a toast and reconfigure instead of crashing.
+        //
+        // The connection can go absent in several scenarios:
+        // - the session is currently between begin/commit of a reconfigure that
+        //   detached + is about to re-attach the photo output,
+        // - the device just switched (Triple → Wide on slo-mo) and the photo
+        //   output's video connection didn't survive the swap,
+        // - the session's `sessionPreset` was left at `.inputPriority` after a
+        //   slo-mo workflow without restoring the original preset — which leaves
+        //   the photo output without an active connection on the Triple camera,
+        // - the user just toggled Live Photo enabled/disabled, which on virtual
+        //   devices (Triple / Dual / DualWide) clears `output.maxPhotoDimensions`
+        //   to (0, 0) AND transiently invalidates the video connection while the
+        //   secondary movie pipeline rebuilds. AVFoundation finishes this rebuild
+        //   asynchronously after `commitConfiguration` returns — typically within
+        //   100-300 ms (vision-camera PR #3637 polls similarly). A first capture
+        //   immediately after a Wide → Triple swap + Live Photo toggle would see
+        //   the still-invalidated connection without a poll window.
+        //
+        // The poll is bounded (`waitForVideoConnection(timeout:)` — 3 s) and
+        // uses small steps so the user-perceived shutter lag is minimal when the
+        // pipeline is immediately ready (typical case). 3 s covers the worst-case
+        // Triple-Camera-after-SLO-MO rebuild observed empirically. If the poll
+        // exhausts, we surface the typed error instead of crashing.
+        try await waitForVideoConnection(timeout: 3.0)
+        // After the connection returns, `maxPhotoDimensions` may still read
+        // (0, 0) — the same Live-Photo-toggle invalidation that broke the
+        // connection also resets the per-format ceiling. Re-derive from the
+        // active device's current format. No session begin/commit needed: by
+        // the time we get here the async re-validation is done and a bare
+        // assignment lands. Skip when the ceiling is already populated (the
+        // common case — only the post-toggle first-capture path goes through
+        // this branch).
+        healMaxPhotoDimensionsIfNeeded()
+
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 pending.singleContinuation = continuation
@@ -289,6 +332,102 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         #endif
     }
 
+    /// Polls `output.connection(with: .video)` AND `output.captureReadiness` for up
+    /// to `timeout` seconds, returning when the connection is present, active and
+    /// enabled AND the photo output reports `.ready`. Throws
+    /// ``PRMSessionError/photoCaptureFailed`` if either condition is unsatisfied at
+    /// timeout.
+    ///
+    /// Necessary because AVFoundation's `commitConfiguration` returns *before* the
+    /// async re-validation of `AVCapturePhotoOutput` finishes. On virtual devices
+    /// (Triple / Dual / DualWide), a recent Live-Photo toggle or `swapInput`-driven
+    /// reconfigure can leave the video connection in a transient `nil` /
+    /// `isActive=false` state for **2-3 seconds** after the commit — well past any
+    /// reasonable polling window. Vision-camera PR #3637's 500 ms poll is too short
+    /// for the Triple-Camera-after-SLO-MO path.
+    ///
+    /// **`AVCapturePhotoOutput.captureReadiness`** (iOS 17+, per WWDC23 session
+    /// 10105) is Apple's documented signal for this exact case: `.sessionNotRunning`
+    /// covers the post-`commitConfiguration` rebuild window, transitioning to
+    /// `.ready` exactly when the pipeline (including connections) finishes
+    /// re-validating. Polling this property is the simplest correct path —
+    /// `AVCapturePhotoOutputReadinessCoordinator` provides a delegate-driven
+    /// equivalent but with the same underlying signal. The poll's job is to
+    /// observe the property; the property is the source of truth.
+    ///
+    /// 50 ms poll cadence balances shutter responsiveness (no perceptible lag
+    /// when the connection is immediately available — the common case) against
+    /// the post-reconfigure recovery window. 3 s timeout is generous enough for
+    /// the Triple-Camera-after-SLO-MO rebuild observed empirically; if it
+    /// exhausts, the session is in a non-recoverable state and the consuming
+    /// app should reconfigure.
+    private func waitForVideoConnection(timeout: TimeInterval) async throws {
+        let pollStep: UInt64 = 50_000_000 // 50 ms in nanoseconds
+        let deadline = Date().addingTimeInterval(timeout)
+        var lastFailureReason: String?
+        while Date() < deadline {
+            let connection = output.connection(with: .video)
+            let connectionReady = connection?.isEnabled == true && connection?.isActive == true
+            let readiness = output.captureReadiness
+            if connectionReady, readiness == .ready {
+                return
+            }
+            // Build a precise failure reason so the timeout message points at the
+            // actual stuck signal, not just "something is unready."
+            switch (connection, readiness) {
+            case (nil, _):
+                lastFailureReason = "no video connection, readiness=\(readiness.rawValue)"
+            case (_?, .ready) where !connectionReady:
+                lastFailureReason = "connection inactive/disabled, readiness=.ready"
+            case (_?, .sessionNotRunning):
+                lastFailureReason = "readiness=.sessionNotRunning (pipeline still rebuilding)"
+            case (_?, .notReadyMomentarily):
+                lastFailureReason = "readiness=.notReadyMomentarily"
+            case (_?, .notReadyWaitingForCapture):
+                lastFailureReason = "readiness=.notReadyWaitingForCapture (prior capture in flight)"
+            case (_?, .notReadyWaitingForProcessing):
+                lastFailureReason = "readiness=.notReadyWaitingForProcessing"
+            default:
+                lastFailureReason = "connection+readiness mismatch"
+            }
+            try? await Task.sleep(nanoseconds: pollStep)
+        }
+        throw PRMSessionError.photoCaptureFailed(
+            "AVCapturePhotoOutput not ready after \(Int(timeout * 1000)) ms poll (\(lastFailureReason ?? "unknown")) — session may need to be reconfigured"
+        )
+    }
+
+    /// Re-asserts `output.maxPhotoDimensions` against the active device's current
+    /// format when the cached ceiling has been clobbered to `(0, 0)`.
+    ///
+    /// Same root cause as ``waitForVideoConnection(timeout:)``: a recent Live-Photo
+    /// toggle resets the photo output's per-format ceilings. `PRMCameraSession`'s
+    /// session-side re-apply runs inside the toggle's `beginConfiguration` /
+    /// `commitConfiguration` block, but on virtual devices the assignment is
+    /// sometimes silently rejected — AVFoundation hasn't finished re-validating the
+    /// pipeline yet, so the bare commit-time write of `maxPhotoDimensions` doesn't
+    /// stick. By the time we poll the connection back in
+    /// `waitForVideoConnection`, the async re-validation is done and a plain
+    /// assignment (no session begin/commit) lands.
+    ///
+    /// No-op when `maxPhotoDimensions` is already non-zero (the common case;
+    /// only the first capture immediately after a virtual-device toggle hits the
+    /// `(0, 0)` path).
+    private func healMaxPhotoDimensionsIfNeeded() {
+        let current = output.maxPhotoDimensions
+        guard current.width == 0 || current.height == 0 else { return }
+        guard let device = activeDevice() else { return }
+        let supported = device.activeFormat.supportedMaxPhotoDimensions
+            .filter { $0.width >= $0.height }
+        guard let largest = supported.max(by: {
+            Int64($0.width) * Int64($0.height) < Int64($1.width) * Int64($1.height)
+        }) else { return }
+        output.maxPhotoDimensions = largest
+        PRMLogger.capture.notice(
+            "healMaxPhotoDimensions: re-applied \(largest.width, privacy: .public)×\(largest.height, privacy: .public) (was 0×0 after async pipeline re-validation)"
+        )
+    }
+
     /// The video device currently feeding the photo output. Walks
     /// `output.connections` (the single video connection) to its first input port
     /// and casts to `AVCaptureDeviceInput`. Returns `nil` if the output isn't
@@ -364,6 +503,18 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
                 filterRecipe: .none,
                 willCapture: willCapture
             )
+
+            // Same guard as the single-capture path. Poll for the photo output
+            // to reach `.ready` if it's transiently rebuilding after a recent
+            // session begin/commit (Live Photo toggle, swapInput rebuild). See
+            // the `capturePhoto` companion site for the full rationale.
+            do {
+                try await waitForVideoConnection(timeout: 3.0)
+            } catch {
+                PRMTempFile.remove(movieURL)
+                throw error
+            }
+            healMaxPhotoDimensionsIfNeeded()
 
             return try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { continuation in
@@ -745,26 +896,47 @@ extension PRMPhotoCapture: AVCapturePhotoCaptureDelegate {
 
             switch pending.kind {
             case .single:
-                pendingCaptures.removeValue(forKey: id)
-                return .terminal(pending, .success(result))
+                return finishSingleSuccess(id: id, pending: pending, result: result)
             case .live:
-                pending.capturedPhoto = result
-                // If the movie finished first, complete now.
-                if pending.liveMovieReady || pending.liveMovieError != nil {
-                    pendingCaptures.removeValue(forKey: id)
-                    if let movieError = pending.liveMovieError {
-                        return .terminal(pending, .failure(
-                            PRMSessionError.photoCaptureFailed(movieError.localizedDescription)
-                        ))
-                    } else {
-                        return .terminal(pending, .success(result))
-                    }
-                }
-                return .pendingLiveMovie
+                return finishLiveSuccess(id: id, pending: pending, result: result)
             }
         }()
 
         outcome.resume()
+    }
+
+    /// Single-photo success path. Removes the pending entry and returns a terminal
+    /// outcome carrying the rendered photo. Called with `lock` held by the caller —
+    /// mutates `pendingCaptures` directly.
+    private func finishSingleSuccess(
+        id: Int64,
+        pending: PendingCapture,
+        result: PRMPhoto
+    ) -> PhotoOutcome {
+        pendingCaptures.removeValue(forKey: id)
+        return .terminal(pending, .success(result))
+    }
+
+    /// Live Photo success path. If the movie sidecar has already arrived (or errored),
+    /// finalize now; otherwise stash the photo half on the pending entry and tell the
+    /// caller we're still waiting for the movie. Called with `lock` held.
+    private func finishLiveSuccess(
+        id: Int64,
+        pending: PendingCapture,
+        result: PRMPhoto
+    ) -> PhotoOutcome {
+        pending.capturedPhoto = result
+        // If the movie finished first, complete now.
+        guard pending.liveMovieReady || pending.liveMovieError != nil else {
+            return .pendingLiveMovie
+        }
+        pendingCaptures.removeValue(forKey: id)
+        if let movieError = pending.liveMovieError {
+            return .terminal(pending, .failure(
+                PRMSessionError.photoCaptureFailed(movieError.localizedDescription)
+            ))
+        }
+        return .terminal(pending, .success(result))
     }
 
     #if !os(macOS)
@@ -824,23 +996,38 @@ private enum PhotoOutcome {
 
     func resume() {
         guard case let .terminal(pending, result) = self else { return }
+        // Take-and-nil before resuming so any second arrival on this PendingCapture
+        // (in-flight delegate callbacks racing the cancellation/error path, or future
+        // logic errors that reach `.terminal` twice for the same entry) silently
+        // no-ops. `CheckedContinuation.resume` crashes the process on double-resume,
+        // so the cost of belt-and-suspenders here is one optional take and we lose
+        // nothing in exchange.
         switch pending.kind {
         case .single:
+            guard let continuation = pending.singleContinuation else { return }
+            pending.singleContinuation = nil
             switch result {
             case let .success(photo):
-                pending.singleContinuation?.resume(returning: photo)
+                continuation.resume(returning: photo)
             case let .failure(error):
-                pending.singleContinuation?.resume(throwing: error)
+                continuation.resume(throwing: error)
             }
         case let .live(movieURL):
+            guard let continuation = pending.liveContinuation else {
+                if case .failure = result {
+                    PRMTempFile.remove(movieURL)
+                }
+                return
+            }
+            pending.liveContinuation = nil
             switch result {
             case let .success(photo):
-                pending.liveContinuation?.resume(
+                continuation.resume(
                     returning: PRMLivePhoto(photo: photo, movieURL: movieURL)
                 )
             case let .failure(error):
                 PRMTempFile.remove(movieURL)
-                pending.liveContinuation?.resume(throwing: error)
+                continuation.resume(throwing: error)
             }
         }
     }

@@ -89,9 +89,12 @@ public final class PRMFilterPipeline: NSObject, @unchecked Sendable {
     private var _currentFormatDescription: CMFormatDescription?
     private let stateLock = NSLock()
 
-    // MARK: - Streams
+    // MARK: - Frame stream
 
-    private var streamContinuations: [UUID: AsyncStream<PRMVideoFrame>.Continuation] = [:]
+    /// Drops older queued frames so only the newest pending frame survives — correct for
+    /// preview consumers that prefer "skip the stale frame" over "play yesterday's frame".
+    /// See ``frameStream`` doc for the backpressure rationale.
+    private let frames = PRMStreamRegistry<PRMVideoFrame>(bufferingPolicy: .bufferingNewest(1))
 
     // Dropped-frame rollup state. AVFoundation calls `captureOutput(_:didDrop:from:)`
     // for every dropped frame — at 30-60 fps under interruption (incoming call,
@@ -102,18 +105,6 @@ public final class PRMFilterPipeline: NSObject, @unchecked Sendable {
     private var droppedFrameCount: UInt64 = 0
     private var lastDropLogTime: CFTimeInterval = 0
     private let dropLogInterval: CFTimeInterval = 2.0
-
-    deinit {
-        // Don't leave consumers hanging on `for await frame in pipeline.frameStream()` if the
-        // pipeline is deallocated mid-iteration.
-        stateLock.lock()
-        let continuations = Array(streamContinuations.values)
-        streamContinuations.removeAll()
-        stateLock.unlock()
-        for continuation in continuations {
-            continuation.finish()
-        }
-    }
 
     /// Async stream of processed frames.
     ///
@@ -128,18 +119,7 @@ public final class PRMFilterPipeline: NSObject, @unchecked Sendable {
     /// frames are also logged via the dedicated `didDrop` delegate path (visible at
     /// `.debug` level under `com.luminoid.Prism.Filter`).
     public func frameStream() -> AsyncStream<PRMVideoFrame> {
-        AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
-            let id = UUID()
-            stateLock.lock()
-            streamContinuations[id] = continuation
-            stateLock.unlock()
-            continuation.onTermination = { @Sendable [weak self] _ in
-                guard let self else { return }
-                stateLock.lock()
-                streamContinuations.removeValue(forKey: id)
-                stateLock.unlock()
-            }
-        }
+        frames.makeStream()
     }
 }
 
@@ -158,7 +138,6 @@ extension PRMFilterPipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
         let enabled = _isEnabled
         let renderer = _activeRenderer
         let onFrameCallback = _onFrame
-        let continuations = Array(streamContinuations.values)
         stateLock.unlock()
 
         guard enabled else { return }
@@ -233,9 +212,7 @@ extension PRMFilterPipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
             formatDescription: formatDescription
         )
         onFrameCallback?(frame)
-        for continuation in continuations {
-            continuation.yield(frame)
-        }
+        frames.yield(frame)
     }
 
     public func captureOutput(

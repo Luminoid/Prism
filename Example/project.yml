@@ -32,7 +32,7 @@ targets:
       base:
         INFOPLIST_FILE: Resources/Info.plist
         PRODUCT_BUNDLE_IDENTIFIER: com.luminoid.PrismExample
-        SWIFT_VERSION: "6.0"
+        SWIFT_VERSION: "6.2"
         CODE_SIGNING_ALLOWED: true
     info:
       path: Resources/Info.plist

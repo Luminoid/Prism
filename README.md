@@ -50,6 +50,7 @@ Sources/PrismUI/
 - **Rotation coordinator** — wraps iOS 17+ `AVCaptureDevice.RotationCoordinator` and exposes preview / capture angles as `AsyncStream<CGFloat>`
 - **Permissions** — async `PRMPermissions.requestCameraAccess()` / `requestMicrophoneAccess()`
 - **iOS 17/18 photo features** — `enableResponsiveCapture`, `enableAutoDeferredPhotoDelivery`, `enableZeroShutterLag`, `enableLivePhoto`, `enableDepthDataDelivery`, `enablePortraitEffectsMatteDelivery`, `preferredVideoStabilizationMode` on `PRMCameraConfiguration`
+- **Runtime format swap** — `await camera.setHighResolutionPhotoFormat(true)` promotes `activeFormat` to the 48MP-capable format on iPhone 14 Pro+ / 15 Pro+ wide camera (auxiliary delivery flags automatically reconciled per Apple dev-forum 715452); `await camera.enableDepthFormat()` switches to a depth-capable format for Portrait mode so depth ancillaries arrive populated.
 - **Multitasking camera access** — iPad-only opt-in via `enableMultitaskingCameraAccess`
 - **Lens descriptors** — `PRMLens` exposes raw 35mm-equivalent focal length per physical camera, with opt-in `snapping(to:tolerance:)` for marketing-friendly values
 - **Filter pipeline** — `PRMFilterPipeline` routes `AVCaptureVideoDataOutput` frames through any `PRMFilterRenderer`; delivery via callback or `AsyncStream<PRMVideoFrame>`
