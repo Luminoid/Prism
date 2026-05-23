@@ -143,6 +143,10 @@ See [Example/Sources/StudioViewController.swift](Example/Sources/StudioViewContr
 2. **Studio** — DSLR-grade camera: preview, lens picker (35mm-equivalent), tap-to-focus, pinch-to-zoom, vertical drag for exposure bias, top-bar toggles (torch / grid / aspect / timer / burst / settings), telemetry strip (mode, zoom, ISO, shutter, EV, WB, frame rate), mode strip with PHOTO / LIVE / PORTRAIT / PANO / VIDEO / SLO-MO / NIGHT, and a slide-in settings drawer covering every supported AVFoundation API.
 3. **Filter Chain** — real-time multi-filter editor with reorderable active pills, per-filter intensity sheet, and a library tabbed by category.
 
+| Studio | Settings drawer | Filter chain |
+|---|---|---|
+| <img src="docs/images/prism_1.png" alt="Studio DSLR shooting" width="240"> | <img src="docs/images/prism_2.png" alt="Camera settings drawer" width="240"> | <img src="docs/images/prism_3.png" alt="Filter chain editor" width="240"> |
+
 Regenerate the Xcode project:
 
 ```bash
