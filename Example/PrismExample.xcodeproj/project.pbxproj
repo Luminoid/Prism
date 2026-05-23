@@ -10,6 +10,7 @@
 		0838F9FBA10453582A8B0D00 /* DepthInspectorViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A668D4255D7028246510B53E /* DepthInspectorViewController.swift */; };
 		168617B0DB22105D061CA978 /* ConfigurationLabViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 033F012A261FEFF4499FEB98 /* ConfigurationLabViewController.swift */; };
 		1A59AD5DB9DBEB0D72EB9BC0 /* SnapKit in Frameworks */ = {isa = PBXBuildFile; productRef = FC7913A55783E87E6169140C /* SnapKit */; };
+		290F66B61CFBAD76E4217683 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 81D52CD5748C0D48FEF27E29 /* Assets.xcassets */; };
 		2E271F3B4DF03489EF8BBB9C /* SceneDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7AFBED18985B4C42614023AD /* SceneDelegate.swift */; };
 		33670C16697D8621EE13129D /* PrismCore in Frameworks */ = {isa = PBXBuildFile; productRef = 5680A63FFF1B03FE637F1A01 /* PrismCore */; };
 		40258322CB68603979892393 /* RootCatalogViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1BFC379ED771940D5CB70AB /* RootCatalogViewController.swift */; };
@@ -26,6 +27,7 @@
 		486B33EDCCB72EDE25192E3F /* PrismExample.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PrismExample.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		4F84EFBD24D61E5FF6AE4844 /* Prism */ = {isa = PBXFileReference; lastKnownFileType = folder; name = Prism; path = ..; sourceTree = SOURCE_ROOT; };
 		7AFBED18985B4C42614023AD /* SceneDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneDelegate.swift; sourceTree = "<group>"; };
+		81D52CD5748C0D48FEF27E29 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		9205AC2DEE68D93059206669 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		A393F4CE7D1B2A788030F14F /* StudioViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StudioViewController.swift; sourceTree = "<group>"; };
 		A668D4255D7028246510B53E /* DepthInspectorViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DepthInspectorViewController.swift; sourceTree = "<group>"; };
@@ -47,6 +49,14 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		694219074FB03C5DCB7D58AF /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				81D52CD5748C0D48FEF27E29 /* Assets.xcassets */,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
 		88B34A575645B42DD0ED0312 /* Packages */ = {
 			isa = PBXGroup;
 			children = (
@@ -59,6 +69,7 @@
 			isa = PBXGroup;
 			children = (
 				88B34A575645B42DD0ED0312 /* Packages */,
+				694219074FB03C5DCB7D58AF /* Resources */,
 				F35CBAE1BCEDCA65BB39F9E7 /* Sources */,
 				CE737317BECA93BE65095738 /* Products */,
 			);
@@ -95,6 +106,7 @@
 			buildConfigurationList = DB35B6F843E76602544FBAC4 /* Build configuration list for PBXNativeTarget "PrismExample" */;
 			buildPhases = (
 				AC5C10B75CC7444604EBE8A3 /* Sources */,
+				82B1A5DDA5DBB83F541EDB61 /* Resources */,
 				50BAB5217EE024645ACB55CD /* Frameworks */,
 			);
 			buildRules = (
@@ -141,6 +153,17 @@
 			);
 		};
 /* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		82B1A5DDA5DBB83F541EDB61 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				290F66B61CFBAD76E4217683 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		AC5C10B75CC7444604EBE8A3 /* Sources */ = {
