@@ -75,6 +75,8 @@ xcodebuild test  -scheme Prism-Package -destination 'platform=iOS Simulator,name
 make check   # SwiftLint + SwiftFormat
 ```
 
+> The scheme is `Prism-Package` (auto-generated from Package.swift), not `Prism`. Don't simplify or restructure Package.swift: past simplification attempts made the scheme disappear.
+
 ## Test Structure
 
 - **44 test suites, 142 tests** — Swift Testing (`@Test`, `#expect`, `@Suite`)
