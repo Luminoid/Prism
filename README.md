@@ -190,6 +190,12 @@ Info.plist keys: `NSCameraUsageDescription` (always), `NSMicrophoneUsageDescript
 
 Prism does not access UserDefaults, system boot time, or active keyboards, so those categories don't apply.
 
+## Used in
+
+| App | Description |
+|-----|-------------|
+| [Metamer](https://metamer.luminoid.dev) | Color-vision camera for iOS (CVD simulation, daltonize filters, true-color naming, Ishihara plate generator). Drives the live camera and filter preview through `PRMCamera`, `PRMFilterPipeline`, and `PRMPreviewView`. |
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
