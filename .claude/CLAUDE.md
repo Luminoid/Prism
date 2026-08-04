@@ -79,7 +79,7 @@ make check   # SwiftLint + SwiftFormat
 
 ## Test Structure
 
-- **44 test suites, 142 tests** — Swift Testing (`@Test`, `#expect`, `@Suite`)
+- **142 tests / 44 suites at v0.1.0 (release figure)** — Swift Testing (`@Test`, `#expect`, `@Suite`)
 - Tests mirror source structure exactly
 - The intensity-blend correctness fix is verified with golden pixel-comparison tests in `PRMFilterChainTests`
 - Device-touching paths (`AVCaptureDevice` extensions, `PRMPhotoCapture`/`PRMVideoRecorder`/`PRMDepthCapture` start/stop) can't run on simulator — `AVCaptureDevice.default(for:)` returns `nil`. Those modules are covered via **value-type tests** (enums, structs, presets), **API surface locks** (`KeyPath` lookups that fail to compile on signature drift), and **Sendable conformance checks** (`Task.detached` round-trips). Full hardware paths are exercised via the example app + manual test plan.
@@ -110,4 +110,4 @@ make check   # SwiftLint + SwiftFormat
 
 ---
 
-*Last updated 2026-05-22 — SnapKit removed from the library (Example app keeps its own SnapKit dep). Format-management split into `PRMCameraSession+Format.swift`, observer wiring into `PRMCamera+Observers.swift`, and async-stream plumbing consolidated behind `PRMStreamRegistry<T>`. PrismUI components rewritten on raw `NSLayoutConstraint`. 142 tests across 44 suites.*
+*Last updated 2026-05-22 — SnapKit removed from the library (Example app keeps its own SnapKit dep). Format-management split into `PRMCameraSession+Format.swift`, observer wiring into `PRMCamera+Observers.swift`, and async-stream plumbing consolidated behind `PRMStreamRegistry<T>`. PrismUI components rewritten on raw `NSLayoutConstraint`. 142 tests / 44 suites at v0.1.0 (release figure).*
