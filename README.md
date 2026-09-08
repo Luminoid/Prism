@@ -2,6 +2,7 @@
 
 [![Swift](https://img.shields.io/badge/Swift-6.2-orange.svg)](https://swift.org)
 [![Platform](https://img.shields.io/badge/iOS-18%2B-blue.svg)](https://developer.apple.com/ios/)
+[![Release](https://img.shields.io/github/v/release/Luminoid/Prism)](https://github.com/Luminoid/Prism/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 Camera pipeline Swift Package for iOS 18+, built on Swift 6.2 strict concurrency.
@@ -196,6 +197,11 @@ Prism does not access UserDefaults, system boot time, or active keyboards, so th
 |-----|-------------|
 | [Metamer](https://metamer.luminoid.dev) | Color-vision camera for iOS (CVD simulation, daltonize filters, true-color naming, Ishihara plate generator). Drives the live camera and filter preview through `PRMCamera`, `PRMFilterPipeline`, and `PRMPreviewView`. |
 
+## Related projects
+
+- [Monolith](https://github.com/Luminoid/Monolith): CLI that scaffolds iOS apps, Swift Packages, and Swift CLIs (Prism was scaffolded with it)
+- Everything else at [luminoid.dev](https://luminoid.dev)
+
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
