@@ -368,9 +368,9 @@ final class FilterChainViewController: UIViewController {
             guard let device = await session.videoDevice,
                   let photoOutput = await session.photoOutput
             else { return }
-            /// Score formats by the area of their largest landscape photo dimension.
-            /// Video formats with portrait `supportedMaxPhotoDimensions` score 0 and
-            /// are filtered out — they can never produce a usable still capture.
+            // Score formats by the area of their largest landscape photo dimension.
+            // Video formats with portrait `supportedMaxPhotoDimensions` score 0 and
+            // are filtered out — they can never produce a usable still capture.
             func score(_ format: AVCaptureDevice.Format) -> Int32 {
                 format.supportedMaxPhotoDimensions
                     .filter { $0.width >= $0.height }
