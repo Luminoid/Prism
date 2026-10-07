@@ -27,6 +27,18 @@ struct PRMSettingsDrawerViewTests {
         drawer.clear()
         // Smoke: clear() must not crash and may be called repeatedly.
         drawer.clear()
-        #expect(true)
+    }
+
+    @Test
+    func `Closed drawer is hidden from VoiceOver, open drawer is modal`() {
+        let drawer = PRMSettingsDrawerView()
+        #expect(drawer.accessibilityElementsHidden)
+        #expect(!drawer.accessibilityViewIsModal)
+        drawer.setOpen(true, animated: false)
+        #expect(!drawer.accessibilityElementsHidden)
+        #expect(drawer.accessibilityViewIsModal)
+        #expect(drawer.accessibilityPerformEscape())
+        #expect(!drawer.isOpen)
+        #expect(!drawer.accessibilityPerformEscape())
     }
 }

@@ -52,4 +52,29 @@ struct PRMCameraConfigurationTests {
         #expect(config.enablePortraitEffectsMatteDelivery)
         #expect(config.preferredVideoStabilizationMode == .cinematic)
     }
+
+    @Test
+    func `iOS 26 and 27 options default to off`() {
+        let config = PRMCameraConfiguration()
+        #expect(config.deferredStart == .systemDefault)
+        #expect(config.lensSmudgeDetectionInterval == nil)
+        #expect(!config.enableBluetoothHighQualityRecording)
+        #expect(!config.includesMetadataOutput)
+        #expect(config.metadataObjectTypes.isEmpty)
+        #expect(!config.enableCinematicVideo)
+        #expect(config.enableCameraSensorOrientationCompensation == nil)
+    }
+
+    @Test
+    func `Cinematic Video conflicts only warn`() {
+        // validate() logs warnings for Cinematic Video + Live Photo / 48MP / depth, but must
+        // not assert: those combinations are legal, AVFoundation just turns features off.
+        let config = PRMCameraConfiguration(
+            enableLivePhoto: true,
+            enableDepthDataDelivery: true,
+            enableCinematicVideo: true
+        )
+        // Returning (rather than tripping an assertion) is the check.
+        config.validate()
+    }
 }

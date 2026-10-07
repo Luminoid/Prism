@@ -19,9 +19,11 @@
             /// reading the value.
             case unconstrained
 
-            /// Width:height ratio, or `nil` for ``unconstrained``. Callers that compute
-            /// crop rects must guard on the nil case rather than substituting a default,
-            /// otherwise an "unconstrained" pass becomes an unintended 1:1 crop.
+            /// Long side : short side (`4/3` for ``ratio4x3``), or `nil` for ``unconstrained``.
+            /// ``PRMAspectRatioMaskView/cropRect(in:)`` orients it to the bounds, so 4:3 in a
+            /// portrait view is a 3:4 crop. Callers that compute crop rects must guard on the
+            /// nil case rather than substituting a default, otherwise an "unconstrained" pass
+            /// becomes an unintended 1:1 crop.
             public var value: CGFloat? {
                 switch self {
                 case .ratio4x3: 4.0 / 3.0
@@ -103,10 +105,14 @@
 
         // MARK: - Public
 
-        /// Returns the crop rectangle for the current aspect ratio within `bounds`.
-        /// Returns `bounds` unchanged when the active ratio is ``AspectRatio/unconstrained``.
+        /// Returns the crop rectangle for the current aspect ratio within `bounds`, oriented
+        /// like `bounds`: the ratio's long side runs along the longer side of `bounds`, so a
+        /// portrait preview or photo gets a portrait 3:4 crop for ``AspectRatio/ratio4x3``.
+        /// Returns `bounds` unchanged when the active ratio is ``AspectRatio/unconstrained``
+        /// or `bounds` is empty.
         public func cropRect(in bounds: CGRect) -> CGRect {
-            guard let target = aspectRatio.value else { return bounds }
+            guard let longToShort = aspectRatio.value, bounds.width > 0, bounds.height > 0 else { return bounds }
+            let target = bounds.width >= bounds.height ? longToShort : 1 / longToShort
             let boundsRatio = bounds.width / bounds.height
             let cropWidth: CGFloat
             let cropHeight: CGFloat

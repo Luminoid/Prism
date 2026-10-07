@@ -3,10 +3,12 @@ import Foundation
 /// Thread-safe `AsyncStream<Element>` continuation registry.
 ///
 /// Consolidates the UUID-keyed dictionary + `onTermination` cleanup + fan-out yield
-/// pattern that several types in PrismCore would otherwise reimplement (the camera
+/// pattern that several types in PrismCore would otherwise reimplement: the camera
 /// state / error / interruption streams on ``PRMCamera``, the preview / capture
-/// rotation streams on ``PRMRotationCoordinator``, and the frame stream on
-/// ``PRMFilterPipeline``).
+/// rotation streams on ``PRMRotationCoordinator``, the frame stream on
+/// ``PRMFilterPipeline``, the detected-object stream on ``PRMMetadataRouter``, and the
+/// session's device-event and Smart Framing streams. Unlike `AsyncStream.makeStream()`
+/// (one continuation), it fans each value out to every subscriber.
 ///
 /// Usage:
 /// ```swift
@@ -51,27 +53,36 @@ public final class PRMStreamRegistry<Element: Sendable>: @unchecked Sendable {
         }
     }
 
-    /// Number of currently-registered continuations. Primarily for tests.
+    /// Number of currently-registered continuations.
     public var count: Int {
         lock.lock()
         defer { lock.unlock() }
         return continuations.count
     }
 
+    /// Whether no subscriber is registered.
+    public var isEmpty: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return continuations.isEmpty
+    }
+
     /// Returns a fresh `AsyncStream<Element>` and registers its continuation.
     ///
     /// - Parameter initial: When non-nil, yielded immediately on subscribe. Use for
     ///   "current value + updates" streams (e.g. camera state) where the late-binding
-    ///   subscriber should see a snapshot rather than wait for the next mutation.
+    ///   subscriber should see a snapshot rather than wait for the next mutation. It's
+    ///   yielded under the same lock as the registration, so a concurrent ``yield(_:)``
+    ///   always lands after it, never before (which would leave the stale snapshot last).
     public func makeStream(initial: Element? = nil) -> AsyncStream<Element> {
         AsyncStream(bufferingPolicy: bufferingPolicy) { [self] continuation in
             let id = UUID()
             lock.lock()
-            continuations[id] = continuation
-            lock.unlock()
             if let initial {
                 continuation.yield(initial)
             }
+            continuations[id] = continuation
+            lock.unlock()
             continuation.onTermination = { @Sendable [weak self] _ in
                 guard let self else { return }
                 lock.lock()
@@ -85,6 +96,10 @@ public final class PRMStreamRegistry<Element: Sendable>: @unchecked Sendable {
     /// any actor or queue.
     public func yield(_ value: Element) {
         lock.lock()
+        guard !continuations.isEmpty else {
+            lock.unlock()
+            return
+        }
         let snapshot = Array(continuations.values)
         lock.unlock()
         for continuation in snapshot {

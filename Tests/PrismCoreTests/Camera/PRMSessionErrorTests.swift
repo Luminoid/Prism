@@ -39,4 +39,13 @@ struct PRMSessionErrorTests {
             #expect(error.errorDescription?.isEmpty == false)
         }
     }
+
+    @Test
+    func `iOS 26 and 27 errors compare and describe themselves`() {
+        #expect(PRMSessionError.exposureCombinationUnsupported == .exposureCombinationUnsupported)
+        #expect(PRMSessionError.unsupportedConfiguration("a") == .unsupportedConfiguration("a"))
+        #expect(PRMSessionError.unsupportedConfiguration("a") != .unsupportedConfiguration("b"))
+        #expect(PRMSessionError.exposureCombinationUnsupported.errorDescription?.isEmpty == false)
+        #expect(PRMSessionError.unsupportedConfiguration("why").errorDescription?.contains("why") == true)
+    }
 }

@@ -1,4 +1,5 @@
 import AVFoundation
+import os
 
 public extension AVCaptureDevice {
     /// Runs `body` inside a paired `lockForConfiguration()` / `unlockForConfiguration()`
@@ -8,10 +9,17 @@ public extension AVCaptureDevice {
     ///
     /// Forwards exceptions from `lockForConfiguration()` (and from `body`) untouched —
     /// AVFoundation's lock error has a specific reason code callers may want to inspect.
-    func withConfigurationLock<T>(_ body: () throws -> T) throws -> T {
+    func prm_withConfigurationLock<T>(_ body: () throws -> T) throws -> T {
         try lockForConfiguration()
         defer { unlockForConfiguration() }
         return try body()
+    }
+
+    /// Renamed ``prm_withConfigurationLock(_:)``; the unprefixed name could collide with an
+    /// app's own `AVCaptureDevice` extension.
+    @available(*, deprecated, renamed: "prm_withConfigurationLock(_:)")
+    func withConfigurationLock<T>(_ body: () throws -> T) throws -> T {
+        try prm_withConfigurationLock(body)
     }
 
     /// `true` for `.builtInTripleCamera`, `.builtInDualCamera`, `.builtInDualWideCamera`
@@ -32,5 +40,92 @@ public extension AVCaptureDevice {
     /// virtual device transitions between its constituent cameras.
     var prm_isVirtualMultiCameraDevice: Bool {
         !virtualDeviceSwitchOverVideoZoomFactors.isEmpty
+    }
+}
+
+// MARK: - Internal helpers
+
+extension AVCaptureDevice {
+    /// Clamps a device-space point into `0...1` on both axes; non-finite coordinates
+    /// become the center. AVFoundation raises on points of interest outside the unit square.
+    static func prm_clampedUnitPoint(_ point: CGPoint) -> CGPoint {
+        func clamp(_ value: CGFloat) -> CGFloat {
+            value.isFinite ? min(max(value, 0), 1) : 0.5
+        }
+        return CGPoint(x: clamp(point.x), y: clamp(point.y))
+    }
+
+    /// Device settings Prism changed on its own (rather than at the app's request), keyed
+    /// by `uniqueID`, so Prism restores only what it turned off itself.
+    enum PRMAutoAdjustment: Hashable {
+        /// `automaticallyAdjustsVideoHDREnabled`, turned off for full manual exposure.
+        case videoHDR
+        /// `isGeometricDistortionCorrectionEnabled`, turned off for a depth format.
+        case geometricDistortionCorrection
+    }
+
+    private static let prismDisabledAdjustments = OSAllocatedUnfairLock<Set<String>>(initialState: [])
+
+    private func prm_adjustmentKey(_ adjustment: PRMAutoAdjustment) -> String {
+        "\(uniqueID)|\(adjustment)"
+    }
+
+    /// Records that Prism turned `adjustment` off on this device.
+    func prm_noteDisabledByPrism(_ adjustment: PRMAutoAdjustment) {
+        let key = prm_adjustmentKey(adjustment)
+        Self.prismDisabledAdjustments.withLock { _ = $0.insert(key) }
+    }
+
+    /// Clears the record (the app took over the setting, or Prism restored it). Returns
+    /// whether Prism had turned it off.
+    @discardableResult
+    func prm_clearDisabledByPrism(_ adjustment: PRMAutoAdjustment) -> Bool {
+        let key = prm_adjustmentKey(adjustment)
+        return Self.prismDisabledAdjustments.withLock { $0.remove(key) != nil }
+    }
+
+    /// Starts a device change whose AVFoundation completion handler fires once the change
+    /// reaches a frame, and waits for it. Gives up after `timeout` seconds with
+    /// ``PRMSessionError/unsupportedConfiguration(_:)`` (`timeoutMessage`), because the handler
+    /// never runs while no frames flow (session stopped or interrupted). `start` receives a
+    /// resume-once callback; if it throws, that error is rethrown.
+    static func prm_awaitDeviceCommit(
+        timeout: TimeInterval,
+        timeoutMessage: String,
+        _ start: (@escaping @Sendable (Result<CMTime, any Error>) -> Void) throws -> Void
+    ) async throws -> CMTime {
+        try await withCheckedThrowingContinuation { continuation in
+            let resumed = OSAllocatedUnfairLock(initialState: false)
+            let resumeOnce: @Sendable (Result<CMTime, any Error>) -> Void = { result in
+                let isFirst = resumed.withLock { done in
+                    defer { done = true }
+                    return !done
+                }
+                if isFirst { continuation.resume(with: result) }
+            }
+            do {
+                try start(resumeOnce)
+            } catch {
+                resumeOnce(.failure(error))
+                return
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                resumeOnce(.failure(PRMSessionError.unsupportedConfiguration(timeoutMessage)))
+            }
+        }
+    }
+
+    /// Turns geometric distortion correction back on if ``prm_enableDepthFormat()`` turned
+    /// it off. Call when the device leaves a depth format or the session. Takes the
+    /// configuration lock itself.
+    func prm_restoreGeometricDistortionCorrectionIfNeeded() {
+        #if !os(macOS)
+            guard prm_clearDisabledByPrism(.geometricDistortionCorrection),
+                  isGeometricDistortionCorrectionSupported, !isGeometricDistortionCorrectionEnabled
+            else { return }
+            PRMLog.bestEffort(.session, "restore geometric distortion correction") {
+                try prm_withConfigurationLock { isGeometricDistortionCorrectionEnabled = true }
+            }
+        #endif
     }
 }

@@ -30,57 +30,22 @@ public extension PRMPhotoCapture {
     /// Captures a photo with depth and portrait effects matte ancillary data, if available.
     ///
     /// Requires `enableDepthDataDelivery` and/or `enablePortraitEffectsMatteDelivery` on
-    /// ``PRMCameraConfiguration``. Silently returns a photo with `nil` ancillaries if the
-    /// output doesn't support them for the active device/format.
+    /// ``PRMCameraConfiguration``. Requests HEVC, embedded depth and the embedded matte
+    /// according to what the live photo output delivers at capture time (checked after the
+    /// readiness wait, so a reconfigure can't leave a request the output would reject).
+    /// Returns a photo with `nil` ancillaries when the output doesn't deliver them for the
+    /// active device and format, and with manual exposure (bracketed captures carry none).
     func capturePortraitPhoto(
         settings: PRMPhotoSettings = PRMPhotoSettings(),
         applying filter: (any PRMFilter)? = nil,
         context: PRMRenderContext? = nil,
         willCapture: (@Sendable () -> Void)? = nil
     ) async throws -> PRMPortraitPhoto {
-        // Read against the public `output` (which for session-based wrappers
-        // returns the most recent capture resolution). The downstream
-        // `capturePhoto` call below re-resolves a fresh reference internally,
-        // so these property reads are only used to seed the settings builder —
-        // they don't gate the actual capture. The reads happen at capture-call
-        // time rather than wrapper-init time, so a session reconfigure between
-        // the first capture and this one already updates the cached snapshot.
-        let output = output
-        var portraitSettings = settings
-        // Force HEIC for Portrait. The iOS Photos.app's Portrait UI (badge + Edit-mode
-        // depth slider) only fires for HEIC files with Apple-written maker-note + depth
-        // aux. JPEG with embedded disparity aux is technically a valid depth photo
-        // (CGImageSourceCopyAuxiliaryDataInfoAtIndex round-trips it), but Photos.app
-        // treats it as a flat still — no badge, no slider. HEVC is available on every
-        // device that supports Portrait (iPhone 7+), so this is safe to force.
-        if portraitSettings.codec == nil, output.availablePhotoCodecTypes.contains(.hevc) {
-            portraitSettings = portraitSettings.codec(.hevc)
-        }
-        if output.isDepthDataDeliveryEnabled {
-            // Embed depth into the HEIC payload so AVFoundation writes the Apple-format
-            // maker-note + aux tracks that Photos.app recognizes. The prior `false` path
-            // existed because the package re-encoded the photo through a CIImage bokeh
-            // filter (which strips aux) and read depth via the property path. We now
-            // save the original `fileDataRepresentation()` unchanged, so embedding is
-            // the right answer — and on iPhone Pro models the deferred-photo issue that
-            // motivated the false path is no longer triggered by this code path.
-            portraitSettings = portraitSettings
-                .depthDataDelivery(true)
-                .embedsDepthDataInPhoto(true)
-        }
-        if output.isPortraitEffectsMatteDeliveryEnabled {
-            // Matte embed requires depth embed (AVFoundation invariant: matte is derived
-            // from depth, and an embedded matte without embedded depth is rejected as
-            // invalid). Both are true together above.
-            portraitSettings = portraitSettings
-                .portraitEffectsMatte(true)
-                .embedsPortraitEffectsMatteInPhoto(true)
-        }
         let photo = try await capturePhoto(
-            settings: portraitSettings,
-            applying: filter,
-            context: context,
-            willCapture: willCapture
+            settings: settings,
+            filterRecipe: filter.map { .single($0, context: context) } ?? .none,
+            willCapture: willCapture,
+            portrait: true
         )
         return PRMPortraitPhoto(
             photo: photo,

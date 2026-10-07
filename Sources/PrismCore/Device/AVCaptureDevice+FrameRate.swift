@@ -31,19 +31,15 @@ public extension AVCaptureDevice {
     /// - Throws: If the device cannot be locked for configuration.
     @discardableResult
     func prm_setFrameRate(_ fps: Float64, allowFormatChange: Bool = true) throws -> PRMFrameRateChange? {
-        guard fps > 0 else { return nil }
-        let duration = CMTimeMake(value: 1, timescale: Int32(fps))
+        guard fps.isFinite, fps > 0 else { return nil }
 
-        let currentSupports = activeFormat.videoSupportedFrameRateRanges.contains {
-            $0.minFrameRate <= fps && $0.maxFrameRate >= fps
-        }
-
-        if currentSupports {
-            try withConfigurationLock {
+        if let range = Self.prm_frameRateRange(containing: fps, in: activeFormat) {
+            let duration = Self.prm_frameDuration(forFPS: fps, min: range.minFrameDuration, max: range.maxFrameDuration)
+            try prm_withConfigurationLock {
                 activeVideoMinFrameDuration = duration
                 activeVideoMaxFrameDuration = duration
             }
-            return PRMFrameRateChange(appliedFPS: fps, formatChanged: false)
+            return PRMFrameRateChange(appliedFPS: Self.prm_frameRate(of: duration), formatChanged: false)
         }
 
         guard allowFormatChange else { return nil }
@@ -58,53 +54,23 @@ public extension AVCaptureDevice {
         //   read time at 120/240 fps doesn't allow more), so "largest" doesn't risk
         //   the 4K overload, and a wider format gives the user the best field of
         //   view — same trade-off Apple Camera makes for its slo-mo mode.
-        let preferLargest = fps >= 120
-        let targetMaxPixels: Int32 = 1920 * 1080
-        var bestSubHD: AVCaptureDevice.Format?
-        var bestSubHDPixels: Int32 = 0
-        var smallest: AVCaptureDevice.Format?
-        var smallestPixels: Int32 = .max
-        var largest: AVCaptureDevice.Format?
-        var largestPixels: Int32 = 0
-        for format in formats {
-            let supports = format.videoSupportedFrameRateRanges.contains {
-                $0.minFrameRate <= fps && $0.maxFrameRate >= fps
-            }
-            guard supports else { continue }
-            let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-            let pixels = dims.width * dims.height
-            if pixels <= targetMaxPixels, pixels > bestSubHDPixels {
-                bestSubHD = format
-                bestSubHDPixels = pixels
-            }
-            if pixels < smallestPixels {
-                smallest = format
-                smallestPixels = pixels
-            }
-            if pixels > largestPixels {
-                largest = format
-                largestPixels = pixels
-            }
+        let format = Self.prm_hdClassFormat(from: formats, preferLargest: fps >= 120) { format in
+            Self.prm_frameRateRange(containing: fps, in: format) != nil
         }
+        guard let format, let range = Self.prm_frameRateRange(containing: fps, in: format) else { return nil }
+        let duration = Self.prm_frameDuration(forFPS: fps, min: range.minFrameDuration, max: range.maxFrameDuration)
 
-        let format: AVCaptureDevice.Format? = if preferLargest {
-            largest ?? bestSubHD ?? smallest
-        } else {
-            bestSubHD ?? smallest
-        }
-        guard let format else { return nil }
-
-        try withConfigurationLock {
+        try prm_withConfigurationLock {
             activeFormat = format
             activeVideoMinFrameDuration = duration
             activeVideoMaxFrameDuration = duration
         }
-        return PRMFrameRateChange(appliedFPS: fps, formatChanged: true)
+        return PRMFrameRateChange(appliedFPS: Self.prm_frameRate(of: duration), formatChanged: true)
     }
 
     /// Clears frame rate constraints, returning to the device's default.
     func prm_resetFrameRate() throws {
-        try withConfigurationLock {
+        try prm_withConfigurationLock {
             activeVideoMinFrameDuration = .invalid
             activeVideoMaxFrameDuration = .invalid
         }
@@ -144,5 +110,68 @@ public extension AVCaptureDevice {
                 $0.minFrameRate <= fps && $0.maxFrameRate >= fps
             }
         }
+    }
+}
+
+// MARK: - Internal helpers
+
+extension AVCaptureDevice {
+    /// The format's frame-rate range that contains `fps`, if any.
+    static func prm_frameRateRange(containing fps: Float64, in format: AVCaptureDevice.Format) -> AVFrameRateRange? {
+        format.videoSupportedFrameRateRanges.first { $0.minFrameRate <= fps && $0.maxFrameRate >= fps }
+    }
+
+    /// Frame duration for `fps`, kept inside a range's `[min, max]` frame durations. Rates
+    /// at a range's ends use the range's own durations, so fractional rates such as 29.97
+    /// (1001/30000 s) come out exact; other rates use a 1/60000 s timescale. Pure, so it's
+    /// unit-testable.
+    static func prm_frameDuration(forFPS fps: Float64, min lower: CMTime, max upper: CMTime) -> CMTime {
+        let shortest = CMTimeGetSeconds(lower)
+        let longest = CMTimeGetSeconds(upper)
+        if shortest > 0, abs(1 / shortest - fps) < 0.01 { return lower }
+        if longest > 0, abs(1 / longest - fps) < 0.01 { return upper }
+        let duration = CMTimeMakeWithSeconds(1 / fps, preferredTimescale: 60000)
+        if lower.isNumeric, CMTimeCompare(duration, lower) < 0 { return lower }
+        if upper.isNumeric, CMTimeCompare(duration, upper) > 0 { return upper }
+        return duration
+    }
+
+    /// Frames per second for a frame duration (`0` when the duration isn't positive).
+    static func prm_frameRate(of duration: CMTime) -> Float64 {
+        let seconds = CMTimeGetSeconds(duration)
+        return seconds > 0 && seconds.isFinite ? 1 / seconds : 0
+    }
+
+    /// Picks a format for a frame-rate or depth switch: among formats matching `predicate`,
+    /// the largest at or below 1920×1080 pixels (so the preview doesn't push 4K through
+    /// Metal every frame), or the smallest when none is that small. With `preferLargest`
+    /// (slow motion, whose formats are already capped at 1080p or 720p) the largest match
+    /// wins outright.
+    static func prm_hdClassFormat(
+        from formats: [AVCaptureDevice.Format],
+        preferLargest: Bool = false,
+        where predicate: (AVCaptureDevice.Format) -> Bool
+    ) -> AVCaptureDevice.Format? {
+        let targetMaxPixels: Int64 = 1920 * 1080
+        var bestSubHD: (format: AVCaptureDevice.Format, pixels: Int64)?
+        var smallest: (format: AVCaptureDevice.Format, pixels: Int64)?
+        var largest: (format: AVCaptureDevice.Format, pixels: Int64)?
+        for format in formats where predicate(format) {
+            let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            let pixels = Int64(dims.width) * Int64(dims.height)
+            if pixels <= targetMaxPixels, pixels > (bestSubHD?.pixels ?? 0) {
+                bestSubHD = (format, pixels)
+            }
+            if pixels < (smallest?.pixels ?? .max) {
+                smallest = (format, pixels)
+            }
+            if pixels > (largest?.pixels ?? 0) {
+                largest = (format, pixels)
+            }
+        }
+        if preferLargest {
+            return (largest ?? bestSubHD ?? smallest)?.format
+        }
+        return (bestSubHD ?? smallest)?.format
     }
 }

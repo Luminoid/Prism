@@ -37,7 +37,7 @@ public final class PRMCamera {
 
     /// Most recent observed state. Updated by ``refreshState()`` and by mutation methods.
     /// The setter is `internal` (not `private(set)`) so the observer extension in
-    /// ``PRMCamera+Observers.swift`` can update interruption / running flags from
+    /// `PRMCamera+Observers.swift` can update interruption / running flags from
     /// notification callbacks; external consumers still see a read-only surface.
     public internal(set) var state = PRMCameraState()
 
@@ -45,8 +45,9 @@ public final class PRMCamera {
     /// See ``PRMStreamRegistry`` for the cleanup contract — registry's deinit finishes
     /// outstanding subscribers, so this class's deinit can stay minimal. `internal`
     /// rather than `private` so the observer-installation extension in
-    /// ``PRMCamera+Observers.swift`` can yield into them.
-    let stateStreams = PRMStreamRegistry<PRMCameraState>()
+    /// ``PRMCamera+Observers.swift`` can yield into them. State is latest-wins: a slow
+    /// subscriber sees the newest snapshot, not a backlog.
+    let stateStreams = PRMStreamRegistry<PRMCameraState>(bufferingPolicy: .bufferingNewest(1))
     let errorStreams = PRMStreamRegistry<PRMSessionError>()
     let interruptionStreams = PRMStreamRegistry<Bool>()
 
@@ -55,6 +56,11 @@ public final class PRMCamera {
     var keyValueObservations: [NSKeyValueObservation] = []
     var notificationObservers: [any NSObjectProtocol] = []
 
+    /// Turns the session's device-level change ticks (smudge status, system pressure,
+    /// tracking, aspect ratio, …) into `refreshState()` calls. Started on first
+    /// ``configure(_:)``, cancelled in `deinit`.
+    var deviceEventTask: Task<Void, Never>?
+
     // User-driven mode intents that override AVFoundation's lagging device
     // reads during the ~3 s window between the slider-driven setter call and
     // its completion handler firing (per Apple dev-forum 751112). Without
@@ -62,17 +68,13 @@ public final class PRMCamera {
     // the UI flips back to "(auto)" mid-drag — the user-visible "slider
     // jumped back to auto" symptom. Cleared the moment the device commits
     // (mode matches the intent), or when the user explicitly picks a new mode.
-    private var intendedExposureMode: AVCaptureDevice.ExposureMode?
-    private var intendedWhiteBalanceMode: AVCaptureDevice.WhiteBalanceMode?
+    var intendedExposureMode: AVCaptureDevice.ExposureMode?
+    var intendedWhiteBalanceMode: AVCaptureDevice.WhiteBalanceMode?
 
-    /// User-intent snapshot for the manual exposure values, exposed so the
-    /// photo-capture layer can patch the saved photo's EXIF without racing
-    /// the device's lagging `iso` / `exposureDuration` properties. Returns
-    /// `nil` when the user isn't in custom exposure mode. Caller is
-    /// responsible for using this only when capturing in a manual context.
-    /// Snapshot the user-driven manual exposure values for callers that need
-    /// to mirror them into a downstream API (e.g. `PRMPhotoCapture`'s EXIF
-    /// patch path). Returns `nil` in continuous-auto modes.
+    /// User-intent snapshot of the manual exposure values, for passing to
+    /// ``PRMPhotoSettings/manualExposureOverride(iso:duration:)`` so the saved photo's EXIF
+    /// doesn't race the device's lagging `iso` / `exposureDuration` properties. `nil` when
+    /// the user isn't in custom exposure mode.
     ///
     /// Reads `state.exposureMode == .custom` as the source-of-truth for "is
     /// the user in manual exposure?" — NOT the transient `intendedExposureMode`
@@ -87,6 +89,9 @@ public final class PRMCamera {
     public var currentManualExposureSnapshot: (iso: Float, duration: CMTime)? {
         let isManual = state.exposureMode == .custom || intendedExposureMode == .custom
         guard isManual else { return nil }
+        // iOS 27 priority modes leave some axes to auto exposure; their values aren't
+        // the user's, so don't patch them into EXIF as manual.
+        guard (intendedAutoExposureAxes ?? state.autoExposureAxes).isEmpty else { return nil }
         let iso = intendedISO ?? state.iso
         let durationSeconds = intendedExposureDurationSeconds ?? state.exposureDurationSeconds ?? 0
         guard iso > 0, durationSeconds > 0, durationSeconds.isFinite else { return nil }
@@ -99,21 +104,34 @@ public final class PRMCamera {
     /// telemetry tick reads the stale auto-driven `device.iso` after the user
     /// releases the slider and the value visibly snaps back — the
     /// "ISO jumped back" symptom that survived the exposure-mode override.
-    private var intendedISO: Float?
+    var intendedISO: Float?
     /// User-set exposure duration (seconds) honored by
     /// ``state``.exposureDurationSeconds until AVFoundation commits.
-    private var intendedExposureDurationSeconds: Double?
+    var intendedExposureDurationSeconds: Double?
     /// User-set WB Kelvin honored by ``state``.whiteBalanceTemperature until
     /// AVFoundation commits the locked WB gains.
-    private var intendedWhiteBalanceTemperature: Float?
+    var intendedWhiteBalanceTemperature: Float?
     /// Auto-exposure ISO baseline snapshotted whenever the device is in
     /// continuous / auto exposure (and the user isn't actively driving sliders).
     /// Used as the reference point for the Tv/Av-priority reciprocity math in
-    /// ``setISO(_:)`` and ``setShutterSpeed(seconds:)`` so the OTHER axis can
+    /// ``setISO(_:baseline:)`` and ``setShutterSpeed(seconds:baseline:)`` so the OTHER axis can
     /// be adjusted to preserve the auto-metered light value when one axis is
     /// changed by the user.
     private var autoExposureBaselineISO: Float?
     private var autoExposureBaselineDurationSeconds: Double?
+    /// iOS 27: user-set aperture honored by ``state``.lensAperture until the device commits.
+    var intendedLensAperture: Float?
+    /// iOS 27: auto axes the user asked for in a priority mode, honored by
+    /// ``state``.autoExposureAxes until the device reports the same set.
+    var intendedAutoExposureAxes: PRMExposureAxes?
+
+    /// `PRMLog.once` keys written by failing slider-rate setters, by setter name, so the
+    /// setter's next success can re-arm them. See ``logThrottled(_:setter:_:error:file:line:)``.
+    var throttledLogKeys: [String: Set<String>] = [:]
+
+    /// The camera Cinematic Video moved away from, to go back to when it's turned off.
+    /// Cleared by any camera switch the app makes.
+    var cinematicReturn: CinematicReturn?
 
     // MARK: - Init
 
@@ -124,6 +142,7 @@ public final class PRMCamera {
     }
 
     deinit {
+        deviceEventTask?.cancel()
         for obs in keyValueObservations {
             obs.invalidate()
         }
@@ -138,7 +157,7 @@ public final class PRMCamera {
 
     /// Configures the session and refreshes ``device`` + ``state``.
     public func configure(_ configuration: PRMCameraConfiguration) async throws {
-        PRMLogger.trace(.session, "PRMCamera.configure")
+        PRMLog.debug(.session, "PRMCamera.configure")
         // Reconfigure clears any per-session manual-exposure / WB intents — the
         // new session starts in `.continuousAuto` for both axes, and we don't
         // want a stale intent from before configure to keep overriding the read.
@@ -147,29 +166,51 @@ public final class PRMCamera {
         await refreshDevice()
         await refreshState()
         await installObservers()
+        startDeviceEventPumpIfNeeded()
+    }
+
+    private func startDeviceEventPumpIfNeeded() {
+        guard deviceEventTask == nil else { return }
+        let events = session.deviceEvents.makeStream()
+        deviceEventTask = Task { [weak self] in
+            for await _ in events {
+                await self?.refreshState()
+                // The registry keeps only the latest tick, so pausing here caps refreshes at
+                // ~10 Hz even when a property (a variable aperture in auto) changes per frame.
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+        }
     }
 
     /// Starts the session. Idempotent.
     public func start() async {
-        PRMLogger.trace(.session, "PRMCamera.start")
+        PRMLog.debug(.session, "PRMCamera.start")
         await session.start()
         await refreshState()
     }
 
     /// Stops the session. Idempotent.
     public func stop() async {
-        PRMLogger.trace(.session, "PRMCamera.stop")
+        PRMLog.debug(.session, "PRMCamera.stop")
         await session.stop()
         await refreshState()
     }
 
     /// Switches the camera position and refreshes ``device``.
     public func switchCamera(to position: AVCaptureDevice.Position) async throws {
-        PRMLogger.trace(.session, "PRMCamera.switchCamera(\(position.rawValue))")
+        PRMLog.debug(.session, "PRMCamera.switchCamera(\(position.prm_logName))")
         // The new physical device starts in `.continuousAuto` — drop intents so
         // the override doesn't keep painting the old custom state on the new lens.
         clearIntendedState()
-        _ = try await session.switchCamera(to: position)
+        cinematicReturn = nil
+        // Cinematic Video stays on across a flip: land on the camera it runs on there, and
+        // go back to the position's usual camera when it's turned off.
+        if let cinematic = await cinematicVideoCamera(at: position) {
+            _ = try await session.switchDevice(type: cinematic.cinematicDeviceType, position: position)
+            cinematicReturn = cinematic
+        } else {
+            _ = try await session.switchCamera(to: position)
+        }
         // Wait for AVF's async pipeline rebuild to settle before returning, so the
         // consuming app's follow-up mutations (mode-change handlers that toggle
         // Live Photo / movie output) don't land on an in-flight rebuild — which on
@@ -178,6 +219,7 @@ public final class PRMCamera {
         #if !os(macOS)
             _ = await session.awaitPhotoOutputReady()
         #endif
+        await reapplyCinematicVideoAfterSwitch()
         await refreshDevice()
         await refreshState()
     }
@@ -190,20 +232,19 @@ public final class PRMCamera {
         type: AVCaptureDevice.DeviceType,
         position: AVCaptureDevice.Position? = nil
     ) async throws {
-        PRMLogger.trace(.session, "PRMCamera.switchDevice(type=\(type.rawValue), pos=\(position?.rawValue.description ?? "nil"))")
+        PRMLog.debug(.session, "PRMCamera.switchDevice(type=\(type.prm_logName), position=\(position?.prm_logName ?? "current"))")
         clearIntendedState()
+        cinematicReturn = nil
         _ = try await session.switchDevice(type: type, position: position)
         // See `switchCamera` for the readiness-wait rationale.
         #if !os(macOS)
             _ = await session.awaitPhotoOutputReady()
         #endif
+        await reapplyCinematicVideoAfterSwitch()
         await refreshDevice()
         await refreshState()
     }
 
-    /// Toggle the movie file output between video-recording mode (attached, Live Photo
-    /// unavailable) and Live-Photo-capable mode (detached). See
-    /// ``PRMCameraSession/setMovieFileOutputAttached(_:)`` for the rationale.
     /// Toggle the photo output's attachment to the session. Use when entering a
     /// stills-incompatible workflow that's bumping the ISP budget (e.g. 240 fps
     /// slo-mo with movie output attached, which triggers `AVError -11872 "Cannot
@@ -211,7 +252,7 @@ public final class PRMCamera {
     /// full rationale. Consumers must rebuild cached ``PRMPhotoCapture``
     /// wrappers after re-attach (the new photo output is a fresh instance).
     public func setPhotoOutputAttached(_ attached: Bool) async throws {
-        PRMLogger.trace(.session, "PRMCamera.setPhotoOutputAttached(\(attached))")
+        PRMLog.debug(.session, "PRMCamera.setPhotoOutputAttached(\(attached))")
         try await session.setPhotoOutputAttached(attached)
         // Attach/detach is a session begin/commit; wait for AVF's async pipeline
         // rebuild before returning. See `switchCamera` for the rationale.
@@ -229,7 +270,7 @@ public final class PRMCamera {
     /// See ``PRMCameraSession/setMovieFileOutputAttached(_:targetLivePhoto:)`` for
     /// the full rationale.
     public func setMovieFileOutputAttached(_ attached: Bool, targetLivePhoto: Bool? = nil) async throws {
-        PRMLogger.trace(
+        PRMLog.debug(
             .session,
             "PRMCamera.setMovieFileOutputAttached(\(attached), targetLivePhoto=\(targetLivePhoto.map(String.init(describing:)) ?? "nil"))"
         )
@@ -248,7 +289,7 @@ public final class PRMCamera {
     /// entering manual exposure (custom ISO / shutter / WB lock) and back on when the
     /// user returns to auto exposure with Live Photo capture intended.
     public func setLivePhotoCaptureEnabled(_ enabled: Bool) async {
-        PRMLogger.trace(.session, "PRMCamera.setLivePhotoCaptureEnabled(\(enabled))")
+        PRMLog.debug(.session, "PRMCamera.setLivePhotoCaptureEnabled(\(enabled))")
         await session.setLivePhotoCaptureEnabled(enabled)
         // The Live Photo toggle is exactly the trigger Apple documents as requiring
         // "a lengthy reconfiguration of the capture render pipeline." Wait for AVF
@@ -272,7 +313,7 @@ public final class PRMCamera {
     /// devices cap at 12MP regardless of format selection. Swap to
     /// `.builtInWideAngleCamera` via ``switchDevice(type:position:)`` first.
     public func setHighResolutionPhotoFormat(_ enabled: Bool) async {
-        PRMLogger.trace(.session, "PRMCamera.setHighResolutionPhotoFormat(\(enabled))")
+        PRMLog.debug(.session, "PRMCamera.setHighResolutionPhotoFormat(\(enabled))")
         if enabled {
             // Log a single .warning before we even touch the session if the active
             // device is virtual. The format-swap helpers below will scan device.formats
@@ -280,11 +321,9 @@ public final class PRMCamera {
             // 12MP — the promotion is a silent no-op and the caller will wonder why
             // captures stay at 12MP. Surface the cause once, here, with the fix path
             // (`switchDevice(type: .builtInWideAngleCamera)`).
-            let isVirtual = await PRMCameraActor.shared.run { [session] in
-                await session.videoDevice?.prm_isVirtualMultiCameraDevice ?? false
-            }
-            if isVirtual {
-                PRMLogger.session.warning(
+            if device?.switchOverZoomFactors.isEmpty == false {
+                PRMLog.warning(
+                    .session,
                     """
                     setHighResolutionPhotoFormat(true) called on a virtual multi-camera device — \
                     virtual devices (.builtInTripleCamera / .builtInDualCamera / .builtInDualWideCamera) \
@@ -294,17 +333,21 @@ public final class PRMCamera {
                 )
             }
         }
-        await PRMCameraActor.shared.run { [session] in
-            if enabled {
-                await session.applyHighResolutionPhotoFormat()
-            } else {
-                await session.applyLivePhotoCompatibleFormat()
-            }
+        do {
+            try await session.setHighResolutionPhotoFormat(enabled)
+        } catch {
+            reportFailure(error, operation: "setHighResolutionPhotoFormat")
+            return
         }
         // Format swap with aux-flag reconciliation is a session begin/commit;
         // wait for AVF's async pipeline rebuild before returning. See `switchCamera`.
         #if !os(macOS)
             _ = await session.awaitPhotoOutputReady()
+            // Depth and portrait matte can only come back once the restored format's
+            // commit has landed.
+            if !enabled, await session.reapplyAuxiliaryPhotoDeliveryIfNeeded() {
+                _ = await session.awaitPhotoOutputReady()
+            }
         #endif
         await refreshDevice()
         await refreshState()
@@ -312,31 +355,60 @@ public final class PRMCamera {
 
     // MARK: - Device controls (forward to AVCaptureDevice extensions on actor)
 
+    /// Sets the raw zoom factor, clamped to the device range (and, while Cinematic Video
+    /// is enabled, to its narrower zoom range). Slider-rate: a failure is logged once until
+    /// a later call succeeds.
     public func setZoom(_ factor: CGFloat) async {
-        await runOnDevice { try? $0.prm_setZoom(factor) }
+        do {
+            try await session.setZoom(factor)
+            clearThrottledLogs(for: "setZoom")
+        } catch {
+            logThrottled(.warning, setter: "setZoom", "setZoom failed", error: error)
+        }
         await refreshState()
     }
 
+    /// Starts a smooth zoom ramp to `factor` (clamped as in ``setZoom(_:)``); `rate` doubles
+    /// the magnification per second at `1.0`. Returns once the ramp has started; pair with
+    /// ``cancelZoomRamp()`` to stop early.
     public func rampZoom(to factor: CGFloat, rate: Float = 1.0) async {
-        await runOnDevice { try? $0.prm_rampZoom(to: factor, rate: rate) }
+        do {
+            try await session.rampZoom(to: factor, rate: rate)
+            clearThrottledLogs(for: "rampZoom")
+        } catch {
+            logThrottled(.warning, setter: "rampZoom", "rampZoom failed", error: error)
+        }
     }
 
+    /// Stops an in-progress zoom ramp at the current factor.
     public func cancelZoomRamp() async {
-        await runOnDevice { try? $0.prm_cancelZoomRamp() }
+        await runOnDevice { device in
+            PRMLog.bestEffort(.session, "cancelZoomRamp") { try device.prm_cancelZoomRamp() }
+        }
     }
 
+    /// Sets the torch. Devices without a torch (or without `.auto`) emit
+    /// ``PRMSessionError/unsupportedConfiguration(_:)`` on ``errorStream()``; turning the
+    /// torch off is always accepted.
     public func setTorch(_ mode: AVCaptureDevice.PRMTorchMode) async {
-        await runOnDevice { try? $0.prm_setTorch(mode) }
+        await runDeviceSetter("setTorch") { try $0.prm_setTorch(mode) }
         await refreshState()
     }
 
+    /// Sets exposure compensation in EV, clamped to the device range. Slider-rate: a failure
+    /// is logged once until a later call succeeds.
     public func setExposureBias(_ bias: Float) async {
-        await runOnDevice { try? $0.prm_setExposureBias(bias) }
+        await runOnDevice { device in
+            PRMLog.bestEffort(.session, "setExposureBias", throttled: true) { try device.prm_setExposureBias(bias) }
+        }
         await refreshState()
     }
 
+    /// Sets the exposure mode. Leaving `.custom` drops the pinned manual values so ``state``
+    /// follows auto exposure again. An unsupported mode emits
+    /// ``PRMSessionError/unsupportedConfiguration(_:)`` on ``errorStream()``.
     public func setExposureMode(_ mode: AVCaptureDevice.ExposureMode) async {
-        PRMLogger.trace(.session, "PRMCamera.setExposureMode(\(mode.rawValue))")
+        PRMLog.debug(.session, "PRMCamera.setExposureMode(\(mode.rawValue))")
         // User explicitly picked a mode — drop any prior manual-exposure intent
         // so the UI doesn't keep showing "custom" after the user taps auto.
         intendedExposureMode = mode
@@ -347,17 +419,32 @@ public final class PRMCamera {
         if mode != .custom {
             intendedISO = nil
             intendedExposureDurationSeconds = nil
+            intendedLensAperture = nil
+            intendedAutoExposureAxes = nil
         }
-        await runOnDevice { try? $0.prm_setExposureMode(mode) }
+        await runDeviceSetter("setExposureMode") { try $0.prm_setExposureMode(mode) }
         await refreshState()
     }
 
+    /// Locks exposure at `duration` and `iso` (both clamped to the active format; the
+    /// `AVCaptureDevice.currentExposureDuration` / `currentISO` sentinels keep that axis).
+    /// ``state`` shows the requested values until the device commits, which can take a few
+    /// seconds for long exposures. Virtual multi-camera devices, which reject manual
+    /// exposure, emit an error on ``errorStream()`` and leave the exposure as it was.
     public func setCustomExposure(duration: CMTime, iso: Float) async {
-        PRMLogger.trace(
+        PRMLog.debug(
             .session,
             "PRMCamera.setCustomExposure(duration=\(CMTimeGetSeconds(duration))s, iso=\(iso))"
         )
+        let previous = (
+            mode: intendedExposureMode,
+            axes: intendedAutoExposureAxes,
+            iso: intendedISO,
+            duration: intendedExposureDurationSeconds,
+            aperture: intendedLensAperture
+        )
         intendedExposureMode = .custom
+        intendedAutoExposureAxes = []
         // Snapshot the user-requested values so `refreshState` keeps the UI
         // pinned to what they set, not the lagging device-reported pre-commit
         // values. Sentinel `currentISO` / `currentExposureDuration` mean "keep
@@ -389,30 +476,54 @@ public final class PRMCamera {
                 NotificationCenter.default.post(name: Self.deviceCommitNotification, object: nil)
             }
         }
+        if thrown != nil {
+            // The device never entered the mode; don't keep painting it into `state` (and
+            // freezing the auto-exposure baseline) until something else clears the intents.
+            intendedExposureMode = previous.mode
+            intendedAutoExposureAxes = previous.axes
+            intendedISO = previous.iso
+            intendedExposureDurationSeconds = previous.duration
+            intendedLensAperture = previous.aperture
+        }
+        // The slider fires this many times a second, so failures are logged once per
+        // error until a later call goes through.
         if let sessionError = thrown as? PRMSessionError {
             // Surface the virtual-device-rejection error (or any future PRMSessionError
             // the device helper starts throwing) on the errorStream so consumers know
             // their manual command was silently dropped at the device layer.
-            emitError(sessionError)
+            emitError(sessionError, throttledBy: "setCustomExposure")
+        } else if let thrown {
+            // A device-lock failure: logged, not sent to the stream.
+            logThrottled(.warning, setter: "setCustomExposure", "setCustomExposure failed", error: thrown)
+        } else {
+            clearThrottledLogs(for: "setCustomExposure")
         }
         await refreshState()
     }
 
+    /// Sets the white balance mode. Leaving `.locked` drops the pinned Kelvin. An
+    /// unsupported mode emits ``PRMSessionError/unsupportedConfiguration(_:)`` on
+    /// ``errorStream()``.
     public func setWhiteBalanceMode(_ mode: AVCaptureDevice.WhiteBalanceMode) async {
-        PRMLogger.trace(.session, "PRMCamera.setWhiteBalanceMode(\(mode.rawValue))")
+        PRMLog.debug(.session, "PRMCamera.setWhiteBalanceMode(\(mode.rawValue))")
         intendedWhiteBalanceMode = mode
         if mode != .locked {
             intendedWhiteBalanceTemperature = nil
         }
-        await runOnDevice { try? $0.prm_setWhiteBalanceMode(mode) }
+        await runDeviceSetter("setWhiteBalanceMode") { try $0.prm_setWhiteBalanceMode(mode) }
         await refreshState()
     }
 
+    /// Locks white balance at a temperature and tint (gains clamped to the device range).
+    /// ``state`` shows the requested Kelvin until the device commits. Virtual multi-camera
+    /// devices and devices without custom-gain locking emit an error on ``errorStream()``
+    /// and leave white balance as it was.
     public func lockWhiteBalance(_ values: AVCaptureDevice.PRMTemperatureAndTint) async {
-        PRMLogger.trace(
+        PRMLog.debug(
             .session,
             "PRMCamera.lockWhiteBalance(temp=\(values.temperature), tint=\(values.tint))"
         )
+        let previous = (mode: intendedWhiteBalanceMode, temperature: intendedWhiteBalanceTemperature)
         intendedWhiteBalanceMode = .locked
         intendedWhiteBalanceTemperature = values.temperature
         // Same async-completion handling as `setCustomExposure` — see that doc.
@@ -427,83 +538,42 @@ public final class PRMCamera {
                 NotificationCenter.default.post(name: Self.deviceCommitNotification, object: nil)
             }
         }
+        if thrown != nil {
+            intendedWhiteBalanceMode = previous.mode
+            intendedWhiteBalanceTemperature = previous.temperature
+        }
+        // Same slider cadence and logging as `setCustomExposure`.
         if let sessionError = thrown as? PRMSessionError {
-            emitError(sessionError)
+            emitError(sessionError, throttledBy: "lockWhiteBalance")
+        } else if let thrown {
+            logThrottled(.warning, setter: "lockWhiteBalance", "lockWhiteBalance failed", error: thrown)
+        } else {
+            clearThrottledLogs(for: "lockWhiteBalance")
         }
         await refreshState()
     }
 
+    /// Locks white balance to a preset: Apple's calibrated values on iOS 26+ (see
+    /// `AVCaptureDevice.PRMWhiteBalancePreset.temperatureAndTint`).
     public func lockWhiteBalance(preset: AVCaptureDevice.PRMWhiteBalancePreset) async {
-        await lockWhiteBalance(
-            AVCaptureDevice.PRMTemperatureAndTint(temperature: preset.temperature, tint: 0)
-        )
+        await lockWhiteBalance(preset.temperatureAndTint)
     }
 
+    /// Sets the frame rate, switching to a format that delivers it when needed (1080p-class
+    /// for normal rates, the largest slow-motion format from 120 fps). The preset moves to
+    /// `.inputPriority` so the format can change, and an attached movie output is rebuilt
+    /// against the new format in the same commit. See
+    /// ``PRMCameraSession/setFrameRate(_:allowFormatChange:)``.
+    ///
+    /// While Cinematic Video is enabled its format is fixed: rates outside its range emit
+    /// ``PRMSessionError/unsupportedConfiguration(_:)`` on ``errorStream()``, as does a call
+    /// while recording.
     public func setFrameRate(_ fps: Float64, allowFormatChange: Bool = true) async {
-        PRMLogger.trace(.session, "PRMCamera.setFrameRate(\(fps), allowFormatChange=\(allowFormatChange))")
-        // Whole transition (preset switch + format swap + movie-output re-attach) runs
-        // inside ONE `PRMCameraActor.shared.run` block so the actor stays exclusively
-        // held across all three steps. Without that, an external shutter tap can hop
-        // onto the actor between our `setMovieFileOutputAttached(false)` and
-        // `(true)` calls and observe `movieFileOutput == nil` — the user-visible
-        // symptom is `PRMVideoRecorder.start` failing with "is not attached to the
-        // session" right after the user just enabled slo-mo.
-        //
-        // **Critical preset rule**: `AVCaptureSession.Preset.photo` (and most other
-        // named presets) imposes session-level constraints that REJECT non-matching
-        // `activeFormat` choices. When a custom format is active under `.photo`,
-        // AVFoundation silently invalidates `AVCaptureMovieFileOutput`'s video
-        // connection — `output.connection(with: .video)` returns `nil` even though
-        // the output is still in `session.outputs`. This is the documented behavior
-        // since iOS 7 (see Apple dev-forum thread 87110 and the high-frame-rate API
-        // docs): *"If you don't manually set captureSession.sessionPreset to
-        // .inputPriority, your captured FPS will be the default, and setting
-        // device.activeVideoMinFrameDuration / activeVideoMaxFrameDuration won't
-        // have any effects."*
-        //
-        // The fix is to switch the session preset to `.inputPriority` for any
-        // `setFrameRate` call that's allowed to change format. The preset switch +
-        // format change happen inside the same `beginConfiguration` /
-        // `commitConfiguration` so AVF sees them atomically.
-        await PRMCameraActor.shared.run { [session] in
-            guard let device = await session.videoDevice else { return }
-            let avSession = session.session
-            let movieAttachedBefore = await session.movieFileOutput != nil
-
-            avSession.beginConfiguration()
-            // Relax to input-priority BEFORE the format swap. Skip the preset write
-            // if we're already there to avoid log noise and AVF re-validation churn.
-            if allowFormatChange, avSession.sessionPreset != .inputPriority {
-                if avSession.canSetSessionPreset(.inputPriority) {
-                    PRMLogger.session.notice(
-                        "setFrameRate: switching sessionPreset \(avSession.sessionPreset.rawValue, privacy: .public) → inputPriority to allow custom format"
-                    )
-                    avSession.sessionPreset = .inputPriority
-                } else {
-                    PRMLogger.session.warning(
-                        "setFrameRate: session does not support .inputPriority preset; format swap may invalidate AVCaptureMovieFileOutput connection"
-                    )
-                }
-            }
-            let change = try? device.prm_setFrameRate(fps, allowFormatChange: allowFormatChange)
-            avSession.commitConfiguration()
-
-            // Even with the `.inputPriority` preset switch, AVFoundation tears down
-            // `AVCaptureMovieFileOutput`'s video connection during the `activeFormat`
-            // swap and the same-instance rebuild doesn't always restore an active
-            // connection. Detach + re-attach forces a fresh output instance whose
-            // video connection is built from scratch against the now-current
-            // `activeFormat`. The detach/reattach has to happen inside the SAME
-            // actor block so an external shutter tap can't race into the gap and
-            // observe a transiently missing output. Both setters do their own
-            // session begin/commit; nesting them under the same actor hold is fine
-            // (the begin/commit pairs are sequential, not nested).
-            let didChangeFormat = change?.formatChanged ?? false
-            if movieAttachedBefore, didChangeFormat {
-                PRMLogger.session.notice("setFrameRate: format changed — re-attaching movieFileOutput against new active format")
-                try? await session.setMovieFileOutputAttached(false)
-                try? await session.setMovieFileOutputAttached(true)
-            }
+        PRMLog.debug(.session, "PRMCamera.setFrameRate(\(fps), allowFormatChange=\(allowFormatChange))")
+        do {
+            try await session.setFrameRate(fps, allowFormatChange: allowFormatChange)
+        } catch {
+            reportFailure(error, operation: "setFrameRate(\(fps))")
         }
         // Wait for AVF's async pipeline rebuild to settle so the next consumer
         // call doesn't stack a mutation onto an in-flight rebuild. The preset
@@ -513,50 +583,26 @@ public final class PRMCamera {
         #if !os(macOS)
             _ = await session.awaitPhotoOutputReady()
         #endif
+        await refreshDevice()
         await refreshState()
     }
 
+    /// Clears the custom frame rate and restores the preset `configure(_:)` used (see
+    /// ``PRMCameraSession/resetFrameRate()``). Under Cinematic Video only the frame
+    /// durations are cleared. Refused while recording, with an error on ``errorStream()``.
     public func resetFrameRate() async {
-        PRMLogger.trace(.session, "PRMCamera.resetFrameRate")
-        // Restore the session preset that was active at `configure(_:)` time AND
-        // clear the device's custom min/max frame duration. `setFrameRate(_:)`
-        // may have switched the preset to `.inputPriority` for slo-mo; leaving the
-        // session in input-priority mode when the consuming app returns to a photo
-        // workflow can leave `AVCapturePhotoOutput` without an active video
-        // connection — the next `capturePhoto` call then crashes with an uncaught
-        // `NSInvalidArgumentException: No active and enabled video connection`.
-        // Restoring the documented preset re-validates every output against the
-        // preset's rules and rebuilds the photo output's connection.
-        //
-        // The restore is best-effort: if `canSetSessionPreset` returns false on
-        // the current device (e.g. portrait-only formats after `enableDepthFormat`
-        // that aren't `.photo`-preset-compatible), we leave the preset alone and
-        // log a warning rather than crashing.
-        await PRMCameraActor.shared.run { [session] in
-            guard let device = await session.videoDevice else { return }
-            let avSession = session.session
-            let originalPreset = await session.configuredSessionPreset
-            avSession.beginConfiguration()
-            if let originalPreset, avSession.sessionPreset != originalPreset {
-                if avSession.canSetSessionPreset(originalPreset) {
-                    PRMLogger.session.notice(
-                        "resetFrameRate: restoring sessionPreset \(avSession.sessionPreset.rawValue, privacy: .public) → \(originalPreset.rawValue, privacy: .public)"
-                    )
-                    avSession.sessionPreset = originalPreset
-                } else {
-                    PRMLogger.session.warning(
-                        "resetFrameRate: cannot restore sessionPreset \(originalPreset.rawValue, privacy: .public) on current device — staying on \(avSession.sessionPreset.rawValue, privacy: .public)"
-                    )
-                }
-            }
-            try? device.prm_resetFrameRate()
-            avSession.commitConfiguration()
+        PRMLog.debug(.session, "PRMCamera.resetFrameRate")
+        do {
+            try await session.resetFrameRate()
+        } catch {
+            reportFailure(error, operation: "resetFrameRate")
         }
         // The preset restore is a session begin/commit; wait for AVF's async
         // pipeline rebuild to settle before returning. See `switchCamera`.
         #if !os(macOS)
             _ = await session.awaitPhotoOutputReady()
         #endif
+        await refreshDevice()
         await refreshState()
     }
 
@@ -573,89 +619,133 @@ public final class PRMCamera {
     /// enabled outside Portrait mode is small (one ISP channel, no measurable preview
     /// impact), and the format change is sticky for the session — re-entering Portrait
     /// is a cheap no-op after the first call.
+    /// Refused while Cinematic Video is enabled or while recording (an error on
+    /// ``errorStream()``, returning `false`).
     @discardableResult
     public func enableDepthFormat() async -> Bool {
-        PRMLogger.trace(.session, "PRMCamera.enableDepthFormat")
-        let result = await PRMCameraActor.shared.run { [session] in
-            guard let device = await session.videoDevice else { return false }
-            // The format change must be wrapped in `beginConfiguration` /
-            // `commitConfiguration` at the session level — not just the device-lock —
-            // because the photo output validates its delivery flags (depth, portrait
-            // matte) against the active format at commit time. Without the session
-            // wrap, the output is left with stale validation and depth captures arrive
-            // as `AVDepthData` instances whose `depthDataMap` is internally null.
-            let avSession = session.session
-            avSession.beginConfiguration()
-            let didEnable = (try? device.prm_enableDepthFormat()) ?? false
-            // Re-toggle the photo output's delivery flags so it re-validates them
-            // against the now-current `activeFormat` + `activeDepthDataFormat`. Without
-            // this, the flags set at `attachPhotoOutput` time stay "enabled" but
-            // AVFoundation never actually wires depth to the photo capture path —
-            // captures complete with `depthData != nil` but a null `depthDataMap`.
-            // The toggle-off/toggle-on dance forces the re-validation; just leaving
-            // them on is not sufficient.
-            if didEnable, let photoOutput = await session.photoOutput {
-                #if !os(macOS)
-                    if photoOutput.isDepthDataDeliverySupported {
-                        photoOutput.isDepthDataDeliveryEnabled = false
-                        photoOutput.isDepthDataDeliveryEnabled = true
-                    }
-                    if photoOutput.isPortraitEffectsMatteDeliverySupported {
-                        photoOutput.isPortraitEffectsMatteDeliveryEnabled = false
-                        photoOutput.isPortraitEffectsMatteDeliveryEnabled = true
-                    }
-                #endif
-            }
-            avSession.commitConfiguration()
-            return didEnable
+        PRMLog.debug(.session, "PRMCamera.enableDepthFormat")
+        let result: Bool
+        do {
+            result = try await session.enableDepthFormat()
+        } catch {
+            reportFailure(error, operation: "enableDepthFormat")
+            result = false
         }
         // Depth-format swap + depth/matte flag re-toggle is a session begin/commit;
         // wait for AVF's async pipeline rebuild before returning. See `switchCamera`.
         #if !os(macOS)
             _ = await session.awaitPhotoOutputReady()
         #endif
+        await refreshDevice()
         await refreshState()
         return result
     }
 
+    /// Focuses and meters at a device-space point (`0...1`, clamped). Taps with an auto
+    /// exposure mode drop any pinned manual exposure values. While Cinematic Video is
+    /// enabled this only sets exposure and asks Cinematic Video to track the subject at the
+    /// point (focus modes are locked then).
     public func setFocusAndExposure(
         focusMode: AVCaptureDevice.FocusMode,
         exposureMode: AVCaptureDevice.ExposureMode,
         at devicePoint: CGPoint,
         monitorSubjectAreaChange: Bool = false
     ) async {
-        intendedExposureMode = exposureMode
-        await runOnDevice {
-            try? $0.prm_setFocusAndExposure(
-                focusMode: focusMode,
-                exposureMode: exposureMode,
-                at: devicePoint,
-                monitorSubjectAreaChange: monitorSubjectAreaChange
-            )
+        noteExposureModeIntent(exposureMode)
+        // Subject-area monitoring re-centers focus on scene changes, which would pull an
+        // iOS 27 tracker off its subject.
+        let monitor = await monitorsSubjectArea(requested: monitorSubjectAreaChange)
+        // While Cinematic Video is on, focus modes are locked: meter at the point and ask
+        // Cinematic Video to track the subject there instead. The flag is read in the same
+        // actor turn as the write.
+        let thrown = await runOnDeviceCheckingCinematic { device, cinematic in
+            if cinematic {
+                try Self.applyCinematicTapFocus(on: device, exposureMode: exposureMode, at: devicePoint)
+            } else {
+                PRMLog.bestEffort(.session, "setFocusAndExposure") {
+                    try device.prm_setFocusAndExposure(
+                        focusMode: focusMode,
+                        exposureMode: exposureMode,
+                        at: devicePoint,
+                        monitorSubjectAreaChange: monitor
+                    )
+                }
+            }
         }
+        if let thrown { emitAnyError(thrown) }
         await refreshState()
     }
 
-    public func setStabilization(_ mode: AVCaptureVideoStabilizationMode) async {
-        await PRMCameraActor.shared.run {
-            if let connection = await self.session.videoDataOutput?.connection(with: .video) {
-                connection.prm_setStabilization(mode)
+    /// Sets the focus mode. Refused (with an error on ``errorStream()``) while Cinematic
+    /// Video is enabled, where AVFoundation raises on any focus-mode change.
+    public func setFocusMode(_ mode: AVCaptureDevice.FocusMode) async {
+        let thrown = await runOnDeviceCheckingCinematic { device, cinematic in
+            if cinematic {
+                throw PRMSessionError.unsupportedConfiguration("Changing the focus mode isn't available while Cinematic Video is enabled")
             }
-            if let connection = await self.session.movieFileOutput?.connection(with: .video) {
-                connection.prm_setStabilization(mode)
-            }
+            try device.prm_setFocusMode(mode)
         }
+        if let thrown { emitAnyError(thrown) }
+        await refreshState()
+    }
+
+    /// Sets video stabilization on the preview and recording connections. Kept across camera
+    /// switches and output rebuilds; ``state`` reports the mode actually active.
+    public func setStabilization(_ mode: AVCaptureVideoStabilizationMode) async {
+        await session.setStabilization(mode)
         await refreshState()
     }
 
     /// Locks focus at the given lens position (0 = near, 1 = far). Returns after the
-    /// physical lens move completes.
+    /// physical lens move completes, or after one second when no frame confirms it (the
+    /// session is stopped or interrupted). Devices that can't lock a custom lens position
+    /// (virtual multi-camera devices) and Cinematic Video emit an error on ``errorStream()``.
     public func setLensPosition(_ position: Float) async {
-        await PRMCameraActor.shared.run { [session] in
-            guard let device = await session.videoDevice else { return }
-            try? await device.prm_setLensPosition(position)
+        // Check Cinematic Video and start the lens move in one actor turn, then wait for
+        // the move to finish outside it.
+        let (lensMoved, lensMovedContinuation) = AsyncStream<Void>.makeStream()
+        let started: Bool
+        do {
+            started = try await session.withVideoDevice { device, cinematic -> Bool in
+                if cinematic {
+                    throw PRMSessionError.unsupportedConfiguration("Manual focus isn't available while Cinematic Video is enabled")
+                }
+                try device.prm_setLensPosition(position) { _ in lensMovedContinuation.finish() }
+                return true
+            } ?? false
+        } catch {
+            lensMovedContinuation.finish()
+            // Slider-driven: logged once per error until a move goes through.
+            if let sessionError = error as? PRMSessionError {
+                emitError(sessionError, throttledBy: "setLensPosition")
+            } else {
+                logThrottled(.warning, setter: "setLensPosition", "setLensPosition failed", error: error)
+            }
+            await refreshState()
+            return
+        }
+        clearThrottledLogs(for: "setLensPosition")
+        if started {
+            await Self.waitForFirst(of: lensMoved, timeout: .seconds(1))
+        } else {
+            // No video device: nothing will finish the stream.
+            lensMovedContinuation.finish()
         }
         await refreshState()
+    }
+
+    /// Waits until `stream` ends or `timeout` passes, whichever comes first.
+    nonisolated static func waitForFirst(of stream: AsyncStream<Void>, timeout: Duration) async {
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask {
+                for await _ in stream {}
+            }
+            group.addTask {
+                try? await Task.sleep(for: timeout)
+            }
+            await group.next()
+            group.cancelAll()
+        }
     }
 
     /// Sets manual ISO and auto-updates shutter to preserve the auto-metered
@@ -708,7 +798,7 @@ public final class PRMCamera {
     }
 
     /// User drags shutter → shutter is the **fixed** axis; ISO is derived
-    /// from the LV target. Same clamping rule as ``setISO(_:)``.
+    /// from the LV target. Same clamping rule as ``setISO(_:baseline:)``.
     ///
     /// `baseline` lets the caller pin the reciprocity reference to a snapshot
     /// taken *before* a device switch (e.g. virtual → wide for manual mode).
@@ -786,13 +876,17 @@ public final class PRMCamera {
 
     /// Enables, disables, or restores auto for video HDR. `nil` returns to auto.
     public func setVideoHDR(_ enabled: Bool?) async {
-        await runOnDevice { try? $0.prm_setVideoHDR(enabled) }
+        await runOnDevice { device in
+            PRMLog.bestEffort(.session, "setVideoHDR") { try device.prm_setVideoHDR(enabled) }
+        }
         await refreshState()
     }
 
     /// Enables or disables automatic low-light boost when the device supports it.
     public func setLowLightBoost(_ enabled: Bool) async {
-        await runOnDevice { try? $0.prm_setLowLightBoost(enabled) }
+        await runOnDevice { device in
+            PRMLog.bestEffort(.session, "setLowLightBoost") { try device.prm_setLowLightBoost(enabled) }
+        }
         await refreshState()
     }
 
@@ -835,43 +929,14 @@ public final class PRMCamera {
 
     // MARK: - State helpers
 
-    /// Re-reads device state and emits a new snapshot.
+    /// Re-reads device state and emits a new snapshot when anything changed.
     public func refreshState() async {
-        let snapshot: PRMCameraState? = await PRMCameraActor.shared.run { [session] in
-            guard let device = await session.videoDevice else { return nil }
-            var newState = PRMCameraState()
-            newState.isRunning = await session.isRunning
-            newState.zoomFactor = device.videoZoomFactor
-            newState.torchMode = device.torchMode
-            newState.torchLevel = device.torchLevel
-            newState.focusMode = device.focusMode
-            newState.lensPosition = device.lensPosition
-            newState.exposureMode = device.exposureMode
-            newState.exposureBias = device.exposureTargetBias
-            newState.iso = device.iso
-            newState.isVideoHDREnabled = device.activeFormat.isVideoHDRSupported && device.isVideoHDREnabled
-            newState.isLowLightBoostActive = device.prm_isLowLightBoostActive
-            let durationSeconds = CMTimeGetSeconds(device.exposureDuration)
-            newState.exposureDurationSeconds = (durationSeconds > 0 && durationSeconds.isFinite) ? durationSeconds : nil
-            newState.whiteBalanceMode = device.whiteBalanceMode
-            let tempTint = device.prm_currentTemperatureAndTint()
-            newState.whiteBalanceTemperature = tempTint.temperature
-            newState.whiteBalanceTint = tempTint.tint
-            if let connection = await session.videoDataOutput?.connection(with: .video) {
-                newState.activeStabilizationMode = connection.activeVideoStabilizationMode
-            }
-            newState.frameRate = device.prm_currentFrameRate()
-            // `activePrimaryConstituentDevice` is iOS 16+ and only meaningful on a virtual
-            // multi-lens device. On single-lens devices it returns `nil` (correct fallback)
-            // — the UI then falls back to the switchover-bucket heuristic.
-            newState.activePrimaryDeviceType = device.activePrimaryConstituent?.deviceType
-            return newState
-        }
-        guard let snapshot else { return }
+        guard let snapshot = await session.stateSnapshot() else { return }
         // Preserve the interruption flag — it's tracked via notifications, not by re-reading
         // the device, so a snapshot built from device state alone would always say false.
         var updated = snapshot
         updated.isInterrupted = state.isInterrupted
+        updated.interruptionReason = state.interruptionReason
 
         // Apply user-intent overrides for exposure mode and WB mode. These bridge
         // the ~3 s window between the slider-driven AVFoundation setter call and
@@ -925,6 +990,21 @@ public final class PRMCamera {
                 updated.whiteBalanceTemperature = intent
             }
         }
+        if let intent = intendedLensAperture {
+            // The physical aperture may not land exactly on the requested 𝑓-number.
+            if abs(updated.lensAperture - intent) / max(intent, 0.1) < 0.05 {
+                intendedLensAperture = nil
+            } else {
+                updated.lensAperture = intent
+            }
+        }
+        if let intent = intendedAutoExposureAxes {
+            if updated.exposureMode == .custom, updated.autoExposureAxes == intent {
+                intendedAutoExposureAxes = nil
+            } else {
+                updated.autoExposureAxes = intent
+            }
+        }
 
         // Snapshot the auto-exposure baseline whenever the device is settled in
         // a continuous / auto exposure mode AND the user isn't actively driving
@@ -949,11 +1029,12 @@ public final class PRMCamera {
             autoExposureBaselineDurationSeconds = durationSeconds
         }
 
+        guard updated != state else { return }
         state = updated
         stateStreams.yield(state)
     }
 
-    private func refreshDevice() async {
+    func refreshDevice() async {
         let snapshot = await PRMCameraActor.shared.run { [session] in
             guard let device = await session.videoDevice else { return PRMCameraDevice?.none }
             return PRMCameraDevice(snapshotting: device)
@@ -963,16 +1044,42 @@ public final class PRMCamera {
 
     /// Hops to ``PRMCameraActor`` and runs `work` against the current video device.
     /// No-ops when the session has no video device (pre-configure, between switchCamera
-    /// failures). Callers use `try?` inside `work` for transient AVFoundation errors
+    /// failures). Callers wrap `work` in `PRMLog.bestEffort` for transient AVFoundation errors
     /// (device lock contention, mode unsupported on the current device) where retrying
     /// is unlikely to help and the operation is best-effort — typical for slider-driven
     /// continuous setters that fire many times per second. Use ``runOnDeviceThrowing(_:)``
     /// instead when a single failure is significant (e.g. virtual-device rejection of
     /// manual exposure) and the camera should surface it on the error stream.
-    private func runOnDevice(_ work: @escaping @Sendable (AVCaptureDevice) -> Void) async {
+    func runOnDevice(_ work: @escaping @Sendable (AVCaptureDevice) -> Void) async {
         await PRMCameraActor.shared.run { [session] in
-            guard let device = await session.videoDevice else { return }
+            // A Night capture holds the device's exposure, focus and white balance.
+            guard let device = await session.videoDevice, await !session.isExclusiveCaptureActive else { return }
             work(device)
+        }
+    }
+
+    /// Runs a device setter whose refusals the app should hear about:
+    /// ``PRMSessionError``s (unsupported mode, virtual device) go to ``errorStream()``,
+    /// other errors (a configuration-lock failure) are logged. Both are written once per
+    /// error until the setter next succeeds.
+    func runDeviceSetter(_ name: String, _ work: @escaping @Sendable (AVCaptureDevice) throws -> Void) async {
+        let thrown = await runOnDeviceThrowing(work)
+        if let sessionError = thrown as? PRMSessionError {
+            emitError(sessionError, throttledBy: name)
+        } else if let thrown {
+            logThrottled(.warning, setter: name, "\(name) failed", error: thrown)
+        } else {
+            clearThrottledLogs(for: name)
+        }
+    }
+
+    /// Reports a failed session operation: ``PRMSessionError``s go to ``errorStream()``,
+    /// anything else (a configuration-lock failure) is logged as a warning.
+    func reportFailure(_ error: any Error, operation: String, file: String = #fileID, line: Int = #line) {
+        if let sessionError = error as? PRMSessionError {
+            emitError(sessionError, file: file, line: line)
+        } else {
+            PRMLog.warning(.session, "\(operation) failed", error: error, file: file, line: line)
         }
     }
 
@@ -982,10 +1089,11 @@ public final class PRMCamera {
     /// so the public camera-facing setters stay non-throwing — surfacing failures
     /// through the error stream keeps the API symmetrical with AVFoundation's own
     /// notification-based error reporting.
-    private func runOnDeviceThrowing(_ work: @escaping @Sendable (AVCaptureDevice) throws -> Void) async -> Error? {
+    func runOnDeviceThrowing(_ work: @escaping @Sendable (AVCaptureDevice) throws -> Void) async -> Error? {
         await PRMCameraActor.shared.run { [session] in
             guard let device = await session.videoDevice else { return Error?.none }
             do {
+                try await session.refuseDuringExclusiveCapture("Changing camera settings")
                 try work(device)
                 return nil
             } catch {
@@ -1000,12 +1108,14 @@ public final class PRMCamera {
     /// starts in `.continuousAuto` for both exposure and WB, and a stale intent
     /// from before the change would keep `refreshState` painting the old custom
     /// values onto the new device's snapshot.
-    private func clearIntendedState() {
+    func clearIntendedState() {
         intendedExposureMode = nil
         intendedWhiteBalanceMode = nil
         intendedISO = nil
         intendedExposureDurationSeconds = nil
         intendedWhiteBalanceTemperature = nil
+        intendedLensAperture = nil
+        intendedAutoExposureAxes = nil
         autoExposureBaselineISO = nil
         autoExposureBaselineDurationSeconds = nil
     }
@@ -1014,7 +1124,43 @@ public final class PRMCamera {
     /// Used to surface non-throwing device-helper failures (e.g. the virtual-device
     /// rejection from ``AVCaptureDevice/prm_setCustomExposure(duration:iso:completion:)``)
     /// so consumers see a signal instead of a silently dropped command.
-    private func emitError(_ error: PRMSessionError) {
+    ///
+    /// Every error is also logged at error level, so it reaches the unified log even when
+    /// nothing subscribes to the stream. Pass `cause` when `error` flattens another error
+    /// (its domain and code then appear in the log line). Setters that run at slider rate
+    /// pass `throttledBy` (their name): the line is then written once per setter and error
+    /// until ``clearThrottledLogs(for:)`` runs on the setter's next success. The stream
+    /// still receives every error.
+    func emitError(
+        _ error: PRMSessionError,
+        cause: (any Error)? = nil,
+        throttledBy setter: String? = nil,
+        file: String = #fileID,
+        line: Int = #line
+    ) {
+        let message = cause == nil ? "Sent to errorStream" : "Sent to errorStream: \(PRMLog.describe(error).summary)"
+        let attached = cause ?? error
+        if let setter {
+            logThrottled(.error, setter: setter, message, error: attached, file: file, line: line)
+        } else {
+            PRMLog.error(.session, message, error: attached, file: file, line: line)
+        }
         errorStreams.yield(error)
+    }
+
+    /// Writes a failure of a slider-rate setter once per setter and error (by its public
+    /// summary) until ``clearThrottledLogs(for:)``.
+    func logThrottled(_ level: PRMLogLevel, setter: String, _ message: String, error: any Error, file: String = #fileID, line: Int = #line) {
+        let key = "PRMCamera.\(setter).\(PRMLog.describe(error).summary)"
+        throttledLogKeys[setter, default: []].insert(key)
+        PRMLog.once(key, level, .session, message, error: error, file: file, line: line)
+    }
+
+    /// Re-arms the throttled lines of `setter` after it succeeds. Cheap when nothing failed.
+    func clearThrottledLogs(for setter: String) {
+        guard let keys = throttledLogKeys.removeValue(forKey: setter) else { return }
+        for key in keys {
+            PRMLog.resetOnce(key)
+        }
     }
 }

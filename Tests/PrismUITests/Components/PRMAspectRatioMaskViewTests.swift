@@ -32,4 +32,18 @@ struct PRMAspectRatioMaskViewTests {
         #expect(rect.size.height == 100)
         #expect(rect.minY == 50)
     }
+
+    @Test
+    func `Ratios follow the bounds' orientation`() {
+        let view = PRMAspectRatioMaskView()
+        view.aspectRatio = .ratio4x3
+        // Portrait bounds get a portrait 3:4 crop, not a landscape band.
+        let portrait = view.cropRect(in: CGRect(x: 0, y: 0, width: 300, height: 600))
+        #expect(portrait.width == 300)
+        #expect(abs(portrait.height - 400) < 1e-9)
+        let landscape = view.cropRect(in: CGRect(x: 0, y: 0, width: 600, height: 300))
+        #expect(abs(landscape.width - 400) < 1e-9)
+        #expect(landscape.height == 300)
+        #expect(view.cropRect(in: .zero) == .zero)
+    }
 }

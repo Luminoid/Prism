@@ -39,4 +39,30 @@ struct AVCaptureDeviceFrameRateTests {
         #expect(onetwenty.appliedFPS == 120)
         #expect(twoforty.appliedFPS == 240)
     }
+
+    @Test
+    func `A rate at a range's end uses the range's own duration`() {
+        // 29.97 fps is 1001/30000 s; Int32(29.97) used to truncate it to 1/29.
+        let ntsc = CMTime(value: 1001, timescale: 30000)
+        let duration = AVCaptureDevice.prm_frameDuration(forFPS: 29.97, min: ntsc, max: CMTime(value: 1, timescale: 2))
+        #expect(CMTimeCompare(duration, ntsc) == 0)
+    }
+
+    @Test
+    func `A rate inside a range is exact and stays inside it`() {
+        let lower = CMTime(value: 1, timescale: 240)
+        let upper = CMTime(value: 1, timescale: 1)
+        let sixty = AVCaptureDevice.prm_frameDuration(forFPS: 60, min: lower, max: upper)
+        #expect(abs(CMTimeGetSeconds(sixty) - 1.0 / 60) < 1e-6)
+        // A sub-1 fps request no longer becomes an invalid time (timescale 0).
+        let slow = AVCaptureDevice.prm_frameDuration(forFPS: 0.5, min: lower, max: upper)
+        #expect(slow.isValid)
+        #expect(CMTimeCompare(slow, upper) == 0)
+    }
+
+    @Test
+    func `Frame rate of a duration`() {
+        #expect(AVCaptureDevice.prm_frameRate(of: CMTime(value: 1, timescale: 30)) == 30)
+        #expect(AVCaptureDevice.prm_frameRate(of: .invalid) == 0)
+    }
 }

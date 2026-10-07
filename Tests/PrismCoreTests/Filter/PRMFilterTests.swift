@@ -56,4 +56,26 @@ struct PRMFilterTests {
         _ = PRMPinchDistortionFilter().render(testImage)
         _ = PRMVortexDistortionFilter().render(testImage)
     }
+
+    @Test
+    func `Blurs don't darken the frame edge`() {
+        // Blurring against transparent black used to pull a solid frame's corner to about
+        // half brightness (142/255 for a 10 px Gaussian on red).
+        let solid = CIImage(color: CIColor(red: 1, green: 0, blue: 0))
+            .cropped(to: CGRect(x: 0, y: 0, width: 64, height: 64))
+        let context = CIContext(options: [.workingColorSpace: NSNull(), .outputColorSpace: NSNull()])
+        for filter in [PRMGaussianBlurFilter(radius: 10) as any PRMFilter, PRMMotionBlurFilter(radius: 10), PRMZoomBlurFilter(amount: 10)] {
+            let blurred = filter.render(solid)
+            var pixel = [UInt8](repeating: 0, count: 4)
+            context.render(
+                blurred,
+                toBitmap: &pixel,
+                rowBytes: 4,
+                bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+                format: .RGBA8,
+                colorSpace: nil
+            )
+            #expect(pixel[0] > 240, "\(type(of: filter)) corner red was \(pixel[0])")
+        }
+    }
 }

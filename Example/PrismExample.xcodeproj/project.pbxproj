@@ -3,36 +3,58 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 63;
+	objectVersion = 77;
 	objects = {
 
 /* Begin PBXBuildFile section */
+		0190E43333951E09829FCB9A /* ExampleComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 63A161EAFA4DB72BD5F5F2C0 /* ExampleComponents.swift */; };
 		0838F9FBA10453582A8B0D00 /* DepthInspectorViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A668D4255D7028246510B53E /* DepthInspectorViewController.swift */; };
 		168617B0DB22105D061CA978 /* ConfigurationLabViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 033F012A261FEFF4499FEB98 /* ConfigurationLabViewController.swift */; };
 		1A59AD5DB9DBEB0D72EB9BC0 /* SnapKit in Frameworks */ = {isa = PBXBuildFile; productRef = FC7913A55783E87E6169140C /* SnapKit */; };
+		23BF3C92D3EC213737301872 /* ExampleLog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F1C92FD3DDF93CF6CBC8EE0 /* ExampleLog.swift */; };
 		290F66B61CFBAD76E4217683 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 81D52CD5748C0D48FEF27E29 /* Assets.xcassets */; };
 		2E271F3B4DF03489EF8BBB9C /* SceneDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7AFBED18985B4C42614023AD /* SceneDelegate.swift */; };
 		33670C16697D8621EE13129D /* PrismCore in Frameworks */ = {isa = PBXBuildFile; productRef = 5680A63FFF1B03FE637F1A01 /* PrismCore */; };
 		40258322CB68603979892393 /* RootCatalogViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1BFC379ED771940D5CB70AB /* RootCatalogViewController.swift */; };
 		809E5100B8DF68369F6CC812 /* FilterChainViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2309B42ACC42C5336112552E /* FilterChainViewController.swift */; };
+		91C357312DFB342F5BEF03FD /* LatestWinsRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = EDDAF983BA1FD6CF1A8E9E4C /* LatestWinsRunner.swift */; };
 		93636A85D08729B0AF1FF66F /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9205AC2DEE68D93059206669 /* AppDelegate.swift */; };
+		95F5118FF1F39719876FF078 /* ModernCaptureControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAA80CF7BD9362871178071E /* ModernCaptureControls.swift */; };
+		9D43F0503BE85D458C36D21B /* StudioDrawerControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49F22E26E7992991C1BB9762 /* StudioDrawerControls.swift */; };
 		B4DC424EC2415F532F95D72F /* StudioViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A393F4CE7D1B2A788030F14F /* StudioViewController.swift */; };
+		C04BD7D17BC8EED689F3EEC6 /* CameraPreviewHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD22463A10782144E6483BA1 /* CameraPreviewHost.swift */; };
+		CAB426AE80B5DFBB750EB84F /* StudioViewController+DeviceHops.swift in Sources */ = {isa = PBXBuildFile; fileRef = F59469F5C6C67FAB8A85EA18 /* StudioViewController+DeviceHops.swift */; };
+		D60B6DD1C21325EA0F3E04F4 /* StudioViewController+Capture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 416B9772379C21278C3BF2A3 /* StudioViewController+Capture.swift */; };
 		D81079311A19F1F0850894FD /* PrismUI in Frameworks */ = {isa = PBXBuildFile; productRef = 3C35934D9D337FA8B1F10B78 /* PrismUI */; };
+		DA9364011D14F658F366D99E /* CaptureLabels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 805F7246E4A71C9B8A134055 /* CaptureLabels.swift */; };
 		EF1CD153FAB443912C2D6EE2 /* PermissionsViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B16B67D838E073419ABD2F17 /* PermissionsViewController.swift */; };
+		F4BCB78F5FA9AF6651776A95 /* PhotoLibrarySaver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 97F6D7EC7BAB8E16D64005D5 /* PhotoLibrarySaver.swift */; };
+		FC5BF218BC1C2CD9917620D3 /* StudioComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2168F1C9DCD3204B5328503F /* StudioComponents.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		033F012A261FEFF4499FEB98 /* ConfigurationLabViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigurationLabViewController.swift; sourceTree = "<group>"; };
+		2168F1C9DCD3204B5328503F /* StudioComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StudioComponents.swift; sourceTree = "<group>"; };
 		2309B42ACC42C5336112552E /* FilterChainViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilterChainViewController.swift; sourceTree = "<group>"; };
+		3F1C92FD3DDF93CF6CBC8EE0 /* ExampleLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExampleLog.swift; sourceTree = "<group>"; };
+		416B9772379C21278C3BF2A3 /* StudioViewController+Capture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "StudioViewController+Capture.swift"; sourceTree = "<group>"; };
 		486B33EDCCB72EDE25192E3F /* PrismExample.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PrismExample.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		49F22E26E7992991C1BB9762 /* StudioDrawerControls.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StudioDrawerControls.swift; sourceTree = "<group>"; };
 		4F84EFBD24D61E5FF6AE4844 /* Prism */ = {isa = PBXFileReference; lastKnownFileType = folder; name = Prism; path = ..; sourceTree = SOURCE_ROOT; };
+		63A161EAFA4DB72BD5F5F2C0 /* ExampleComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExampleComponents.swift; sourceTree = "<group>"; };
 		7AFBED18985B4C42614023AD /* SceneDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneDelegate.swift; sourceTree = "<group>"; };
+		805F7246E4A71C9B8A134055 /* CaptureLabels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureLabels.swift; sourceTree = "<group>"; };
 		81D52CD5748C0D48FEF27E29 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		9205AC2DEE68D93059206669 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		97F6D7EC7BAB8E16D64005D5 /* PhotoLibrarySaver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhotoLibrarySaver.swift; sourceTree = "<group>"; };
 		A393F4CE7D1B2A788030F14F /* StudioViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StudioViewController.swift; sourceTree = "<group>"; };
 		A668D4255D7028246510B53E /* DepthInspectorViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DepthInspectorViewController.swift; sourceTree = "<group>"; };
 		B16B67D838E073419ABD2F17 /* PermissionsViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PermissionsViewController.swift; sourceTree = "<group>"; };
 		C1BFC379ED771940D5CB70AB /* RootCatalogViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootCatalogViewController.swift; sourceTree = "<group>"; };
+		CD22463A10782144E6483BA1 /* CameraPreviewHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraPreviewHost.swift; sourceTree = "<group>"; };
+		EAA80CF7BD9362871178071E /* ModernCaptureControls.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModernCaptureControls.swift; sourceTree = "<group>"; };
+		EDDAF983BA1FD6CF1A8E9E4C /* LatestWinsRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LatestWinsRunner.swift; sourceTree = "<group>"; };
+		F59469F5C6C67FAB8A85EA18 /* StudioViewController+DeviceHops.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "StudioViewController+DeviceHops.swift"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -87,13 +109,24 @@
 			isa = PBXGroup;
 			children = (
 				9205AC2DEE68D93059206669 /* AppDelegate.swift */,
+				CD22463A10782144E6483BA1 /* CameraPreviewHost.swift */,
+				805F7246E4A71C9B8A134055 /* CaptureLabels.swift */,
 				033F012A261FEFF4499FEB98 /* ConfigurationLabViewController.swift */,
 				A668D4255D7028246510B53E /* DepthInspectorViewController.swift */,
+				63A161EAFA4DB72BD5F5F2C0 /* ExampleComponents.swift */,
+				3F1C92FD3DDF93CF6CBC8EE0 /* ExampleLog.swift */,
 				2309B42ACC42C5336112552E /* FilterChainViewController.swift */,
+				EDDAF983BA1FD6CF1A8E9E4C /* LatestWinsRunner.swift */,
+				EAA80CF7BD9362871178071E /* ModernCaptureControls.swift */,
 				B16B67D838E073419ABD2F17 /* PermissionsViewController.swift */,
+				97F6D7EC7BAB8E16D64005D5 /* PhotoLibrarySaver.swift */,
 				C1BFC379ED771940D5CB70AB /* RootCatalogViewController.swift */,
 				7AFBED18985B4C42614023AD /* SceneDelegate.swift */,
+				2168F1C9DCD3204B5328503F /* StudioComponents.swift */,
+				49F22E26E7992991C1BB9762 /* StudioDrawerControls.swift */,
 				A393F4CE7D1B2A788030F14F /* StudioViewController.swift */,
+				416B9772379C21278C3BF2A3 /* StudioViewController+Capture.swift */,
+				F59469F5C6C67FAB8A85EA18 /* StudioViewController+DeviceHops.swift */,
 			);
 			path = Sources;
 			sourceTree = "<group>";
@@ -130,10 +163,9 @@
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = YES;
-				LastUpgradeCheck = 1720;
+				LastUpgradeCheck = 2700;
 			};
 			buildConfigurationList = DE7247D563492104A5BA7899 /* Build configuration list for PBXProject "PrismExample" */;
-			compatibilityVersion = "Xcode 14.0";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
 			knownRegions = (
@@ -146,6 +178,8 @@
 				4CEB00C55783E014D19C8D71 /* XCRemoteSwiftPackageReference "SnapKit" */,
 				CDBD5315840276B35BD9819D /* XCLocalSwiftPackageReference ".." */,
 			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = CE737317BECA93BE65095738 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -171,12 +205,23 @@
 			buildActionMask = 2147483647;
 			files = (
 				93636A85D08729B0AF1FF66F /* AppDelegate.swift in Sources */,
+				C04BD7D17BC8EED689F3EEC6 /* CameraPreviewHost.swift in Sources */,
+				DA9364011D14F658F366D99E /* CaptureLabels.swift in Sources */,
 				168617B0DB22105D061CA978 /* ConfigurationLabViewController.swift in Sources */,
 				0838F9FBA10453582A8B0D00 /* DepthInspectorViewController.swift in Sources */,
+				0190E43333951E09829FCB9A /* ExampleComponents.swift in Sources */,
+				23BF3C92D3EC213737301872 /* ExampleLog.swift in Sources */,
 				809E5100B8DF68369F6CC812 /* FilterChainViewController.swift in Sources */,
+				91C357312DFB342F5BEF03FD /* LatestWinsRunner.swift in Sources */,
+				95F5118FF1F39719876FF078 /* ModernCaptureControls.swift in Sources */,
 				EF1CD153FAB443912C2D6EE2 /* PermissionsViewController.swift in Sources */,
+				F4BCB78F5FA9AF6651776A95 /* PhotoLibrarySaver.swift in Sources */,
 				40258322CB68603979892393 /* RootCatalogViewController.swift in Sources */,
 				2E271F3B4DF03489EF8BBB9C /* SceneDelegate.swift in Sources */,
+				FC5BF218BC1C2CD9917620D3 /* StudioComponents.swift in Sources */,
+				9D43F0503BE85D458C36D21B /* StudioDrawerControls.swift in Sources */,
+				D60B6DD1C21325EA0F3E04F4 /* StudioViewController+Capture.swift in Sources */,
+				CAB426AE80B5DFBB750EB84F /* StudioViewController+DeviceHops.swift in Sources */,
 				B4DC424EC2415F532F95D72F /* StudioViewController.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -199,7 +244,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.luminoid.PrismExample;
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = 6.2;
-				TARGETED_DEVICE_FAMILY = "1,2";
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Debug;
 		};
@@ -218,7 +263,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.luminoid.PrismExample;
 				SDKROOT = iphoneos;
 				SWIFT_VERSION = 6.2;
-				TARGETED_DEVICE_FAMILY = "1,2";
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Release;
 		};
@@ -377,7 +422,7 @@
 			repositoryURL = "https://github.com/SnapKit/SnapKit.git";
 			requirement = {
 				kind = upToNextMajorVersion;
-				minimumVersion = 5.7.0;
+				minimumVersion = 5.7.1;
 			};
 		};
 /* End XCRemoteSwiftPackageReference section */

@@ -25,7 +25,6 @@ struct PRMPhotoTests {
         let timestampKP: KeyPath<PRMPhoto, Date> = \PRMPhoto.timestamp
         _ = (dataKP, photoKP, metadataKP, timestampKP)
         // The act of compiling this file with the assignments above is the test.
-        #expect(true)
     }
 
     @Test

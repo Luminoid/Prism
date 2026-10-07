@@ -64,7 +64,13 @@ public struct PRMCameraDevice: Sendable, Equatable {
     /// virtual devices (`triple`, `dual`, `dualWide`) cap at 12MP (4032×3024) regardless
     /// of format selection; only the physical `.builtInWideAngleCamera` on iPhone 14
     /// Pro+ / 15 Pro+ exposes the 48MP entry (8064×6048).
-    public let maxSupportedPhotoDimensions: CMVideoDimensions?
+    public var maxSupportedPhotoDimensions: CMVideoDimensions? {
+        maxPhotoDimensions.map { CMVideoDimensions(width: $0.width, height: $0.height) }
+    }
+
+    /// Storage for ``maxSupportedPhotoDimensions`` as an `Equatable` type, so `==` can be
+    /// synthesized over every field (a hand-written `==` silently misses new ones).
+    private let maxPhotoDimensions: PRMVideoDimensions?
 
     /// Whether the device supports `setFocusModeLocked(lensPosition:)`. Virtual devices
     /// (`triple`, `dual`, `dualWide`) report `isFocusModeSupported(.locked) == true` but
@@ -72,6 +78,62 @@ public struct PRMCameraDevice: Sendable, Equatable {
     /// `isLockingFocusWithCustomLensPositionSupported` as a separate gate). Gate manual-
     /// focus UI on this flag and require a physical-device swap when false.
     public let supportsCustomLensPosition: Bool
+
+    // MARK: iOS 26 / 27 capabilities (active format unless noted)
+
+    /// iOS 27: supported lens 𝑓-number range, or `nil` when the aperture is fixed.
+    public let apertureRange: ClosedRange<Float>?
+
+    /// iOS 27: recommended 𝑓-stops, sorted. One entry means the aperture is fixed.
+    public let recommendedApertureStops: [Float]
+
+    /// iOS 27: exposure signals ``PRMCamera/setExposureSignals(_:)`` accepts.
+    public let supportedExposureSignals: Set<PRMExposureSignal>
+
+    /// iOS 26: whether focus accepts a rectangle of interest, not just a point.
+    public let supportsFocusRectOfInterest: Bool
+
+    /// iOS 26: whether exposure accepts a rectangle of interest, not just a point.
+    public let supportsExposureRectOfInterest: Bool
+
+    /// iOS 27: whether ``PRMCamera/lockLens(_:)`` can pin a virtual device to one lens.
+    public let supportsPrimaryConstituentLock: Bool
+
+    /// iOS 26: whether lens smudge detection is available in the current configuration.
+    public let supportsLensSmudgeDetection: Bool
+
+    /// iOS 27: whether the active format supports low-light video noise reduction.
+    public let supportsLowLightVideoNoiseReduction: Bool
+
+    /// iOS 27: whether continuous autofocus subject tracking is available.
+    public let supportsContinuousAutoFocusTracking: Bool
+
+    /// iOS 26: whether *any* of this camera's formats supports Cinematic Video (Prism
+    /// switches to one when Cinematic Video is enabled).
+    public let supportsCinematicVideo: Bool
+
+    /// iOS 26: the camera at this position that Cinematic Video runs on: this one when
+    /// ``supportsCinematicVideo``, otherwise the one
+    /// ``PRMCamera/setCinematicVideoEnabled(_:targetPhotoOutputAttached:)`` switches to (see
+    /// ``cinematicVideoDeviceType(at:)``). `nil` when no camera here supports it.
+    public let cinematicVideoDeviceType: AVCaptureDevice.DeviceType?
+
+    /// iOS 26: raw zoom range available while Cinematic Video is enabled, on
+    /// ``cinematicVideoDeviceType``.
+    public let cinematicZoomRange: ClosedRange<CGFloat>?
+
+    /// iOS 26: simulated-aperture range for Cinematic Video, or `nil` when it can't change.
+    public let simulatedApertureRange: ClosedRange<Float>?
+
+    /// iOS 26: frame-rate range available while Cinematic Video is enabled.
+    public let cinematicFrameRateRange: ClosedRange<Float64>?
+
+    /// iOS 26: aspect ratios ``PRMCamera/setDynamicAspectRatio(_:)`` accepts. Empty when the
+    /// active format doesn't support dynamic aspect ratio.
+    public let supportedDynamicAspectRatios: [PRMAspectRatio]
+
+    /// iOS 26: whether the Smart Framing monitor can recommend framings.
+    public let supportsSmartFraming: Bool
 
     public init(
         uniqueID: String,
@@ -91,7 +153,23 @@ public struct PRMCameraDevice: Sendable, Equatable {
         supportsSlowMotion: Bool,
         maxFrameRate: Float64,
         maxSupportedPhotoDimensions: CMVideoDimensions? = nil,
-        supportsCustomLensPosition: Bool = true
+        supportsCustomLensPosition: Bool = true,
+        apertureRange: ClosedRange<Float>? = nil,
+        recommendedApertureStops: [Float] = [],
+        supportedExposureSignals: Set<PRMExposureSignal> = [],
+        supportsFocusRectOfInterest: Bool = false,
+        supportsExposureRectOfInterest: Bool = false,
+        supportsPrimaryConstituentLock: Bool = false,
+        supportsLensSmudgeDetection: Bool = false,
+        supportsLowLightVideoNoiseReduction: Bool = false,
+        supportsContinuousAutoFocusTracking: Bool = false,
+        supportsCinematicVideo: Bool = false,
+        cinematicVideoDeviceType: AVCaptureDevice.DeviceType? = nil,
+        cinematicZoomRange: ClosedRange<CGFloat>? = nil,
+        simulatedApertureRange: ClosedRange<Float>? = nil,
+        cinematicFrameRateRange: ClosedRange<Float64>? = nil,
+        supportedDynamicAspectRatios: [PRMAspectRatio] = [],
+        supportsSmartFraming: Bool = false
     ) {
         self.uniqueID = uniqueID
         self.deviceType = deviceType
@@ -109,8 +187,24 @@ public struct PRMCameraDevice: Sendable, Equatable {
         self.supportsCustomWhiteBalance = supportsCustomWhiteBalance
         self.supportsSlowMotion = supportsSlowMotion
         self.maxFrameRate = maxFrameRate
-        self.maxSupportedPhotoDimensions = maxSupportedPhotoDimensions
+        maxPhotoDimensions = maxSupportedPhotoDimensions.map(PRMVideoDimensions.init)
         self.supportsCustomLensPosition = supportsCustomLensPosition
+        self.apertureRange = apertureRange
+        self.recommendedApertureStops = recommendedApertureStops
+        self.supportedExposureSignals = supportedExposureSignals
+        self.supportsFocusRectOfInterest = supportsFocusRectOfInterest
+        self.supportsExposureRectOfInterest = supportsExposureRectOfInterest
+        self.supportsPrimaryConstituentLock = supportsPrimaryConstituentLock
+        self.supportsLensSmudgeDetection = supportsLensSmudgeDetection
+        self.supportsLowLightVideoNoiseReduction = supportsLowLightVideoNoiseReduction
+        self.supportsContinuousAutoFocusTracking = supportsContinuousAutoFocusTracking
+        self.supportsCinematicVideo = supportsCinematicVideo
+        self.cinematicVideoDeviceType = cinematicVideoDeviceType ?? (supportsCinematicVideo ? deviceType : nil)
+        self.cinematicZoomRange = cinematicZoomRange
+        self.simulatedApertureRange = simulatedApertureRange
+        self.cinematicFrameRateRange = cinematicFrameRateRange
+        self.supportedDynamicAspectRatios = supportedDynamicAspectRatios
+        self.supportsSmartFraming = supportsSmartFraming
     }
 
     /// Constructs a snapshot from an `AVCaptureDevice`. Call from session-actor context where
@@ -154,9 +248,73 @@ public struct PRMCameraDevice: Sendable, Equatable {
                 }
             }
         }
-        maxSupportedPhotoDimensions = bestPhotoDims
+        maxPhotoDimensions = bestPhotoDims.map(PRMVideoDimensions.init)
         supportsCustomLensPosition = device.isFocusModeSupported(.locked)
             && device.isLockingFocusWithCustomLensPositionSupported
+
+        let format = device.activeFormat
+        if #available(iOS 27.0, *) {
+            apertureRange = device.prm_lensApertureRange
+            recommendedApertureStops = format.recommendedLensApertureStops
+            supportedExposureSignals = PRMExposureSignal.set(from: device.supportedExposureSignals)
+            supportsPrimaryConstituentLock = device.isPrimaryConstituentDeviceSwitchingBehaviorLockedWithDeviceSupported
+            supportsLowLightVideoNoiseReduction = format.isLowLightVideoNoiseReductionSupported
+            supportsContinuousAutoFocusTracking = format.isContinuousAutoFocusTrackingSupported
+        } else {
+            apertureRange = nil
+            recommendedApertureStops = []
+            supportedExposureSignals = []
+            supportsPrimaryConstituentLock = false
+            supportsLowLightVideoNoiseReduction = false
+            supportsContinuousAutoFocusTracking = false
+        }
+        if #available(iOS 26.0, *) {
+            supportsFocusRectOfInterest = device.isFocusRectOfInterestSupported
+            supportsExposureRectOfInterest = device.isExposureRectOfInterestSupported
+            supportsLensSmudgeDetection = format.isCameraLensSmudgeDetectionSupported
+            // The format `PRMCameraSession` would switch to, so the ranges match what
+            // enabling Cinematic Video actually gives. Without one here, the ranges are the
+            // camera's that enabling switches to.
+            let preferredDimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            let ownCinematicFormat = format.isCinematicVideoCaptureSupported
+                ? format
+                : AVCaptureDevice.prm_bestCinematicFormat(from: device.formats, preferredDimensions: preferredDimensions)
+            supportsCinematicVideo = ownCinematicFormat != nil
+            var cinematicFormat = ownCinematicFormat
+            if ownCinematicFormat != nil {
+                cinematicVideoDeviceType = device.deviceType
+            } else {
+                let type = Self.cinematicVideoDeviceType(at: device.position)
+                cinematicVideoDeviceType = type
+                if let type, let other = AVCaptureDevice.default(type, for: .video, position: device.position) {
+                    cinematicFormat = AVCaptureDevice.prm_bestCinematicFormat(from: other.formats, preferredDimensions: preferredDimensions)
+                }
+            }
+            if let cinematicFormat {
+                let minZoom = cinematicFormat.videoMinZoomFactorForCinematicVideo
+                let maxZoom = cinematicFormat.videoMaxZoomFactorForCinematicVideo
+                cinematicZoomRange = minZoom <= maxZoom ? minZoom ... maxZoom : nil
+                simulatedApertureRange = cinematicFormat.prm_simulatedApertureRange
+                cinematicFrameRateRange = cinematicFormat.prm_cinematicFrameRateRange
+            } else {
+                cinematicZoomRange = nil
+                simulatedApertureRange = nil
+                cinematicFrameRateRange = nil
+            }
+            supportedDynamicAspectRatios = format.supportedDynamicAspectRatios.compactMap(PRMAspectRatio.init)
+            supportsSmartFraming = format.isSmartFramingSupported && device.smartFramingMonitor != nil
+        } else {
+            supportsFocusRectOfInterest = false
+            supportsExposureRectOfInterest = false
+            supportsLensSmudgeDetection = false
+            supportsCinematicVideo = false
+            cinematicVideoDeviceType = nil
+            cinematicZoomRange = nil
+            simulatedApertureRange = nil
+            cinematicFrameRateRange = nil
+            supportedDynamicAspectRatios = []
+            supportsSmartFraming = false
+        }
     }
 
     /// Whether *any* discoverable device at `position` supports a format at ≥120 fps.
@@ -166,30 +324,53 @@ public struct PRMCameraDevice: Sendable, Equatable {
     /// virtual `.builtInTripleCamera`'s `formats` list caps at 60 fps, but the physical
     /// `.builtInWideAngleCamera` (a separately-discoverable device) does support 120/240.
     /// Switch to it via ``PRMCamera/switchDevice(type:position:)`` when entering slo-mo.
-    public static func == (lhs: Self, rhs: Self) -> Bool {
-        lhs.uniqueID == rhs.uniqueID
-            && lhs.deviceType == rhs.deviceType
-            && lhs.position == rhs.position
-            && lhs.localizedName == rhs.localizedName
-            && lhs.minZoomFactor == rhs.minZoomFactor
-            && lhs.maxZoomFactor == rhs.maxZoomFactor
-            && lhs.switchOverZoomFactors == rhs.switchOverZoomFactors
-            && lhs.lenses == rhs.lenses
-            && lhs.hasTorch == rhs.hasTorch
-            && lhs.hasFlash == rhs.hasFlash
-            && lhs.exposureBiasRange == rhs.exposureBiasRange
-            && lhs.isoRange == rhs.isoRange
-            && lhs.shutterRange == rhs.shutterRange
-            && lhs.supportsCustomWhiteBalance == rhs.supportsCustomWhiteBalance
-            && lhs.supportsSlowMotion == rhs.supportsSlowMotion
-            && lhs.maxFrameRate == rhs.maxFrameRate
-            && lhs.maxSupportedPhotoDimensions?.width == rhs.maxSupportedPhotoDimensions?.width
-            && lhs.maxSupportedPhotoDimensions?.height == rhs.maxSupportedPhotoDimensions?.height
-            && lhs.supportsCustomLensPosition == rhs.supportsCustomLensPosition
-    }
-
     public static func anyDeviceSupportsSlowMotion(at position: AVCaptureDevice.Position) -> Bool {
         SlowMotionCache.supports(at: position)
+    }
+
+    /// The camera at `position` that Cinematic Video runs on (iOS 26), or `nil` when none has
+    /// a Cinematic Video format (or before iOS 26).
+    ///
+    /// Apple supports Cinematic Video on the back Dual Wide camera and the front TrueDepth
+    /// camera, not the Triple camera Pro iPhones open by default. This checks, in order, the
+    /// Dual Wide, TrueDepth, Triple, Dual, wide-angle, ultra-wide and telephoto cameras for a
+    /// Cinematic Video format. The answer is cached per position: a camera's formats don't
+    /// change at runtime.
+    public static func cinematicVideoDeviceType(at position: AVCaptureDevice.Position) -> AVCaptureDevice.DeviceType? {
+        CinematicVideoDeviceCache.deviceType(at: position)
+    }
+}
+
+/// Per-position cache for ``PRMCameraDevice/cinematicVideoDeviceType(at:)``: the discovery
+/// walks every format of several cameras.
+private enum CinematicVideoDeviceCache {
+    private static let lock = NSLock()
+    private nonisolated(unsafe) static var values: [AVCaptureDevice.Position: AVCaptureDevice.DeviceType?] = [:]
+
+    static func deviceType(at position: AVCaptureDevice.Position) -> AVCaptureDevice.DeviceType? {
+        if let cached = lock.withLock({ values[position] }) {
+            return cached
+        }
+        let result = discover(at: position)
+        lock.withLock { values[position] = result }
+        return result
+    }
+
+    private static func discover(at position: AVCaptureDevice.Position) -> AVCaptureDevice.DeviceType? {
+        guard #available(iOS 26.0, *) else { return nil }
+        let preference: [AVCaptureDevice.DeviceType] = [
+            .builtInDualWideCamera,
+            .builtInTrueDepthCamera,
+            .builtInTripleCamera,
+            .builtInDualCamera,
+            .builtInWideAngleCamera,
+            .builtInUltraWideCamera,
+            .builtInTelephotoCamera,
+        ]
+        let devices = AVCaptureDevice.DiscoverySession(deviceTypes: preference, mediaType: .video, position: position).devices
+        return preference.first { type in
+            devices.contains { $0.deviceType == type && $0.formats.contains(where: \.isCinematicVideoCaptureSupported) }
+        }
     }
 }
 

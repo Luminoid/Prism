@@ -17,6 +17,5 @@ struct AVCaptureDeviceISOTests {
         let shutterRange: (AVCaptureDevice) -> () -> ClosedRange<Double> =
             { device in device.prm_shutterSpeedRange }
         _ = (setISO, setShutter, isoRange, shutterRange)
-        #expect(true)
     }
 }

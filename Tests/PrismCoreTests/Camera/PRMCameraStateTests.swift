@@ -41,4 +41,26 @@ struct PRMCameraStateTests {
         #expect(state.isVideoHDREnabled)
         #expect(state.isLowLightBoostActive)
     }
+
+    @Test
+    func `iOS 26 and 27 fields default to off`() {
+        let state = PRMCameraState()
+        #expect(state.lensAperture == 0)
+        #expect(state.autoExposureAxes == .all)
+        #expect(state.activeExposureSignals.isEmpty)
+        #expect(!state.isPrimaryConstituentLocked)
+        #expect(state.lensSmudgeStatus == .disabled)
+        #expect(!state.isLowLightVideoNoiseReductionActive)
+        #expect(state.interruptionReason == nil)
+        #expect(state.systemPressure == .nominal)
+        #expect(!state.isContinuousAutoFocusTrackingEnabled)
+        #expect(!state.isContinuousAutoFocusTrackingSubjectAcquired)
+        #expect(state.continuousAutoFocusTrackingBias == 0)
+        #expect(!state.isCinematicVideoCaptureEnabled)
+        #expect(state.cinematicSimulatedAperture == 0)
+        #expect(state.cinematicSceneStatuses.isEmpty)
+        #expect(!state.isCinematicVideoMetadataCaptureEnabled)
+        #expect(state.dynamicAspectRatio == nil)
+        #expect(state.dynamicDimensions == nil)
+    }
 }

@@ -18,4 +18,11 @@ struct PRMLevelIndicatorViewTests {
         view.isActive = true
         view.isActive = false
     }
+
+    @Test
+    func `VoiceOver label is set`() {
+        let view = PRMLevelIndicatorView()
+        #expect(view.isAccessibilityElement)
+        #expect(view.accessibilityLabel == "Level indicator")
+    }
 }

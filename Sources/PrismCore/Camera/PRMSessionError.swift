@@ -24,6 +24,11 @@ public enum PRMSessionError: Error, Sendable, Equatable {
     /// Photo capture failed before delivering a final photo.
     case photoCaptureFailed(String)
 
+    /// AVFoundation failed a photo capture or a recording. The `AVError` keeps the code, for
+    /// example `.maximumDurationReached`, or `-11872` when the session asked for more
+    /// camera hardware than the device has.
+    case captureFailed(AVError)
+
     /// Video recording failed.
     case videoRecordingFailed(String)
 
@@ -38,6 +43,17 @@ public enum PRMSessionError: Error, Sendable, Equatable {
     /// before re-issuing the manual call.
     case virtualDeviceManualControlUnsupported(AVCaptureDevice.DeviceType)
 
+    /// The requested exposure combination (an iOS 27 priority mode, or any aperture /
+    /// shutter / ISO mix) isn't supported by the active format, or the OS is older than
+    /// iOS 27. Check ``PRMCameraDevice/apertureRange`` and
+    /// `AVCaptureDevice.prm_supportsExposure(aperture:shutterSeconds:iso:)` first.
+    case exposureCombinationUnsupported
+
+    /// The operation isn't available in the session's current configuration: the OS is too
+    /// old, the device or format doesn't support it, or another mode excludes it (for
+    /// example, focus changes while Cinematic Video is active). The string says which.
+    case unsupportedConfiguration(String)
+
     public static func == (lhs: Self, rhs: Self) -> Bool {
         switch (lhs, rhs) {
         case (.notAuthorized, .notAuthorized): true
@@ -48,8 +64,11 @@ public enum PRMSessionError: Error, Sendable, Equatable {
         case let (.cannotAttachToSession(a), .cannotAttachToSession(b)): a == b
         case let (.runtime(a), .runtime(b)): a.code == b.code
         case let (.photoCaptureFailed(a), .photoCaptureFailed(b)): a == b
+        case let (.captureFailed(a), .captureFailed(b)): a.code == b.code
         case let (.videoRecordingFailed(a), .videoRecordingFailed(b)): a == b
         case let (.virtualDeviceManualControlUnsupported(a), .virtualDeviceManualControlUnsupported(b)): a == b
+        case (.exposureCombinationUnsupported, .exposureCombinationUnsupported): true
+        case let (.unsupportedConfiguration(a), .unsupportedConfiguration(b)): a == b
         default: false
         }
     }
@@ -74,12 +93,18 @@ extension PRMSessionError: LocalizedError {
             "Capture session runtime error: \(error.localizedDescription)"
         case let .photoCaptureFailed(reason):
             "Photo capture failed: \(reason)"
+        case let .captureFailed(error):
+            "Capture failed: \(error.localizedDescription)"
         case let .videoRecordingFailed(reason):
             "Video recording failed: \(reason)"
         case .cancelled:
             "Operation cancelled."
         case let .virtualDeviceManualControlUnsupported(deviceType):
             "Manual exposure / white-balance lock is unsupported on virtual multi-camera device \(deviceType.rawValue). Switch to .builtInWideAngleCamera first."
+        case .exposureCombinationUnsupported:
+            "The requested aperture / shutter / ISO combination isn't supported by the active format."
+        case let .unsupportedConfiguration(reason):
+            "Unsupported in the current configuration: \(reason)"
         }
     }
 }

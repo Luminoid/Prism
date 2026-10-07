@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import os
 
 /// Owns the `AVCaptureSession` and serializes all mutations on ``PRMCameraActor``.
 ///
@@ -8,9 +9,11 @@
 /// - install custom outputs (depth, audio, multi-cam),
 /// - integrate with code that already lives on `PRMCameraActor`.
 ///
-/// All public methods are actor-isolated, so callers must `await` them. AVFoundation
-/// delegate callbacks land on the actor's underlying queue automatically because the actor
-/// is initialized with a custom serial executor.
+/// All public methods are actor-isolated, so callers must `await` them. A synchronous
+/// method runs in one actor turn, so its checks and mutations can't interleave with another
+/// caller's; anything that must be atomic belongs in one. AVFoundation delegate callbacks
+/// arrive on the dedicated queues below (``dataOutputQueue``, ``metadataOutputQueue``), not
+/// on the actor.
 @PRMCameraActor
 public final class PRMCameraSession {
     // MARK: - Properties
@@ -23,7 +26,7 @@ public final class PRMCameraSession {
 
     /// Dedicated queue for AVFoundation delegate callbacks (video data output).
     public nonisolated let dataOutputQueue = DispatchQueue(
-        label: "com.luminoid.Prism.DataOutput",
+        label: "dev.luminoid.prism.dataOutput",
         qos: .userInitiated,
         autoreleaseFrequency: .workItem
     )
@@ -31,8 +34,15 @@ public final class PRMCameraSession {
     /// Current configuration.
     public private(set) var configuration: PRMCameraConfiguration?
 
-    /// Current video device.
-    public private(set) var videoDevice: AVCaptureDevice?
+    /// Current video device. Changing it re-binds the device-level KVO behind
+    /// `deviceEvents` (see `PRMCameraSession+DeviceObservers.swift`).
+    public private(set) var videoDevice: AVCaptureDevice? {
+        didSet {
+            if videoDevice !== oldValue {
+                installDeviceObservers()
+            }
+        }
+    }
 
     /// Current video device input.
     public private(set) var videoDeviceInput: AVCaptureDeviceInput?
@@ -46,14 +56,55 @@ public final class PRMCameraSession {
     /// Video data output (for filter pipeline), if configured.
     public private(set) var videoDataOutput: AVCaptureVideoDataOutput?
 
+    /// The video-data connection's `videoRotationAngle`: how far its frames arrive rotated
+    /// from the camera's native sensor orientation, or `nil` without a video-data output.
+    ///
+    /// It isn't always 0. AVFoundation defaults some front cameras to a rotation that makes
+    /// their frames look like older hardware's: 270° on the Center Stage front camera of
+    /// iPhone 17 and later (its sensor is mounted in portrait), 180° on recent iPads. Rotation
+    /// angles from `AVCaptureDevice.RotationCoordinator` are measured from the native
+    /// orientation, so a view that draws these frames rotates by the difference
+    /// (``PRMRotationCoordinator/portraitFrameRotation(connectionAngle:)``).
+    public var videoDataRotationAngle: CGFloat? {
+        videoDataOutput?.connection(with: .video)?.videoRotationAngle
+    }
+
+    /// Whether AVFoundation mirrors the video-data frames, or `nil` without a video-data
+    /// output. Front-camera frames arrive unmirrored by default; a selfie preview mirrors them
+    /// in view space, after the rotation.
+    public var isVideoDataMirrored: Bool? {
+        videoDataOutput?.connection(with: .video)?.isVideoMirrored
+    }
+
     /// Movie file output, if configured.
     public private(set) var movieFileOutput: AVCaptureMovieFileOutput?
 
-    /// Whether `session.startRunning()` has been called.
-    public private(set) var isRunning: Bool = false
+    /// Live depth stream, when attached with ``attachDepthDataOutput(delegate:queue:filteringEnabled:)``.
+    public internal(set) var depthDataOutput: AVCaptureDepthDataOutput?
 
-    /// The `device.activeFormat` snapshot captured at `configure(_:)` and refreshed
-    /// at every `switchCamera` / `switchDevice` success. Used by
+    /// Delegate, queue and filtering for the depth stream, kept so a full reconfigure
+    /// re-attaches it. `nil` when the app hasn't asked for one (or detached it).
+    var depthDataOutputRequest: DepthDataOutputRequest?
+
+    struct DepthDataOutputRequest {
+        let delegate: any AVCaptureDepthDataOutputDelegate
+        let queue: DispatchQueue
+        let filteringEnabled: Bool
+    }
+
+    /// Whether the capture session is running, read from AVFoundation. It turns `false`
+    /// when AVFoundation stops the session itself (a runtime error, a media-services reset),
+    /// so ``start()`` is never skipped because of a stale flag.
+    public var isRunning: Bool {
+        session.isRunning
+    }
+
+    /// Whether the app asked the session to run (``start()`` without a later ``stop()``).
+    /// ``restartAfterMediaServicesReset()`` only restarts a session the app wanted running.
+    public private(set) var wantsRunning = false
+
+    /// The `device.activeFormat` snapshot captured at `configure(_:)` and at a device's
+    /// first `switchCamera` / `switchDevice` visit (see ``baselineFormats``). Used by
     /// `applyLivePhotoCompatibleFormat()` as the canonical "restore" target on
     /// Max-Dimensions-OFF — the format AVFoundation picked for our session at
     /// configure time is guaranteed BGRA-capable (we render a preview with it
@@ -70,6 +121,12 @@ public final class PRMCameraSession {
     /// otherwise unchanged — only the session itself updates the baseline.
     var baselineActiveFormat: AVCaptureDevice.Format?
 
+    /// Each device's baseline format, by `uniqueID`, taken at configure and on the device's
+    /// first visit. A later visit reuses it instead of snapshotting again: a device keeps
+    /// whatever format it last had (48MP, Cinematic Video), and a fresh snapshot on the way
+    /// back would make that the format "restore" returns to. Cleared by `configure(_:)`.
+    var baselineFormats: [String: AVCaptureDevice.Format] = [:]
+
     /// The `AVCaptureSession.Preset` AVFoundation was configured with at
     /// ``configure(_:)`` time. Snapshotted so that `PRMCamera.setFrameRate` can
     /// temporarily switch to `.inputPriority` for slo-mo / custom-format captures
@@ -80,6 +137,98 @@ public final class PRMCameraSession {
     /// shutter tap with `NSInvalidArgumentException: No active and enabled video
     /// connection`).
     var configuredSessionPreset: AVCaptureSession.Preset?
+
+    // MARK: - iOS 26 / 27 feature state
+
+    // The intents below survive `tearDownAttachments()` (like the app's frame delegate)
+    // so camera switches and full reconfigures re-apply them via `applyFeatureIntents()`.
+    // `configure(_:)` resets them from the configuration. They're intents rather than
+    // device reads because input properties (Cinematic Video) die with each new
+    // `AVCaptureDeviceInput`, while device properties (tracking, aspect ratio) linger on the
+    // outgoing device.
+
+    /// Metadata output feeding subject tracking, Cinematic Video and
+    /// ``PRMCameraConfiguration/metadataObjectTypes``. Attached on first need; `nil` until then.
+    public internal(set) var metadataOutput: AVCaptureMetadataOutput?
+
+    /// Dedicated queue for metadata delegate callbacks, separate from frame delivery so
+    /// metadata work never delays frames.
+    public nonisolated let metadataOutputQueue = DispatchQueue(
+        label: "dev.luminoid.prism.metadata",
+        qos: .userInitiated,
+        autoreleaseFrequency: .workItem
+    )
+
+    /// Converts metadata objects to ``PRMDetectedObject`` values and fans them out.
+    public nonisolated let metadataRouter = PRMMetadataRouter()
+
+    /// The video-data output's delegate: forwards to the app's delegate and feeds Prism's own
+    /// frame observers (Night captures).
+    nonisolated let frameRouter = PRMVideoFrameRouter()
+
+    /// Names the capture holding the camera exclusively (a Night capture), during which
+    /// reconfigurations and device controls are refused. See ``refuseWhileBusy(_:)``.
+    var exclusiveCaptureOwner: String?
+
+    /// Whether a Night capture holds the camera.
+    public var isExclusiveCaptureActive: Bool {
+        exclusiveCaptureOwner != nil
+    }
+
+    /// Ticks whenever an observed property of the current device changes (smudge status,
+    /// system pressure, tracking, aspect ratio, …). Coalesced to the latest tick.
+    /// ``PRMCamera`` turns these into `refreshState()` calls.
+    nonisolated let deviceEvents = PRMStreamRegistry<Void>(bufferingPolicy: .bufferingNewest(1))
+
+    /// iOS 26 Smart Framing recommendations for the current device (`nil` when there is none).
+    nonisolated let framingRecommendations = PRMStreamRegistry<PRMFraming?>(bufferingPolicy: .bufferingNewest(1))
+
+    /// The latest value sent on ``framingRecommendations``, handed to late subscribers.
+    nonisolated let latestFramingRecommendation = OSAllocatedUnfairLock<PRMFraming?>(initialState: nil)
+
+    /// Device-level KVO behind ``deviceEvents`` / ``framingRecommendations``.
+    var deviceObservations: [NSKeyValueObservation] = []
+
+    /// Consumer-requested metadata types (beyond what tracking / Cinematic Video need).
+    var requestedMetadataObjectTypes: [AVMetadataObject.ObjectType] = []
+
+    /// iOS 27: whether continuous autofocus tracking should be on.
+    var wantsContinuousAutoFocusTracking = false
+
+    /// iOS 26: whether Cinematic Video capture should be on.
+    var wantsCinematicVideo = false
+
+    /// Whether the app wants the 48MP-class photo format (from
+    /// ``PRMCameraConfiguration/prefersMaxPhotoDimensionsFormat`` at configure, then
+    /// ``setHighResolutionPhotoFormat(_:)``). Re-applied after camera switches, and keeps a
+    /// re-attached photo output's auxiliary streams off.
+    var wantsHighResolutionPhotoFormat = false
+
+    /// Video stabilization for the video-data and movie connections, re-applied whenever
+    /// either is rebuilt (camera switch, runtime attach).
+    var stabilizationMode: AVCaptureVideoStabilizationMode = .off
+
+    /// Bumped by every Cinematic Video toggle and camera switch, so an enable that waited
+    /// for a rebuild can tell it was overtaken.
+    var cinematicGeneration = 0
+
+    /// iOS 26: last simulated aperture requested for Cinematic Video.
+    var cinematicSimulatedApertureIntent: Float?
+
+    /// iOS 27: Cinematic Video metadata recording policy for the movie output.
+    var cinematicMetadataCapture: PRMCinematicMetadataCapture = .automatic
+
+    /// iOS 26: smudge detection interval (`nil` = off).
+    var lensSmudgeDetectionInterval: CMTime?
+
+    /// iOS 27: low-light video noise reduction policy.
+    var lowLightVideoNoiseReduction: PRMLowLightVideoNoiseReduction = .automatic
+
+    /// iOS 26: dynamic aspect ratio to keep applying to the device.
+    var desiredDynamicAspectRatio: PRMAspectRatio?
+
+    /// iOS 26: framings the Smart Framing monitor may recommend (`nil` = monitoring off).
+    var smartFramingIntent: [PRMFraming]?
 
     // MARK: - Init
 
@@ -102,14 +251,45 @@ public final class PRMCameraSession {
     /// is atomic from AVFoundation's perspective. (The original implementation only
     /// added — calling it twice left two video inputs attached, with the second
     /// `canAddInput` silently failing and the session stuck on the first device.)
+    ///
+    /// Logs one notice line with the resulting device, format, outputs and hardware cost,
+    /// or an error line when configuration fails.
+    ///
+    /// - Throws: ``PRMSessionError/notAuthorized`` when camera access was denied or is
+    ///   restricted, ``PRMSessionError/unsupportedConfiguration(_:)`` while recording, or the
+    ///   error from attaching an input or output.
     public func configure(_ configuration: PRMCameraConfiguration) throws {
+        do {
+            let status = AVCaptureDevice.authorizationStatus(for: .video)
+            if status == .denied || status == .restricted {
+                throw PRMSessionError.notAuthorized
+            }
+            try refuseWhileBusy("Reconfiguring the session")
+            try applyConfiguration(configuration)
+        } catch {
+            PRMLog.error(.session, "configure failed", error: error)
+            throw error
+        }
+        PRMLog.notice(.session, "Configured: \(configurationSummary())")
+    }
+
+    /// Body of ``configure(_:)``: one begin/commit that replaces every input and output.
+    /// `resettingIntents: false` keeps the runtime feature intents, for rebuilding after a
+    /// failed reconfigure.
+    private func applyConfiguration(_ configuration: PRMCameraConfiguration, resettingIntents: Bool = true) throws {
         configuration.validate()
         self.configuration = configuration
+        if resettingIntents {
+            resetFeatureIntents(from: configuration)
+            // An app-added depth stream belongs to the previous configuration.
+            depthDataOutputRequest = nil
+        }
+        baselineFormats.removeAll()
 
-        PRMLogger.trace(
+        PRMLog.debug(
             .session,
             """
-            configure(pos=\(configuration.cameraPosition.rawValue), preset=\(configuration.sessionPreset.rawValue), \
+            configure(position=\(configuration.cameraPosition.prm_logName), preset=\(configuration.sessionPreset.prm_logName), \
             audio=\(configuration.includesAudio), video=\(configuration.includesVideoDataOutput), \
             photo=\(configuration.includesPhotoOutput), movie=\(configuration.includesMovieFileOutput), \
             preferMaxPhoto=\(configuration.prefersMaxPhotoDimensionsFormat))
@@ -124,7 +304,7 @@ public final class PRMCameraSession {
         session.sessionPreset = configuration.sessionPreset
         configuredSessionPreset = configuration.sessionPreset
 
-        try attachVideoDevice(position: configuration.cameraPosition, types: configuration.deviceTypes)
+        try attachVideoDevice(position: configuration.cameraPosition, types: Self.videoDeviceTypes(for: configuration))
         #if !os(macOS)
             // Promote `activeFormat` to a 48MP-capable format BEFORE the photo output is
             // attached — `refreshOutputMaxPhotoDimensions` reads
@@ -135,6 +315,10 @@ public final class PRMCameraSession {
 
         if configuration.includesAudio {
             attachAudioDevice()
+            if #available(iOS 26.0, *) {
+                session.configuresApplicationAudioSessionForBluetoothHighQualityRecording =
+                    configuration.enableBluetoothHighQualityRecording
+            }
         }
 
         if configuration.includesVideoDataOutput {
@@ -152,14 +336,13 @@ public final class PRMCameraSession {
             try attachMovieFileOutput()
         }
 
-        applyPreferredStabilization(configuration.preferredVideoStabilizationMode)
-
         #if !os(macOS)
             if configuration.enableMultitaskingCameraAccess {
                 if session.isMultitaskingCameraAccessSupported {
                     session.isMultitaskingCameraAccessEnabled = true
                 } else {
-                    PRMLogger.session.info(
+                    PRMLog.notice(
+                        .session,
                         "Multitasking camera access requested but not supported on this device (iPad only)"
                     )
                 }
@@ -171,22 +354,80 @@ public final class PRMCameraSession {
         // format application so the snapshot reflects the format the user will actually
         // see rendering, not an intermediate state.
         baselineActiveFormat = videoDevice?.activeFormat
-
         if let device = videoDevice {
-            let dims = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
-            PRMLogger.trace(
-                .session,
-                "configure complete: device=\(device.localizedName), activeFormat=\(dims.width)×\(dims.height)"
-            )
+            baselineFormats[device.uniqueID] = device.activeFormat
+        }
+
+        applyFeatureIntents()
+        // Cinematic Video goes last, after the baseline snapshot, so the baseline stays the
+        // format AVFoundation picked for the plain session (the one disable restores).
+        if wantsCinematicVideo {
+            enableCinematicVideoDuringConfigure()
         }
     }
 
-    private func applyPreferredStabilization(_ mode: AVCaptureVideoStabilizationMode) {
-        if let connection = videoDataOutput?.connection(with: .video) {
-            connection.prm_setStabilization(mode)
-        }
+    /// Applies ``stabilizationMode`` to the movie connection, and the preview's mode (see
+    /// ``previewStabilizationMode(requested:hasMovieOutput:supportsLowLatency:)``) to the
+    /// video-data connection.
+    func applyStabilization() {
         if let connection = movieFileOutput?.connection(with: .video) {
-            connection.prm_setStabilization(mode)
+            connection.prm_setStabilization(stabilizationMode)
+        }
+        if let connection = videoDataOutput?.connection(with: .video) {
+            var supportsLowLatency = false
+            if #available(iOS 26.0, *), let device = videoDevice {
+                supportsLowLatency = device.activeFormat.isVideoStabilizationModeSupported(.lowLatency)
+            }
+            connection.prm_setStabilization(Self.previewStabilizationMode(
+                requested: stabilizationMode,
+                hasMovieOutput: movieFileOutput != nil,
+                supportsLowLatency: supportsLowLatency
+            ))
+        }
+    }
+
+    /// The stabilization for the video-data connection, which feeds the live preview. The
+    /// cinematic modes (which `.auto` can pick on video formats) delay every frame by a large
+    /// fraction of a second, so the preview never gets them: without a movie output (the
+    /// photo modes) or with stabilization off it runs unstabilized, showing the photo's field
+    /// of view; while recording is possible it gets iOS 26's `.lowLatency`, which adds no
+    /// latency, where the format supports it.
+    nonisolated static func previewStabilizationMode(
+        requested: AVCaptureVideoStabilizationMode,
+        hasMovieOutput: Bool,
+        supportsLowLatency: Bool
+    ) -> AVCaptureVideoStabilizationMode {
+        guard requested != .off, hasMovieOutput, supportsLowLatency else { return .off }
+        if #available(iOS 26.0, *) {
+            return .lowLatency
+        }
+        return .off
+    }
+
+    /// Sets video stabilization for recordings (the movie connection) and keeps it across
+    /// camera switches and output rebuilds. The video-data connection behind the live preview
+    /// gets a low-latency mode instead; see
+    /// ``previewStabilizationMode(requested:hasMovieOutput:supportsLowLatency:)``.
+    public func setStabilization(_ mode: AVCaptureVideoStabilizationMode) {
+        stabilizationMode = mode
+        applyStabilization()
+    }
+
+    /// Throws ``PRMSessionError/unsupportedConfiguration(_:)`` naming `operation` while the
+    /// movie output is recording or a Night capture holds the camera: reconfiguring the
+    /// session (a camera switch, a format change, removing the movie output) would end or
+    /// corrupt either.
+    func refuseWhileBusy(_ operation: String) throws {
+        if movieFileOutput?.isRecording == true {
+            throw PRMSessionError.unsupportedConfiguration("\(operation) isn't available while recording")
+        }
+        try refuseDuringExclusiveCapture(operation)
+    }
+
+    /// Throws while a Night capture holds the camera (``exclusiveCaptureOwner``).
+    func refuseDuringExclusiveCapture(_ operation: String) throws {
+        if let owner = exclusiveCaptureOwner {
+            throw PRMSessionError.unsupportedConfiguration("\(operation) isn't available during \(owner)")
         }
     }
 
@@ -196,6 +437,8 @@ public final class PRMCameraSession {
     /// open — AVFoundation batches the removals + the subsequent additions into a
     /// single session commit, so the user doesn't see a transient empty preview.
     private func tearDownAttachments() {
+        stopSmartFramingMonitoring()
+        videoDevice?.prm_restoreGeometricDistortionCorrectionIfNeeded()
         for input in session.inputs {
             session.removeInput(input)
         }
@@ -208,25 +451,95 @@ public final class PRMCameraSession {
         photoOutput = nil
         videoDataOutput = nil
         movieFileOutput = nil
+        metadataOutput = nil
+        depthDataOutput = nil
     }
 
     // MARK: - Lifecycle
 
     /// Starts the session. Idempotent.
     public func start() {
+        wantsRunning = true
         guard !isRunning else { return }
-        PRMLogger.trace(.session, "start")
+        PRMLog.debug(.session, "start")
         session.startRunning()
-        isRunning = session.isRunning
-        PRMLogger.trace(.session, "start: isRunning=\(isRunning)")
+        if isRunning {
+            PRMLog.notice(.session, "Started: \(configurationSummary())")
+        } else {
+            // AVFoundation reports why through a runtime-error or interruption notification.
+            PRMLog.warning(.session, "startRunning returned without the session running: \(configurationSummary())")
+        }
+        startSmartFramingMonitoringIfNeeded()
     }
 
     /// Stops the session. Idempotent.
     public func stop() {
+        wantsRunning = false
         guard isRunning else { return }
-        PRMLogger.trace(.session, "stop")
+        PRMLog.debug(.session, "stop")
+        stopSmartFramingMonitoring()
         session.stopRunning()
-        isRunning = false
+        PRMLog.notice(.session, "Stopped")
+    }
+
+    /// Restarts a session that AVFoundation stopped underneath the app with a
+    /// media-services reset, if the app still wants it running. Without this the preview
+    /// stays black until the app reconfigures. ``PRMCamera`` calls it from its runtime-error
+    /// observer.
+    public func restartAfterMediaServicesReset() {
+        guard wantsRunning, !isRunning else { return }
+        PRMLog.notice(.session, "Restarting after a media-services reset")
+        start()
+    }
+
+    // MARK: - Log summary
+
+    /// One public line describing the session for notice-level logs: device, position,
+    /// preset, active format, frame-rate range, attached outputs and hardware cost.
+    func configurationSummary() -> String {
+        var parts: [String] = []
+        if let device = videoDevice {
+            let description = device.activeFormat.formatDescription
+            let dims = CMVideoFormatDescriptionGetDimensions(description)
+            let pixelFormat = PRMLog.fourCC(CMFormatDescriptionGetMediaSubType(description))
+            parts.append("device=\(device.deviceType.prm_logName)")
+            parts.append("position=\(device.position.prm_logName)")
+            parts.append("format=\(dims.width)x\(dims.height) \(pixelFormat)")
+            parts.append("fps=\(Self.frameRateRangeText(of: device))")
+        } else {
+            parts.append("device=none")
+        }
+        parts.append("preset=\(session.sessionPreset.prm_logName)")
+        var outputs: [String] = []
+        if photoOutput != nil { outputs.append("photo") }
+        if videoDataOutput != nil { outputs.append("videoData") }
+        if movieFileOutput != nil { outputs.append("movie") }
+        if metadataOutput != nil { outputs.append("metadata") }
+        if depthDataOutput != nil { outputs.append("depth") }
+        if audioDeviceInput != nil { outputs.append("audioInput") }
+        parts.append("outputs=\(outputs.isEmpty ? "none" : outputs.joined(separator: ","))")
+        #if !os(macOS)
+            if let photoOutput {
+                let maxDims = photoOutput.maxPhotoDimensions
+                parts.append("maxPhoto=\(maxDims.width)x\(maxDims.height)")
+                parts.append("livePhoto=\(photoOutput.isLivePhotoCaptureEnabled)")
+            }
+        #endif
+        if isCinematicVideoCaptureActive {
+            parts.append("cinematicVideo=true")
+        }
+        parts.append("hardwareCost=\(String(format: "%.2f", session.hardwareCost))")
+        return parts.joined(separator: " ")
+    }
+
+    /// `"30"`, `"1-30"`, or `"default"` when the device reports no frame durations.
+    nonisolated static func frameRateRangeText(of device: AVCaptureDevice) -> String {
+        let maxRate = 1 / CMTimeGetSeconds(device.activeVideoMinFrameDuration)
+        let minRate = 1 / CMTimeGetSeconds(device.activeVideoMaxFrameDuration)
+        guard minRate.isFinite, maxRate.isFinite, minRate > 0, maxRate > 0 else { return "default" }
+        let low = String(format: "%g", minRate)
+        let high = String(format: "%g", maxRate)
+        return low == high ? high : "\(low)-\(high)"
     }
 
     // MARK: - Photo output readiness
@@ -271,7 +584,7 @@ public final class PRMCameraSession {
             // photo output means nothing to wait for — return `true` so callers
             // can proceed without a 3 s timeout warning.
             guard photoOutput != nil else {
-                PRMLogger.trace(.session, "awaitPhotoOutputReady: photo output detached, skipping wait")
+                PRMLog.debug(.session, "awaitPhotoOutputReady: photo output detached, skipping wait")
                 return true
             }
             let pollStep: UInt64 = pollIntervalMS * 1_000_000
@@ -294,7 +607,7 @@ public final class PRMCameraSession {
                     let dimsReady = dims.width > 0 && dims.height > 0
                     if connectionReady, dimsReady, output.captureReadiness == .ready {
                         let elapsedMS = Int(Date().timeIntervalSince(startedAt) * 1000)
-                        PRMLogger.trace(
+                        PRMLog.debug(
                             .session,
                             "awaitPhotoOutputReady: ready after \(elapsedMS) ms (maxDim=\(dims.width)×\(dims.height))"
                         )
@@ -323,11 +636,12 @@ public final class PRMCameraSession {
             } else {
                 "nil"
             }
-            PRMLogger.session.warning(
+            PRMLog.warning(
+                .session,
                 """
-                awaitPhotoOutputReady: timeout after \(Int(timeout * 1000), privacy: .public) ms — \
-                readiness=\(readinessText, privacy: .public), connection=\(connectionText, privacy: .public), \
-                maxDim=\(dimsText, privacy: .public)
+                awaitPhotoOutputReady: timeout after \(Int(timeout * 1000)) ms — \
+                readiness=\(readinessText), connection=\(connectionText), \
+                maxDim=\(dimsText)
                 """
             )
             return false
@@ -340,17 +654,28 @@ public final class PRMCameraSession {
     /// configuration's `deviceTypes` priority list. Returns the new device.
     @discardableResult
     public func switchCamera(to position: AVCaptureDevice.Position) throws -> AVCaptureDevice {
-        guard let configuration else {
-            throw PRMSessionError.cannotAttachToSession("Session not yet configured")
+        try loggingFailure("switchCamera(\(position.prm_logName))") {
+            guard let configuration else {
+                throw PRMSessionError.cannotAttachToSession("Session not yet configured")
+            }
+            try refuseWhileBusy("Switching cameras")
+            guard let newDevice = Self.bestVideoDevice(
+                position: position,
+                types: configuration.deviceTypes
+            ) else {
+                throw PRMSessionError.noVideoDevice(position)
+            }
+            try swapInput(to: newDevice)
+            return newDevice
         }
-        guard let newDevice = Self.bestVideoDevice(
-            position: position,
-            types: configuration.deviceTypes
-        ) else {
-            throw PRMSessionError.noVideoDevice(position)
-        }
-        try swapInput(to: newDevice)
-        return newDevice
+    }
+
+    /// The device type ``switchCamera(to:)`` lands on at `position` (the first of the
+    /// configuration's `deviceTypes` there), or `nil` before ``configure(_:)`` or without
+    /// a camera there.
+    public func defaultVideoDeviceType(at position: AVCaptureDevice.Position) -> AVCaptureDevice.DeviceType? {
+        guard let configuration else { return nil }
+        return Self.bestVideoDevice(position: position, types: configuration.deviceTypes)?.deviceType
     }
 
     /// Switches the video input to a specific device type, keeping the current camera
@@ -380,16 +705,29 @@ public final class PRMCameraSession {
         if let current = videoDevice, current.deviceType == type, current.position == targetPosition {
             return current
         }
-        let discovery = AVCaptureDevice.DiscoverySession(
-            deviceTypes: [type],
-            mediaType: .video,
-            position: targetPosition
-        )
-        guard let newDevice = discovery.devices.first else {
-            throw PRMSessionError.noDeviceOfType(type, targetPosition)
+        return try loggingFailure("switchDevice(\(type.prm_logName), \(targetPosition.prm_logName))") {
+            try refuseWhileBusy("Switching cameras")
+            let discovery = AVCaptureDevice.DiscoverySession(
+                deviceTypes: [type],
+                mediaType: .video,
+                position: targetPosition
+            )
+            guard let newDevice = discovery.devices.first else {
+                throw PRMSessionError.noDeviceOfType(type, targetPosition)
+            }
+            try swapInput(to: newDevice)
+            return newDevice
         }
-        try swapInput(to: newDevice)
-        return newDevice
+    }
+
+    /// Runs `body`, logging a thrown error at error level before rethrowing it.
+    private func loggingFailure<T>(_ operation: String, _ body: () throws -> T) rethrows -> T {
+        do {
+            return try body()
+        } catch {
+            PRMLog.error(.session, "\(operation) failed", error: error)
+            throw error
+        }
     }
 
     /// Removes the current video input (if any) and installs an input wrapping `newDevice`.
@@ -400,14 +738,15 @@ public final class PRMCameraSession {
         guard let currentInput = videoDeviceInput else {
             throw PRMSessionError.cannotAttachToSession("No current input to swap")
         }
-        PRMLogger.trace(
+        PRMLog.debug(
             .session,
-            "swapInput: \(videoDevice?.localizedName ?? "nil") → \(newDevice.localizedName) (type=\(newDevice.deviceType.rawValue), pos=\(newDevice.position.rawValue))"
+            "swapInput: \(videoDevice?.deviceType.prm_logName ?? "none") → \(newDevice.deviceType.prm_logName) (\(newDevice.position.prm_logName))"
         )
         let newInput: AVCaptureDeviceInput
         do {
             newInput = try AVCaptureDeviceInput(device: newDevice)
         } catch {
+            PRMLog.error(.session, "AVCaptureDeviceInput failed for \(newDevice.deviceType.prm_logName)", error: error)
             throw PRMSessionError.cannotCreateDeviceInput(error.localizedDescription)
         }
 
@@ -423,8 +762,26 @@ public final class PRMCameraSession {
         // output.maxPhotoDimensions reads (0,0)). Pre-emptive cleanup here is
         // cheap and keeps the device in a clean state for the next time it's
         // active in the session.
+        // Live Photo's runtime on/off state (``setLivePhotoCaptureEnabled(_:)``): AVFoundation
+        // turns it off when the input goes, and the re-assert below must not turn back on
+        // what the app turned off (Live Photo makes AVFoundation drop manual exposure).
+        #if !os(macOS)
+            let livePhotoWasEnabled = photoOutput?.isLivePhotoCaptureEnabled ?? false
+        #endif
+        cinematicGeneration += 1
+
         if let outgoingDevice = videoDevice {
-            try? outgoingDevice.prm_resetFrameRate()
+            PRMLog.bestEffort(.session, "swapInput: resetFrameRate on outgoing device") { try outgoingDevice.prm_resetFrameRate() }
+            outgoingDevice.prm_restoreGeometricDistortionCorrectionIfNeeded()
+            // Device-level feature state lingers on the instance the same way frame
+            // durations do. Leave the outgoing camera clean; intents are re-applied to the
+            // incoming one below.
+            stopSmartFramingMonitoring()
+            if outgoingDevice.prm_isContinuousAutoFocusTrackingEnabled {
+                PRMLog.bestEffort(.session, "swapInput: stop AF tracking on outgoing device") {
+                    try outgoingDevice.prm_setContinuousAutoFocusTracking(false)
+                }
+            }
         }
 
         session.beginConfiguration()
@@ -433,16 +790,26 @@ public final class PRMCameraSession {
             session.addInput(newInput)
             videoDeviceInput = newInput
             videoDevice = newDevice
+            // The tracked subject and detections belonged to the previous camera.
+            metadataRouter.reset()
+            // A format-driven preset (`.inputPriority` from a frame-rate, depth, 48MP or
+            // Cinematic Video format) would otherwise carry over; the incoming device starts
+            // from the configured preset, and the intents below re-apply what's wanted.
+            if let preset = configuredSessionPreset, session.sessionPreset != preset, session.canSetSessionPreset(preset) {
+                session.sessionPreset = preset
+            }
         } else {
-            // Fall back to original input — keep session usable.
+            // Fall back to original input — keep session usable. The outgoing-device cleanup
+            // above already ran on it, so re-apply the feature intents it just lost.
             session.addInput(currentInput)
+            applyFeatureIntents()
             session.commitConfiguration()
             throw PRMSessionError.cannotAttachToSession("Cannot attach \(newDevice.localizedName)")
         }
         // Also reset the INCOMING device's frame-duration. It may carry forward
         // leftover state from its own prior session usage (e.g. swap back to a
         // device that was previously set to a custom frame duration).
-        try? newDevice.prm_resetFrameRate()
+        PRMLog.bestEffort(.session, "swapInput: resetFrameRate on incoming device") { try newDevice.prm_resetFrameRate() }
 
         #if !os(macOS)
             // New device may have a different `formats` list (e.g. virtual → physical wide
@@ -463,7 +830,7 @@ public final class PRMCameraSession {
             // the new connection chain on the existing output instance.
             if let photoOutput, let configuration {
                 if configuration.enableLivePhoto {
-                    photoOutput.isLivePhotoCaptureEnabled = photoOutput.isLivePhotoCaptureSupported
+                    photoOutput.isLivePhotoCaptureEnabled = livePhotoWasEnabled && photoOutput.isLivePhotoCaptureSupported
                 }
                 if configuration.enableDepthDataDelivery {
                     photoOutput.isDepthDataDeliveryEnabled = photoOutput.isDepthDataDeliverySupported
@@ -471,12 +838,14 @@ public final class PRMCameraSession {
                 if configuration.enablePortraitEffectsMatteDelivery {
                     photoOutput.isPortraitEffectsMatteDeliveryEnabled = photoOutput.isPortraitEffectsMatteDeliverySupported
                 }
-                PRMLogger.trace(
+                PRMLog.debug(
                     .session,
                     "swapInput post: live(supported=\(photoOutput.isLivePhotoCaptureSupported), enabled=\(photoOutput.isLivePhotoCaptureEnabled))"
                 )
             }
         #endif
+        applyStabilization()
+        applyFeatureIntents()
         session.commitConfiguration()
 
         #if !os(macOS)
@@ -495,10 +864,15 @@ public final class PRMCameraSession {
             // in-place re-set failed — the common case (Live Photo off, or in-place
             // succeeded) is unaffected. The reconfigure preserves the destination
             // device since `videoDevice` is already updated above.
-            if let configuration, configuration.enableLivePhoto, let photoOutput,
+            //
+            // Never while a movie output is attached: Live Photo is unsupported alongside one
+            // by design, so the rebuild couldn't restore it and would only freeze the preview
+            // on every switch in video, slow-motion or Cinematic Video mode.
+            if let configuration, configuration.enableLivePhoto, let photoOutput, movieFileOutput == nil,
                !photoOutput.isLivePhotoCaptureSupported {
-                PRMLogger.session.notice(
-                    "swapInput: Live Photo lost on \(newDevice.localizedName, privacy: .public) — full session reconfigure"
+                PRMLog.notice(
+                    .session,
+                    "swapInput: Live Photo lost on \(newDevice.deviceType.prm_logName) — full session reconfigure"
                 )
                 // Snapshot the **dynamic** state that `tearDownAttachments()` is about
                 // to wipe — `reconfigureForDevice` would otherwise rebuild only against
@@ -509,21 +883,32 @@ public final class PRMCameraSession {
                 // captures keep working.
                 let dynamicState = DynamicSessionState(
                     movieFileOutputAttached: movieFileOutput != nil,
-                    livePhotoCaptureEnabled: photoOutput.isLivePhotoCaptureEnabled
+                    livePhotoCaptureEnabled: livePhotoWasEnabled
                 )
-                try reconfigureForDevice(newDevice, configuration: configuration, dynamicOverride: dynamicState)
+                do {
+                    try reconfigureForDevice(newDevice, configuration: configuration, dynamicOverride: dynamicState)
+                } catch {
+                    // The teardown already ran, so the session has no input or outputs.
+                    // Rebuild from the configuration (its own device choice) to keep it usable,
+                    // and still report that the switch failed.
+                    PRMLog.error(.session, "swapInput: full reconfigure failed; rebuilding from the configuration", error: error)
+                    try applyConfiguration(configuration, resettingIntents: false)
+                    throw error
+                }
             }
         #endif
 
-        // Re-snapshot the baseline format for the new device so a subsequent
-        // `applyLivePhotoCompatibleFormat()` restores to THIS device's known-good
-        // default, not a stale snapshot from the prior device.
-        baselineActiveFormat = videoDevice?.activeFormat ?? newDevice.activeFormat
-        let dims = CMVideoFormatDescriptionGetDimensions((videoDevice ?? newDevice).activeFormat.formatDescription)
-        PRMLogger.trace(
-            .session,
-            "swapInput complete: device=\((videoDevice ?? newDevice).localizedName), activeFormat=\(dims.width)×\(dims.height)"
-        )
+        // The baseline format for the new device, so a later `applyLivePhotoCompatibleFormat()`
+        // restores THIS device's known-good default. Taken on the device's first visit only.
+        if let device = videoDevice {
+            if let known = baselineFormats[device.uniqueID], device.formats.contains(where: { $0 === known }) {
+                baselineActiveFormat = known
+            } else {
+                baselineActiveFormat = device.activeFormat
+                baselineFormats[device.uniqueID] = device.activeFormat
+            }
+        }
+        PRMLog.notice(.session, "Switched device: \(configurationSummary())")
     }
 
     #if !os(macOS)
@@ -553,6 +938,7 @@ public final class PRMCameraSession {
             do {
                 input = try AVCaptureDeviceInput(device: device)
             } catch {
+                PRMLog.error(.session, "AVCaptureDeviceInput failed for \(device.deviceType.prm_logName) during reconfigure", error: error)
                 throw PRMSessionError.cannotCreateDeviceInput(error.localizedDescription)
             }
             guard session.canAddInput(input) else {
@@ -579,7 +965,7 @@ public final class PRMCameraSession {
             // every subsequent `capturePhoto` failing with "no active video
             // connection" until the consuming app explicitly calls
             // `resetFrameRate()` (which our reset here makes unnecessary).
-            try? device.prm_resetFrameRate()
+            PRMLog.bestEffort(.session, "reconfigureForDevice: resetFrameRate") { try device.prm_resetFrameRate() }
 
             applyPreferredPhotoFormatIfNeeded()
 
@@ -602,8 +988,9 @@ public final class PRMCameraSession {
             // begin/commit cycle — one toggle too many on top of AVF's already-in-
             // flight Live-Photo rebuild, which on virtual devices can leave the
             // photo output's secondary movie pipeline permanently stuck in
-            // `.notReadyMomentarily` (3 s+ unrecoverable, see the workspace lesson
-            // catalog entry on isLivePhotoCaptureEnabled async re-validation).
+            // `.notReadyMomentarily` (3 s+ unrecoverable: `isLivePhotoCaptureEnabled`
+            // re-validates asynchronously after commit, so a second toggle lands on a
+            // pipeline that is still rebuilding).
             // Baking the dynamic state INTO this one begin/commit gives AVF a
             // single rebuild target instead of a stack of three.
             let shouldAttachMovie = dynamicOverride?.movieFileOutputAttached
@@ -619,6 +1006,9 @@ public final class PRMCameraSession {
             // overwrite IN-PLACE here (still inside this same begin/commit) and
             // call `refreshOutputMaxPhotoDimensions` to keep the ceiling consistent.
             // No extra session commit cycle, no async rebuild stack-up.
+            if depthDataOutputRequest != nil {
+                applyDepthDataOutputAttached()
+            }
             #if !os(macOS)
                 if let override = dynamicOverride, let photoOutput {
                     // Movie output presence forces Live Photo OFF (AVF documents this
@@ -634,12 +1024,12 @@ public final class PRMCameraSession {
                     }
                 }
             #endif
-            applyPreferredStabilization(configuration.preferredVideoStabilizationMode)
+            applyFeatureIntents()
             let supported = photoOutput?.isLivePhotoCaptureSupported ?? false
             let enabled = photoOutput?.isLivePhotoCaptureEnabled ?? false
-            PRMLogger.trace(
+            PRMLog.debug(
                 .session,
-                "reconfigureForDevice complete: device=\(device.localizedName), live(supported=\(supported), enabled=\(enabled), movieAttached=\(movieFileOutput != nil))"
+                "reconfigureForDevice complete: device=\(device.deviceType.prm_logName), live(supported=\(supported), enabled=\(enabled), movieAttached=\(movieFileOutput != nil))"
             )
         }
 
@@ -668,26 +1058,32 @@ public final class PRMCameraSession {
 
     // MARK: - Delegate installation
 
-    /// Cached sample-buffer delegate so it can be re-installed after a full session
-    /// reconfigure (which creates a fresh `videoDataOutput` instance and loses the
-    /// delegate set on the prior instance). `nonisolated(unsafe)` because the only
-    /// writers run on `PRMCameraActor` and the AVFoundation `setSampleBufferDelegate`
-    /// docs are explicit that it can be called from any actor.
-    private var cachedVideoDataOutputDelegate: (any AVCaptureVideoDataOutputSampleBufferDelegate)?
-
-    /// Installs a sample-buffer delegate on the video data output. Cached so a
-    /// full session reconfigure (e.g. the `swapInput` recovery path for Live Photo
-    /// support on virtual devices) automatically re-installs it on the new output.
+    /// Installs a sample-buffer delegate for the video data output. Frames reach it through
+    /// Prism's router (which also feeds Night captures), on ``dataOutputQueue``. Kept so a
+    /// full session reconfigure (e.g. the `swapInput` recovery path for Live Photo support on
+    /// virtual devices) automatically delivers to it from the new output.
     public func setVideoDataOutputDelegate(
         _ delegate: any AVCaptureVideoDataOutputSampleBufferDelegate
     ) {
-        cachedVideoDataOutputDelegate = delegate
-        videoDataOutput?.setSampleBufferDelegate(delegate, queue: dataOutputQueue)
+        frameRouter.setDownstream(delegate)
+        videoDataOutput?.setSampleBufferDelegate(frameRouter, queue: dataOutputQueue)
     }
 
     // MARK: - Static device discovery
 
     /// Returns the best available device for the given position, scanning the type list in order.
+    /// The device types `configure(_:)` picks from: the configuration's, led by the camera
+    /// Cinematic Video runs on when it's enabled at configure and the usual camera has no
+    /// Cinematic Video format (the Triple camera on Pro iPhones).
+    nonisolated static func videoDeviceTypes(for configuration: PRMCameraConfiguration) -> [AVCaptureDevice.DeviceType] {
+        guard #available(iOS 26.0, *), configuration.enableCinematicVideo,
+              let cinematic = PRMCameraDevice.cinematicVideoDeviceType(at: configuration.cameraPosition),
+              let usual = bestVideoDevice(position: configuration.cameraPosition, types: configuration.deviceTypes),
+              !usual.formats.contains(where: \.isCinematicVideoCaptureSupported)
+        else { return configuration.deviceTypes }
+        return [cinematic] + configuration.deviceTypes.filter { $0 != cinematic }
+    }
+
     nonisolated static func bestVideoDevice(
         position: AVCaptureDevice.Position,
         types: [AVCaptureDevice.DeviceType]
@@ -713,6 +1109,7 @@ public final class PRMCameraSession {
         do {
             input = try AVCaptureDeviceInput(device: device)
         } catch {
+            PRMLog.error(.session, "AVCaptureDeviceInput failed for \(device.deviceType.prm_logName)", error: error)
             throw PRMSessionError.cannotCreateDeviceInput(error.localizedDescription)
         }
         guard session.canAddInput(input) else {
@@ -730,20 +1127,18 @@ public final class PRMCameraSession {
             position: .unspecified
         )
         guard let audio = discovery.devices.first else {
-            PRMLogger.session.warning("No microphone available; audio input skipped")
+            PRMLog.warning(.session, "No microphone available; audio input skipped")
             return
         }
         let input: AVCaptureDeviceInput
         do {
             input = try AVCaptureDeviceInput(device: audio)
         } catch {
-            PRMLogger.session.warning(
-                "Failed to create audio input: \(error.localizedDescription, privacy: .public)"
-            )
+            PRMLog.warning(.session, "Failed to create audio input; audio skipped", error: error)
             return
         }
         guard session.canAddInput(input) else {
-            PRMLogger.session.warning("Cannot add audio input to session; skipping")
+            PRMLog.warning(.session, "Cannot add audio input to session; skipping")
             return
         }
         session.addInput(input)
@@ -759,12 +1154,12 @@ public final class PRMCameraSession {
         }
         session.addOutput(output)
         videoDataOutput = output
-        // Re-apply the cached delegate so a full reconfigure (which creates a fresh
-        // output instance) doesn't strand the filter pipeline / preview view with no
-        // frame source. The cache is populated by `setVideoDataOutputDelegate(_:)`.
-        if let cachedVideoDataOutputDelegate {
-            output.setSampleBufferDelegate(cachedVideoDataOutputDelegate, queue: dataOutputQueue)
-        }
+        applyDeferredStart(to: output, isPreview: true)
+        applyStabilization()
+        // The router keeps the app's delegate, so a full reconfigure (which creates a fresh
+        // output instance) doesn't strand the filter pipeline / preview view with no frame
+        // source.
+        output.setSampleBufferDelegate(frameRouter, queue: dataOutputQueue)
     }
 
     private func attachPhotoOutput(configuration: PRMCameraConfiguration) throws {
@@ -780,6 +1175,11 @@ public final class PRMCameraSession {
         }
         session.addOutput(output)
         photoOutput = output
+        applyDeferredStart(to: output, isPreview: false)
+        if #available(iOS 26.0, *), let compensation = configuration.enableCameraSensorOrientationCompensation,
+           output.isCameraSensorOrientationCompensationSupported {
+            output.isCameraSensorOrientationCompensationEnabled = compensation
+        }
 
         #if !os(macOS)
             refreshOutputMaxPhotoDimensions()
@@ -787,7 +1187,8 @@ public final class PRMCameraSession {
             applyPhotoOutputFeature(
                 "Live Photo",
                 requested: configuration.enableLivePhoto,
-                supported: output.isLivePhotoCaptureSupported
+                supported: output.isLivePhotoCaptureSupported,
+                unsupportedReason: movieFileOutput != nil ? "a movie output is attached" : nil
             ) { output.isLivePhotoCaptureEnabled = true }
             applyPhotoOutputFeature(
                 "Depth data delivery",
@@ -799,9 +1200,11 @@ public final class PRMCameraSession {
                 requested: configuration.enablePortraitEffectsMatteDelivery,
                 supported: output.isPortraitEffectsMatteDeliverySupported
             ) { output.isPortraitEffectsMatteDeliveryEnabled = true }
+            // A deferred photo output only queues more than one capture request before its
+            // deferred start runs when responsive capture is on (per the iOS 26 SDK).
             applyPhotoOutputFeature(
                 "Responsive capture",
-                requested: configuration.enableResponsiveCapture,
+                requested: configuration.enableResponsiveCapture || configuration.deferredStart == .photoAndMovie,
                 supported: output.isResponsiveCaptureSupported
             ) { output.isResponsiveCaptureEnabled = true }
             applyPhotoOutputFeature(
@@ -814,6 +1217,17 @@ public final class PRMCameraSession {
                 requested: configuration.enableZeroShutterLag,
                 supported: output.isZeroShutterLagSupported
             ) { output.isZeroShutterLagEnabled = true }
+
+            // A photo output attached while the 48MP format or Cinematic Video is active
+            // (configure, or a runtime re-attach) must not bring back the streams those turn
+            // off: Live Photo, depth, ZSL and deferred delivery all substitute 12MP proxies,
+            // and depth competes with Cinematic Video's own pipeline.
+            if isOnHighResolutionPhotoFormat {
+                applyAuxiliaryPhotoOutputFlags(highRes: true)
+            }
+            if isCinematicVideoCaptureActive {
+                disableCinematicIncompatiblePhotoDelivery()
+            }
         #endif
     }
 
@@ -821,11 +1235,12 @@ public final class PRMCameraSession {
         _ name: String,
         requested: Bool,
         supported: Bool,
+        unsupportedReason: String? = nil,
         apply: () -> Void
     ) {
         guard requested else { return }
         guard supported else {
-            PRMLogger.session.info("\(name, privacy: .public) requested but not supported on this device")
+            PRMLog.notice(.session, "\(name) requested but not supported: \(unsupportedReason ?? "not on this camera and format")")
             return
         }
         apply()
@@ -844,22 +1259,16 @@ public final class PRMCameraSession {
         }
         session.addOutput(output)
         movieFileOutput = output
+        applyDeferredStart(to: output, isPreview: false)
+        if let connection = output.connection(with: .video) {
+            connection.prm_setStabilization(stabilizationMode)
+        }
+        applyLowLightVideoNoiseReduction()
+        applyCinematicMetadataCapturePolicy()
     }
 
     // MARK: - Live Photo / movie-output mutual exclusion
 
-    /// Dynamically attach or detach `AVCaptureMovieFileOutput`. Use this to switch the
-    /// session between *video-recording mode* (movie output attached, Live Photo
-    /// unavailable) and *Live-Photo-capable mode* (movie output detached, Live Photo
-    /// re-enabled if supported).
-    ///
-    /// `AVCapturePhotoOutput.isLivePhotoCaptureSupported` returns `false` whenever
-    /// `AVCaptureMovieFileOutput` is also in the session — Apple documents the two as
-    /// mutually exclusive. Apps that want both modes have to reconfigure when crossing
-    /// between them; this is the same trade-off the built-in Camera app makes.
-    ///
-    /// Wrapped in `beginConfiguration` / `commitConfiguration` so the session can stay
-    /// running. The reconfigure typically takes 50-300 ms on real hardware.
     /// Runtime toggle for `AVCapturePhotoOutput.isLivePhotoCaptureEnabled`. Off by default
     /// after `configure(_:)` honors the initial `PRMCameraConfiguration.enableLivePhoto`
     /// flag; callers flip this to opt into / out of Live Photo capability per-frame.
@@ -877,7 +1286,7 @@ public final class PRMCameraSession {
     public func setLivePhotoCaptureEnabled(_ enabled: Bool) {
         #if !os(macOS)
             guard let photoOutput else {
-                PRMLogger.session.error("setLivePhotoCaptureEnabled(\(enabled, privacy: .public)): no photoOutput attached")
+                PRMLog.error(.session, "setLivePhotoCaptureEnabled(\(enabled)): no photoOutput attached")
                 return
             }
             // **`isLivePhotoCaptureSupported` is a build-time property of the pipeline,
@@ -898,7 +1307,8 @@ public final class PRMCameraSession {
             // runtime-recoverable state. The log message points the user at the fix
             // instead of silently no-op'ing or thrashing the active format.
             if enabled, !photoOutput.isLivePhotoCaptureSupported {
-                PRMLogger.session.error(
+                PRMLog.error(
+                    .session,
                     """
                     setLivePhotoCaptureEnabled(true): isLivePhotoCaptureSupported=false. \
                     The session was configured with enableLivePhoto=false. Live Photo \
@@ -910,8 +1320,9 @@ public final class PRMCameraSession {
                 return
             }
             guard photoOutput.isLivePhotoCaptureEnabled != enabled else {
-                PRMLogger.session.debug(
-                    "setLivePhotoCaptureEnabled(\(enabled, privacy: .public)): already \(enabled, privacy: .public), no-op"
+                PRMLog.debug(
+                    .session,
+                    "setLivePhotoCaptureEnabled(\(enabled)): already \(enabled), no-op"
                 )
                 return
             }
@@ -933,9 +1344,7 @@ public final class PRMCameraSession {
             // commit so AVF re-validates atomically) restores `maxPhotoDimensions` and
             // the video connection in one pass.
             refreshOutputMaxPhotoDimensions()
-            PRMLogger.session.notice(
-                "setLivePhotoCaptureEnabled: now \(enabled, privacy: .public)"
-            )
+            PRMLog.notice(.session, "setLivePhotoCaptureEnabled: now \(enabled)")
         #endif
     }
 
@@ -956,19 +1365,25 @@ public final class PRMCameraSession {
     ///
     /// On re-attach, the photo output is rebuilt from the original
     /// `PRMCameraConfiguration` (Live Photo / depth / matte / responsive-capture /
-    /// auto-deferred / ZSL flags). Consuming apps must rebuild any cached
-    /// `PRMPhotoCapture` wrapper after re-attach because the new instance is a
-    /// fresh `AVCapturePhotoOutput` (see the workspace lesson catalog entry on
-    /// stale output references).
+    /// auto-deferred / ZSL flags), minus the streams the 48MP format or Cinematic Video
+    /// excludes. The new instance is a fresh `AVCapturePhotoOutput`: a wrapper built with
+    /// ``PRMPhotoCapture/init(output:)`` would keep capturing against the detached one and
+    /// fail, so use ``PRMPhotoCapture/init(session:)``, which resolves the current output at
+    /// every capture.
     ///
     /// No-op when the requested state already matches. Throws if `attach: true`
     /// fails (e.g. the session refuses `canAddOutput` — usually a sign of
     /// hardware budget overrun in the opposite direction).
     public func setPhotoOutputAttached(_ attached: Bool) throws {
-        PRMLogger.trace(.session, "setPhotoOutputAttached(\(attached)): current=\(photoOutput != nil)")
+        PRMLog.debug(.session, "setPhotoOutputAttached(\(attached)): current=\(photoOutput != nil)")
         session.beginConfiguration()
         defer { session.commitConfiguration() }
+        try applyPhotoOutputAttached(attached)
+    }
 
+    /// Body of ``setPhotoOutputAttached(_:)`` for callers that already hold an open
+    /// begin/commit.
+    func applyPhotoOutputAttached(_ attached: Bool) throws {
         if attached {
             guard photoOutput == nil, let configuration else { return }
             try attachPhotoOutput(configuration: configuration)
@@ -982,6 +1397,13 @@ public final class PRMCameraSession {
     /// Toggle the movie file output between attached (video recording capable) and
     /// detached (Live Photo capable) state, optionally with an explicit Live Photo
     /// state to apply IN THE SAME begin/commit.
+    ///
+    /// `AVCapturePhotoOutput.isLivePhotoCaptureSupported` returns `false` whenever
+    /// `AVCaptureMovieFileOutput` is also in the session — Apple documents the two as
+    /// mutually exclusive. Apps that want both modes have to reconfigure when crossing
+    /// between them; this is the same trade-off the built-in Camera app makes. Wrapped in
+    /// `beginConfiguration` / `commitConfiguration` so the session can stay running; the
+    /// reconfigure typically takes 50-300 ms on real hardware.
     ///
     /// **Why `targetLivePhoto:` matters**: AVFoundation's documented behavior
     /// (per [`isLivePhotoCaptureEnabled`](https://developer.apple.com/documentation/avfoundation/avcapturephotooutput/islivephotocaptureenabled)
@@ -1008,14 +1430,26 @@ public final class PRMCameraSession {
     ///   (mutual exclusion); passing `true` is silently coerced to `false` to
     ///   preserve the AVF invariant. When omitted, the method picks a default per
     ///   the legacy behavior described above.
+    ///
+    /// - Throws: ``PRMSessionError/unsupportedConfiguration(_:)`` when detaching while
+    ///   recording, or ``PRMSessionError/cannotAttachToSession(_:)`` when attaching fails.
     public func setMovieFileOutputAttached(_ attached: Bool, targetLivePhoto: Bool? = nil) throws {
-        PRMLogger.trace(
+        if !attached {
+            try refuseWhileBusy("Removing the movie output")
+        }
+        PRMLog.debug(
             .session,
             "setMovieFileOutputAttached(\(attached), targetLivePhoto=\(targetLivePhoto.map(String.init(describing:)) ?? "nil")): current=\(movieFileOutput != nil)"
         )
         session.beginConfiguration()
         defer { session.commitConfiguration() }
+        try applyMovieFileOutputAttached(attached, targetLivePhoto: targetLivePhoto)
+    }
 
+    /// Body of ``setMovieFileOutputAttached(_:targetLivePhoto:)`` for callers that already
+    /// hold an open begin/commit (Cinematic Video enable bakes the movie attach into its
+    /// own single commit).
+    func applyMovieFileOutputAttached(_ attached: Bool, targetLivePhoto: Bool? = nil) throws {
         if attached {
             if movieFileOutput == nil {
                 try attachMovieFileOutput()
@@ -1031,6 +1465,8 @@ public final class PRMCameraSession {
             if let movieFileOutput {
                 session.removeOutput(movieFileOutput)
                 self.movieFileOutput = nil
+                // Back to the photo modes' unstabilized preview.
+                applyStabilization()
             }
             #if !os(macOS)
                 guard let photoOutput, let configuration, configuration.enableLivePhoto else { return }

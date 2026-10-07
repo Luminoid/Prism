@@ -1,5 +1,4 @@
 @preconcurrency import AVFoundation
-import Photos
 import PrismCore
 import PrismUI
 import SnapKit
@@ -9,144 +8,206 @@ import UIKit
 
 /// Exposes every knob on `PRMCameraConfiguration` so the user can build a configuration, then
 /// "Apply" it to a live preview. Demonstrates `PRMCamera.configure(_:)` re-runs and the
-/// various session-level toggles that the DSLR Studio leaves at defaults.
+/// session-level toggles that Studio leaves at their defaults.
 ///
 /// Mutual-exclusion rules wire common AVFoundation incompatibilities directly into the UI
 /// (instead of letting them silently drop one feature at Apply time):
-/// - MovieFileOutput ↔ LivePhoto (mutually exclusive on the same session),
-/// - Depth + Portrait matte require depth-capable formats (depth toggles off → matte too),
-/// - Auto-deferred photo delivery + Depth fight on iPhone Pro models (deferred routes the
-///   depth XPC stream through the proxy and the matte arrives null).
+/// - Movie file output ↔ Live Photo (they can't share a session),
+/// - Portrait matte needs depth (matte on turns depth on; depth off turns matte off),
+/// - Auto-deferred photo delivery ↔ depth and matte (deferred routes depth through a proxy
+///   whose depth map arrives empty on iPhone Pro models),
+/// - every photo-output feature needs the photo output (turning one on turns it on; turning
+///   the output off turns them all off),
+/// - Cinematic Video (iOS 26) ↔ Live Photo / depth / Portrait matte (it brings its own depth
+///   pipeline and movie output),
+/// - AirPods high-quality recording (iOS 26) needs the audio input.
 ///
-/// A "Capture" button at the bottom exercises the photo output configuration the user just
-/// applied (codec from the lab settings, saves to Photos so the user can confirm size,
-/// format, and depth/matte payload). The preview hides itself with a "no preview" status
-/// when `includesVideoDataOutput` is off so the user gets a clear signal the setting took.
+/// The iOS 26 / 27 group also covers deferred start, lens smudge detection, sensor
+/// orientation compensation and the metadata output. After Apply the status lists what the
+/// camera supports and what actually landed on the session (read back from it, not echoed
+/// from the configuration), and a chip over the preview counts detected objects.
+///
+/// "Capture" takes a still through the applied photo output: the Capture section's codec,
+/// depth and the matte requested when they landed on the output. The status then reports
+/// the saved container, size and whether depth and matte came back.
 @MainActor
 final class ConfigurationLabViewController: UIViewController {
-    // MARK: - State
+    // MARK: - Types
 
-    private var configuration = PRMCameraConfiguration()
-    private let camera = PRMCamera()
-    private let pipeline = PRMFilterPipeline()
-    private let renderContext: PRMRenderContext = {
-        guard let context = PRMRenderContext(name: "ConfigLab") else {
-            fatalError("Metal is unavailable on this device — Prism preview requires Metal.")
-        }
-        return context
-    }()
-
-    private lazy var previewView = PRMPreviewView(context: renderContext)
-    private var photoCapture: PRMPhotoCapture?
-
-    /// Keys for each toggle in `toggles` so mutual-exclusion rules can reach into peer
-    /// toggles and flip them off. Mirrors `PRMCameraConfiguration`'s feature flags.
+    /// Keys for each toggle in `toggles`, so mutual-exclusion rules can reach their peers.
     private enum ToggleKey: Hashable {
         case audio, videoData, photo, movie
         case responsive, autoDeferred, zeroShutterLag
         case livePhoto, depth, portraitMatte, multitasking
+        case metadataOutput, bluetoothHighQuality, cinematic
+
+        /// Features of the photo output, which need it attached.
+        static let photoScoped: [Self] = [.livePhoto, .depth, .portraitMatte, .responsive, .zeroShutterLag, .autoDeferred]
     }
 
-    // MARK: - UI
+    /// What landed on the session, read back from it on the camera actor.
+    private struct LandedState: Sendable {
+        var outputs: [String] = []
+        var livePhoto = false
+        var depthDelivery = false
+        var matteDelivery = false
+        var responsiveCapture = false
+        var autoDeferredDelivery = false
+        var zeroShutterLag = false
+        var multitasking = false
+    }
+
+    // MARK: - Properties
+
+    private var configuration = PRMCameraConfiguration()
+    /// The codec for Capture: a capture setting, not part of the configuration.
+    private var captureCodec: AVVideoCodecType = .hevc
+    private let host = CameraPreviewHost(name: "ConfigLab", requestsMicrophone: true)
+    private var camera: PRMCamera { host.camera }
+    private var photoCapture: PRMPhotoCapture?
+    /// What the last Apply produced; Capture only requests depth and matte that landed (a
+    /// request the output doesn't deliver raises an exception AVFoundation won't let us catch).
+    private var landed = LandedState()
+    private var applyTask: Task<Void, Never>?
+    private var captureTask: Task<Void, Never>?
+    /// The configuration's toggles, so mutual-exclusion rules can flip their peers.
+    private var toggles: [ToggleKey: UISwitch] = [:]
+    private lazy var toaster = ToastPresenter(hostView: view, below: host.previewView.snp.top)
+
+    // MARK: - Views
 
     private let scrollView = UIScrollView()
     private let contentStack = UIStackView()
-    private let statusLabel = UILabel()
-    private let applyButton = UIButton(type: .system)
-    private let captureButton = UIButton(type: .system)
-    private let previewPlaceholder = UILabel()
 
-    /// All toggles indexed by their config-targeted property so mutual-exclusion rules
-    /// (MovieFileOutput vs Live Photo, Depth vs Auto-deferred photo delivery, etc.) can
-    /// flip peers off when the user enables a conflicting feature. Without this the
-    /// previous version let users tick both and Apply silently dropped one.
-    private var toggles: [ToggleKey: UISwitch] = [:]
+    private lazy var statusLabel: PaddedLabel = {
+        let label = PaddedLabel()
+        label.text = "Starting the camera…"
+        label.textColor = UIColor.white.withAlphaComponent(0.8)
+        label.font = ExampleFont.scaled(12, style: .footnote)
+        label.backgroundColor = UIColor.white.withAlphaComponent(0.08)
+        label.numberOfLines = 0
+        return label
+    }()
+
+    /// Shown over the preview when `includesVideoDataOutput` is off: without frames the
+    /// preview would just freeze on its last one.
+    private lazy var previewPlaceholder: UILabel = {
+        let label = UILabel()
+        label.text = "Preview off: the video data output is disabled"
+        label.textColor = UIColor.white.withAlphaComponent(0.55)
+        label.font = ExampleFont.scaled(12, weight: .semibold, style: .footnote)
+        label.adjustsFontForContentSizeCategory = true
+        label.textAlignment = .center
+        label.numberOfLines = 0
+        label.backgroundColor = .black
+        label.isHidden = true
+        return label
+    }()
+
+    /// Counts from `PRMCamera.detectedObjectsStream()`, shown while object detection or
+    /// Cinematic Video is configured.
+    private lazy var detectionLabel: PaddedLabel = {
+        let label = PaddedLabel()
+        label.insets = UIEdgeInsets(top: 4, left: 10, bottom: 4, right: 10)
+        label.font = ExampleFont.monospaced(11, weight: .semibold, style: .caption1, maximum: 16)
+        label.textColor = .white
+        label.backgroundColor = UIColor.black.withAlphaComponent(0.55)
+        label.isHidden = true
+        return label
+    }()
+
+    private lazy var captureButton: UIButton = {
+        var configuration = UIButton.Configuration.tinted()
+        configuration.title = "Capture"
+        configuration.baseForegroundColor = .systemYellow
+        configuration.baseBackgroundColor = .systemYellow
+        configuration.cornerStyle = .large
+        let button = UIButton(configuration: configuration)
+        button.isEnabled = false
+        button.accessibilityHint = "Takes a photo with the applied configuration and saves it to Photos"
+        button.addAction(UIAction { [weak self] _ in self?.capture() }, for: .touchUpInside)
+        return button
+    }()
+
+    private lazy var applyButton: UIButton = {
+        var configuration = UIButton.Configuration.filled()
+        configuration.title = "Apply Configuration"
+        configuration.baseBackgroundColor = .systemYellow
+        configuration.baseForegroundColor = .black
+        configuration.cornerStyle = .large
+        let button = UIButton(configuration: configuration)
+        button.addAction(UIAction { [weak self] _ in self?.applyConfiguration() }, for: .touchUpInside)
+        return button
+    }()
 
     // MARK: - Lifecycle
 
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .black
-        overrideUserInterfaceStyle = .dark
         navigationItem.title = "Configuration Lab"
+        navigationItem.largeTitleDisplayMode = .never
+        host.delegate = self
+        host.addLoop { [weak self, camera = host.camera] in
+            for await objects in camera.detectedObjectsStream() {
+                self?.showDetections(objects)
+            }
+        }
         setupLayout()
         populateContent()
-        Task { await bootCamera() }
+        // The first boot is an Apply of the default configuration.
+        setBusy(applying: true)
     }
 
-    override func viewWillDisappear(_ animated: Bool) {
-        super.viewWillDisappear(animated)
-        Task { await camera.stop() }
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        host.viewWillAppear()
+    }
+
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        host.viewDidDisappear(awaiting: captureTask.map { [$0] } ?? [])
     }
 
     // MARK: - Layout
 
     private func setupLayout() {
+        let previewView = host.previewView
         view.addSubview(previewView)
-        previewView.rotation = .rotate90
-        previewView.contentFit = .fill
+        // Letterbox the full frame, so the preview shows what Capture saves.
+        previewView.contentFit = .fit
         previewView.snp.makeConstraints {
             $0.top.equalTo(view.safeAreaLayoutGuide)
             $0.leading.trailing.equalToSuperview()
             $0.height.equalToSuperview().multipliedBy(0.35)
         }
-
-        // Placeholder text shown when `includesVideoDataOutput` is off and the preview
-        // can't receive frames. Without this, the preview just stays on the last frame
-        // and looks frozen — the user has no signal the toggle did anything.
-        previewPlaceholder.text = "Preview off — video data output disabled in current config"
-        previewPlaceholder.textColor = UIColor.white.withAlphaComponent(0.55)
-        previewPlaceholder.font = .systemFont(ofSize: 12, weight: .semibold)
-        previewPlaceholder.textAlignment = .center
-        previewPlaceholder.numberOfLines = 2
-        previewPlaceholder.backgroundColor = UIColor.black
-        previewPlaceholder.isHidden = true
         view.addSubview(previewPlaceholder)
         previewPlaceholder.snp.makeConstraints { $0.edges.equalTo(previewView) }
+        view.addSubview(detectionLabel)
+        detectionLabel.snp.makeConstraints {
+            $0.leading.equalTo(previewView).offset(12)
+            $0.bottom.equalTo(previewView).offset(-12)
+        }
 
-        statusLabel.text = "Ready. Pick a configuration below, then Apply."
-        statusLabel.textColor = UIColor.white.withAlphaComponent(0.7)
-        statusLabel.font = .systemFont(ofSize: 12)
-        statusLabel.numberOfLines = 0
         view.addSubview(statusLabel)
         statusLabel.snp.makeConstraints {
             $0.top.equalTo(previewView.snp.bottom).offset(8)
-            $0.leading.equalToSuperview().offset(16)
-            $0.trailing.equalToSuperview().offset(-16)
+            $0.leading.trailing.equalToSuperview().inset(16)
         }
 
-        // Capture button next to Apply — uses the current config's photo output to take
-        // an actual still and save to Photos, so the user can verify codec / quality /
-        // depth/matte payload landed in the file. Disabled until first Apply.
-        var captureConfig = UIButton.Configuration.tinted()
-        captureConfig.title = "Capture"
-        captureConfig.baseForegroundColor = .systemYellow
-        captureConfig.baseBackgroundColor = .systemYellow
-        captureConfig.cornerStyle = .large
-        captureButton.configuration = captureConfig
-        captureButton.isEnabled = false
-        captureButton.addAction(UIAction { [weak self] _ in self?.capture() }, for: .touchUpInside)
         view.addSubview(captureButton)
         captureButton.snp.makeConstraints {
             $0.leading.equalToSuperview().offset(16)
             $0.bottom.equalTo(view.safeAreaLayoutGuide).offset(-12)
-            $0.height.equalTo(44)
+            $0.height.greaterThanOrEqualTo(44)
             $0.width.equalTo(110)
         }
-
-        var applyConfig = UIButton.Configuration.filled()
-        applyConfig.title = "Apply Configuration"
-        applyConfig.baseBackgroundColor = .systemYellow
-        applyConfig.baseForegroundColor = .black
-        applyConfig.cornerStyle = .large
-        applyButton.configuration = applyConfig
-        applyButton.addAction(UIAction { [weak self] _ in self?.applyConfiguration() }, for: .touchUpInside)
         view.addSubview(applyButton)
         applyButton.snp.makeConstraints {
             $0.leading.equalTo(captureButton.snp.trailing).offset(8)
             $0.trailing.equalToSuperview().offset(-16)
             $0.bottom.equalTo(view.safeAreaLayoutGuide).offset(-12)
-            $0.height.equalTo(44)
+            $0.height.equalTo(captureButton)
         }
 
         view.addSubview(scrollView)
@@ -168,392 +229,414 @@ final class ConfigurationLabViewController: UIViewController {
     // MARK: - Form
 
     private func populateContent() {
-        addPicker(
-            title: "Session preset",
-            options: SessionPresetOption.allCases,
-            current: { [unowned self] in
-                SessionPresetOption.allCases.firstIndex(where: { $0.preset == configuration.sessionPreset }) ?? 0
-            },
-            apply: { [unowned self] index in
-                configuration.sessionPreset = SessionPresetOption.allCases[index].preset
-            }
-        )
-        addPicker(
-            title: "Camera position",
-            options: PositionOption.allCases,
-            current: { [unowned self] in
-                PositionOption.allCases.firstIndex(where: { $0.position == configuration.cameraPosition }) ?? 0
-            },
-            apply: { [unowned self] index in
-                configuration.cameraPosition = PositionOption.allCases[index].position
-            }
-        )
-        addPicker(
-            title: "Device types",
-            options: DeviceTypeOption.allCases,
-            current: { 0 },
-            apply: { [unowned self] index in
-                configuration.deviceTypes = DeviceTypeOption.allCases[index].types
-            }
-        )
-        addPicker(
-            title: "Video pixel format",
-            options: PixelFormatOption.allCases,
-            current: { [unowned self] in
-                PixelFormatOption.allCases.firstIndex(where: { $0.value == configuration.videoPixelFormat }) ?? 0
-            },
-            apply: { [unowned self] index in
-                configuration.videoPixelFormat = PixelFormatOption.allCases[index].value
-            }
-        )
-        addPicker(
-            title: "Photo quality ceiling",
-            options: QualityOption.allCases,
-            current: { [unowned self] in
-                QualityOption.allCases.firstIndex(where: { $0.value == configuration.maxPhotoQualityPrioritization }) ?? 2
-            },
-            apply: { [unowned self] index in
-                configuration.maxPhotoQualityPrioritization = QualityOption.allCases[index].value
-            }
-        )
-        addPicker(
-            title: "Preferred stabilization",
-            options: StabilizationOption.allCases,
-            current: { [unowned self] in
-                StabilizationOption.allCases.firstIndex(where: { $0.value == configuration.preferredVideoStabilizationMode }) ?? 0
-            },
-            apply: { [unowned self] index in
-                configuration.preferredVideoStabilizationMode = StabilizationOption.allCases[index].value
-            }
-        )
+        addSectionHeader("Session")
+        addPicker(title: "Session preset", options: SessionPresetOption.allCases, value: \.preset, setting: \.sessionPreset)
+        addPicker(title: "Camera position", options: PositionOption.allCases, value: \.position, setting: \.cameraPosition)
+        addPicker(title: "Device types", options: DeviceTypeOption.allCases, value: \.types, setting: \.deviceTypes)
+        addPicker(title: "Video pixel format", options: PixelFormatOption.allCases, value: \.value, setting: \.videoPixelFormat)
+        addPicker(title: "Photo quality ceiling", options: QualityOption.allCases, value: \.value, setting: \.maxPhotoQualityPrioritization)
+        addPicker(title: "Preferred stabilization", options: StabilizationOption.available, value: \.mode, setting: \.preferredVideoStabilizationMode)
 
-        addToggle(
-            key: .audio,
-            title: "Include audio input",
-            initial: configuration.includesAudio,
-            apply: { [unowned self] in configuration.includesAudio = $0 }
+        addSectionHeader("Inputs and outputs")
+        addToggle(.audio, title: "Include audio input", setting: \.includesAudio)
+        addToggle(.videoData, title: "Video data output (filters)", setting: \.includesVideoDataOutput)
+        addToggle(.photo, title: "Photo output", setting: \.includesPhotoOutput)
+        addToggle(.movie, title: "Movie file output", setting: \.includesMovieFileOutput)
+        addToggle(.multitasking, title: "Multitasking camera access (iPad)", setting: \.enableMultitaskingCameraAccess)
+
+        addSectionHeader("Photo output")
+        addToggle(.responsive, title: "Responsive capture (iOS 17+)", setting: \.enableResponsiveCapture)
+        addToggle(.autoDeferred, title: "Auto-deferred photo delivery", setting: \.enableAutoDeferredPhotoDelivery)
+        addToggle(.zeroShutterLag, title: "Zero shutter lag", setting: \.enableZeroShutterLag)
+        addToggle(.livePhoto, title: "Live Photo capture", setting: \.enableLivePhoto)
+        addToggle(.depth, title: "Depth-data delivery", setting: \.enableDepthDataDelivery)
+        addToggle(.portraitMatte, title: "Portrait-effects matte", setting: \.enablePortraitEffectsMatteDelivery)
+
+        addSectionHeader("iOS 26 / 27")
+        addPicker(title: "Deferred start (iOS 26)", options: DeferredStartOption.allCases, value: \.value, setting: \.deferredStart)
+        addPicker(title: "Lens smudge detection (iOS 26)", options: SmudgeDetectionOption.allCases, value: \.interval, setting: \.lensSmudgeDetectionInterval)
+        addPicker(
+            title: "Sensor orientation compensation (iOS 26)",
+            options: OrientationCompensationOption.allCases,
+            value: \.value,
+            setting: \.enableCameraSensorOrientationCompensation
         )
-        addToggle(
-            key: .videoData,
-            title: "Video data output (filters)",
-            initial: configuration.includesVideoDataOutput,
-            apply: { [unowned self] in configuration.includesVideoDataOutput = $0 }
-        )
-        addToggle(
-            key: .photo,
-            title: "Photo output",
-            initial: configuration.includesPhotoOutput,
-            apply: { [unowned self] in configuration.includesPhotoOutput = $0 }
-        )
-        addToggle(
-            key: .movie,
-            title: "Movie file output",
-            initial: configuration.includesMovieFileOutput,
-            apply: { [unowned self] in configuration.includesMovieFileOutput = $0 }
-        )
-        addToggle(
-            key: .responsive,
-            title: "Responsive capture (iOS 17+)",
-            initial: configuration.enableResponsiveCapture,
-            apply: { [unowned self] in configuration.enableResponsiveCapture = $0 }
-        )
-        addToggle(
-            key: .autoDeferred,
-            title: "Auto-deferred photo delivery",
-            initial: configuration.enableAutoDeferredPhotoDelivery,
-            apply: { [unowned self] in configuration.enableAutoDeferredPhotoDelivery = $0 }
-        )
-        addToggle(
-            key: .zeroShutterLag,
-            title: "Zero shutter lag",
-            initial: configuration.enableZeroShutterLag,
-            apply: { [unowned self] in configuration.enableZeroShutterLag = $0 }
-        )
-        addToggle(
-            key: .livePhoto,
-            title: "Live Photo capture",
-            initial: configuration.enableLivePhoto,
-            apply: { [unowned self] in configuration.enableLivePhoto = $0 }
-        )
-        addToggle(
-            key: .depth,
-            title: "Depth-data delivery",
-            initial: configuration.enableDepthDataDelivery,
-            apply: { [unowned self] in configuration.enableDepthDataDelivery = $0 }
-        )
-        addToggle(
-            key: .portraitMatte,
-            title: "Portrait-effects matte",
-            initial: configuration.enablePortraitEffectsMatteDelivery,
-            apply: { [unowned self] in configuration.enablePortraitEffectsMatteDelivery = $0 }
-        )
-        addToggle(
-            key: .multitasking,
-            title: "Multitasking camera access (iPad)",
-            initial: configuration.enableMultitaskingCameraAccess,
-            apply: { [unowned self] in configuration.enableMultitaskingCameraAccess = $0 }
-        )
+        addPicker(title: "Detect objects (metadata output)", options: DetectionOption.allCases, value: \.types, setting: \.metadataObjectTypes)
+        addToggle(.metadataOutput, title: "Attach metadata output at configure", setting: \.includesMetadataOutput)
+        addToggle(.bluetoothHighQuality, title: "AirPods high-quality mic (iOS 26)", setting: \.enableBluetoothHighQualityRecording)
+        addToggle(.cinematic, title: "Cinematic Video (iOS 26)", setting: \.enableCinematicVideo)
+
+        addSectionHeader("Capture")
+        let codecs = CodecOption.allCases
+        addPicker(title: "Photo codec", labels: codecs.map(\.label), selected: codecs.firstIndex { $0.value == captureCodec } ?? 0) { [weak self] index in
+            self?.captureCodec = codecs[index].value
+        }
     }
 
-    private func addPicker(
+    private func addSectionHeader(_ title: String) {
+        if let previous = contentStack.arrangedSubviews.last {
+            contentStack.setCustomSpacing(20, after: previous)
+        }
+        contentStack.addArrangedSubview(SectionHeaderLabel(title))
+    }
+
+    /// A picker bound to one configuration property: the segment whose option value equals the
+    /// property is selected, and picking one writes its value back.
+    private func addPicker<Option: PickerOption, Value: Equatable>(
         title: String,
-        options: [some PickerOption],
-        current: @escaping () -> Int,
-        apply: @escaping (Int) -> Void
+        options: [Option],
+        value: KeyPath<Option, Value>,
+        setting: WritableKeyPath<PRMCameraConfiguration, Value>
     ) {
-        let titleLabel = UILabel()
-        titleLabel.text = title.uppercased()
-        titleLabel.font = .systemFont(ofSize: 10, weight: .bold)
-        titleLabel.textColor = UIColor.white.withAlphaComponent(0.6)
+        let current = configuration[keyPath: setting]
+        let selected = options.firstIndex { $0[keyPath: value] == current } ?? 0
+        addPicker(title: title, labels: options.map(\.label), selected: selected) { [weak self] index in
+            self?.configuration[keyPath: setting] = options[index][keyPath: value]
+        }
+    }
 
-        let segmented = UISegmentedControl(items: options.map(\.label))
-        segmented.selectedSegmentIndex = current()
-        segmented.addAction(UIAction { _ in
-            apply(segmented.selectedSegmentIndex)
+    private func addPicker(title: String, labels: [String], selected: Int, onSelect: @escaping (Int) -> Void) {
+        let titleLabel = makeFieldLabel(title)
+        let segmented = UISegmentedControl(items: labels)
+        segmented.selectedSegmentIndex = selected
+        segmented.accessibilityLabel = title
+        segmented.addAction(UIAction { action in
+            guard let segmented = action.sender as? UISegmentedControl, labels.indices.contains(segmented.selectedSegmentIndex) else { return }
+            onSelect(segmented.selectedSegmentIndex)
         }, for: .valueChanged)
-
         let row = UIStackView(arrangedSubviews: [titleLabel, segmented])
         row.axis = .vertical
-        row.spacing = 4
+        row.spacing = 6
         contentStack.addArrangedSubview(row)
     }
 
-    private func addToggle(
-        key: ToggleKey,
-        title: String,
-        initial: Bool,
-        apply: @escaping (Bool) -> Void
-    ) {
-        let label = UILabel()
-        label.text = title
-        label.textColor = .white
-        label.font = .systemFont(ofSize: 13)
+    private func addToggle(_ key: ToggleKey, title: String, setting: WritableKeyPath<PRMCameraConfiguration, Bool>) {
+        let label = makeFieldLabel(title)
         let toggle = UISwitch()
-        toggle.isOn = initial
-        toggle.addAction(UIAction { [weak self] _ in
-            apply(toggle.isOn)
-            self?.enforceMutualExclusion(changed: key, isOn: toggle.isOn)
+        toggle.isOn = configuration[keyPath: setting]
+        toggle.accessibilityLabel = title
+        toggle.setContentCompressionResistancePriority(.required, for: .horizontal)
+        toggle.addAction(UIAction { [weak self] action in
+            guard let self, let toggle = action.sender as? UISwitch else { return }
+            configuration[keyPath: setting] = toggle.isOn
+            enforceMutualExclusion(changed: key, isOn: toggle.isOn)
         }, for: .valueChanged)
         toggles[key] = toggle
         let row = UIStackView(arrangedSubviews: [label, toggle])
         row.axis = .horizontal
-        row.distribution = .equalSpacing
         row.alignment = .center
+        row.spacing = 12
         contentStack.addArrangedSubview(row)
     }
 
-    /// Auto-deselect AVFoundation-incompatible peer toggles so the user gets immediate
-    /// feedback instead of a silent drop at Apply time. Pairs encoded:
-    /// - Movie file output ↔ Live Photo (can't coexist on the same session).
-    /// - Portrait matte → requires Depth (matte without depth throws at capture).
-    /// - Depth → off forces Portrait matte off (matte alone makes no sense).
-    /// - Auto-deferred photo delivery ↔ Depth (deferred routes depth through a proxy
-    ///   whose `depthDataMap` is internally null on iPhone Pro models).
-    /// - Photo output → off forces Live Photo / Depth / Portrait matte / responsive /
-    ///   zero-shutter-lag / auto-deferred all off (they're all photo-output-scoped).
-    private func enforceMutualExclusion(changed: ToggleKey, isOn: Bool) {
-        let setOff: (ToggleKey) -> Void = { [unowned self] key in
-            guard let peer = toggles[key], peer.isOn else { return }
-            peer.setOn(false, animated: true)
-            peer.sendActions(for: .valueChanged)
-        }
+    /// A field's title; the control next to it carries the same text for VoiceOver.
+    private func makeFieldLabel(_ title: String) -> UILabel {
+        let label = UILabel()
+        label.text = title
+        label.textColor = .white
+        label.font = ExampleFont.scaled(13, style: .subheadline)
+        label.adjustsFontForContentSizeCategory = true
+        label.numberOfLines = 0
+        label.isAccessibilityElement = false
+        return label
+    }
 
+    /// Turns AVFoundation-incompatible peers off (and required ones on) so the user sees the
+    /// conflict now instead of a silent drop at Apply. The pairs are listed in the type's
+    /// documentation.
+    private func enforceMutualExclusion(changed: ToggleKey, isOn: Bool) {
         guard isOn else {
-            if changed == .photo {
-                setOff(.livePhoto)
-                setOff(.depth)
-                setOff(.portraitMatte)
-                setOff(.responsive)
-                setOff(.zeroShutterLag)
-                setOff(.autoDeferred)
-            }
-            if changed == .depth {
-                setOff(.portraitMatte)
+            switch changed {
+            case .photo:
+                for key in ToggleKey.photoScoped {
+                    setToggle(key, to: false)
+                }
+            case .depth:
+                setToggle(.portraitMatte, to: false)
+            case .audio:
+                setToggle(.bluetoothHighQuality, to: false)
+            default:
+                break
             }
             return
         }
-
+        if ToggleKey.photoScoped.contains(changed) {
+            setToggle(.photo, to: true)
+        }
         switch changed {
         case .movie:
-            setOff(.livePhoto)
+            setToggle(.livePhoto, to: false)
         case .livePhoto:
-            setOff(.movie)
+            setToggle(.movie, to: false)
+            setToggle(.cinematic, to: false)
+        case .depth:
+            setToggle(.autoDeferred, to: false)
+            setToggle(.cinematic, to: false)
         case .portraitMatte:
-            if let depth = toggles[.depth], !depth.isOn {
-                depth.setOn(true, animated: true)
-                depth.sendActions(for: .valueChanged)
-            }
+            setToggle(.depth, to: true)
+            setToggle(.autoDeferred, to: false)
+            setToggle(.cinematic, to: false)
         case .autoDeferred:
-            setOff(.depth)
-            setOff(.portraitMatte)
+            setToggle(.depth, to: false)
+            setToggle(.portraitMatte, to: false)
+        case .cinematic:
+            setToggle(.livePhoto, to: false)
+            setToggle(.depth, to: false)
+            setToggle(.portraitMatte, to: false)
+        case .bluetoothHighQuality:
+            setToggle(.audio, to: true)
         default:
             break
         }
     }
 
-    // MARK: - Boot / apply
-
-    private func bootCamera() async {
-        if PRMPermissions.cameraStatus() == .notDetermined {
-            _ = await PRMPermissions.requestCameraAccess()
-        }
-        if configuration.includesAudio, PRMPermissions.microphoneStatus() == .notDetermined {
-            _ = await PRMPermissions.requestMicrophoneAccess()
-        }
-        await applyConfigurationAsync()
+    /// Flips a peer and runs its action, so its own rules apply too.
+    private func setToggle(_ key: ToggleKey, to isOn: Bool) {
+        guard let toggle = toggles[key], toggle.isOn != isOn else { return }
+        toggle.setOn(isOn, animated: true)
+        toggle.sendActions(for: .valueChanged)
     }
+
+    // MARK: - Apply
 
     private func applyConfiguration() {
-        Task { await applyConfigurationAsync() }
+        guard applyTask == nil, captureTask == nil else { return }
+        setBusy(applying: true)
+        applyTask = Task { [weak self, host] in
+            await host.reconfigure()
+            self?.applyTask = nil
+            self?.setBusy(applying: false)
+        }
     }
 
-    private func applyConfigurationAsync() async {
-        await camera.stop()
-        do {
-            try await camera.configure(configuration)
-        } catch {
-            statusLabel.text = "Configure failed: \(error.localizedDescription)"
-            previewPlaceholder.text = "Configure failed — see status"
-            previewPlaceholder.isHidden = false
-            captureButton.isEnabled = false
-            return
-        }
+    /// Apply and Capture are unavailable while either runs; Apply says what it's doing.
+    private func setBusy(applying: Bool) {
+        let busy = applying || captureTask != nil
+        applyButton.isEnabled = !busy
+        applyButton.configuration?.title = applying ? "Applying…" : "Apply Configuration"
+        applyButton.configuration?.showsActivityIndicator = applying
+        captureButton.isEnabled = !busy && photoCapture != nil && landed.outputs.contains("photo")
+    }
 
-        // Re-wire pipeline if video data output is enabled. With it off, the preview
-        // can't receive frames, so we surface a "preview off" placeholder so the user
-        // sees the toggle took effect (otherwise the preview just freezes silently).
-        if configuration.includesVideoDataOutput {
-            pipeline.isEnabled = true
-            await camera.session.setVideoDataOutputDelegate(pipeline)
-            pipeline.onFrame = { [weak self] frame in
-                self?.previewView.update(frame.pixelBuffer)
-            }
-            previewPlaceholder.isHidden = true
-        } else {
-            pipeline.isEnabled = false
-            previewPlaceholder.text = "Preview off — video data output disabled"
-            previewPlaceholder.isHidden = false
-        }
+    // MARK: - Detection feed
 
-        // Wire (or release) the photo capture facade so the Capture button can actually
-        // run an AVCapturePhotoOutput round-trip with the user's just-applied codec /
-        // quality / depth / matte settings. Disabled when the user turned off photo
-        // output (there's nothing to capture).
-        if configuration.includesPhotoOutput {
-            let session = camera.session
-            let capture: PRMPhotoCapture? = await PRMCameraActor.shared.run {
-                guard let photoOutput = await session.photoOutput else { return PRMPhotoCapture?.none }
-                return PRMPhotoCapture(output: photoOutput)
-            }
-            photoCapture = capture
-            captureButton.isEnabled = capture != nil
-        } else {
-            photoCapture = nil
-            captureButton.isEnabled = false
+    private func showDetections(_ objects: [PRMDetectedObject]) {
+        guard !detectionLabel.isHidden else { return }
+        let text = Self.detectionSummary(objects)
+        if detectionLabel.text != text {
+            detectionLabel.text = text
         }
+    }
 
-        await camera.start()
-        statusLabel.text = describeApplied()
+    private static func detectionSummary(_ objects: [PRMDetectedObject]) -> String {
+        guard !objects.isEmpty else { return "No detections" }
+        var counts: [String: Int] = [:]
+        for object in objects {
+            counts[name(of: object.kind), default: 0] += 1
+        }
+        return counts.sorted { $0.key < $1.key }.map { "\($0.value) \($0.key)" }.joined(separator: " · ")
+    }
+
+    private static func name(of kind: PRMDetectedObject.Kind) -> String {
+        switch kind {
+        case .focusTracked: "tracked"
+        case .face: "face"
+        case .humanBody: "body"
+        case .humanFullBody: "full body"
+        case .catHead: "cat head"
+        case .catBody: "cat"
+        case .dogHead: "dog head"
+        case .dogBody: "dog"
+        case .salientObject: "salient"
+        case let .other(raw): raw
+        }
     }
 
     // MARK: - Capture
 
+    /// A still through the applied photo output, with the lab's codec and the depth and matte
+    /// that landed, rotated to how the phone is held.
     private func capture() {
-        guard let photoCapture else { return }
-        let codec: AVVideoCodecType = .hevc
+        guard let photoCapture, captureTask == nil, applyTask == nil else { return }
+        var settings = PRMPhotoSettings()
+            .flashMode(.off)
+            .qualityPrioritization(configuration.maxPhotoQualityPrioritization)
+            .codec(captureCodec)
+            .rotationAngle(host.captureRotationAngle)
+        let requestsDepth = configuration.enableDepthDataDelivery && landed.depthDelivery
+        let requestsMatte = requestsDepth && configuration.enablePortraitEffectsMatteDelivery && landed.matteDelivery
+        if requestsDepth {
+            settings = settings.depthDataDelivery(true).embedsDepthDataInPhoto(true)
+        }
+        if requestsMatte {
+            // The matte needs depth delivery on, and embedding it needs embedded depth.
+            settings = settings.portraitEffectsMatte(true).embedsPortraitEffectsMatteInPhoto(true)
+        }
         statusLabel.text = "Capturing…"
-        Task { [photoCapture] in
+        captureTask = Task { [weak self, photoCapture] in
             do {
-                let settings = PRMPhotoSettings()
-                    .flashMode(.off)
-                    .qualityPrioritization(configuration.maxPhotoQualityPrioritization)
-                    .codec(codec)
                 let photo = try await photoCapture.capturePhoto(settings: settings)
-                await save(data: photo.data)
+                try await PhotoLibrarySaver.save(.photo(photo.data))
+                var parts = [
+                    "Saved \(PhotoLibrarySaver.containerLabel(for: photo.data))",
+                    "\(photo.data.count / 1024) KB",
+                ]
+                if requestsDepth { parts.append(photo.underlyingPhoto.depthData == nil ? "no depth" : "with depth") }
+                if requestsMatte { parts.append(photo.underlyingPhoto.portraitEffectsMatte == nil ? "no matte" : "with matte") }
+                self?.statusLabel.text = parts.joined(separator: " · ")
             } catch {
-                await MainActor.run { [weak self] in
-                    self?.statusLabel.text = "Capture failed: \(error.localizedDescription)"
-                }
+                self?.statusLabel.text = "Capture failed"
+                self?.toaster.report(error, context: "Capture")
             }
+            self?.captureTask = nil
+            self?.setBusy(applying: false)
         }
+        setBusy(applying: false)
     }
 
-    private func save(data: Data) async {
-        let status = PHPhotoLibrary.authorizationStatus(for: .addOnly)
-        if status == .notDetermined {
-            _ = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
-        }
-        let granted = PHPhotoLibrary.authorizationStatus(for: .addOnly)
-        guard granted == .authorized || granted == .limited else {
-            statusLabel.text = "Photos access denied"
-            return
-        }
-        do {
-            try await Self.writePhoto(data: data)
-            let sizeKB = data.count / 1024
-            statusLabel.text = "Saved \(sizeKB) KB · current config in metadata"
-        } catch {
-            statusLabel.text = "Save failed: \(error.localizedDescription)"
-        }
-    }
+    // MARK: - Summary
 
-    /// `PHPhotoLibrary.performChanges` dispatches its closure on Photos' private queue.
-    /// A closure created inside a `@MainActor` method inherits MainActor isolation and
-    /// the runtime aborts with `_dispatch_assert_queue_fail` when Photos tries to
-    /// dispatch it. Wrap in a `nonisolated static` helper to fully sever the inheritance.
-    private nonisolated static func writePhoto(data: Data) async throws {
-        try await PHPhotoLibrary.shared().performChanges {
-            let request = PHAssetCreationRequest.forAsset()
-            request.addResource(with: .photo, data: data, options: PHAssetResourceCreationOptions())
-        }
-    }
-
-    private func describeApplied() -> String {
+    private func describeApplied() async -> String {
+        landed = await Self.readLandedState(camera.session)
         let device = camera.device
         var lines = ["Applied. Device: \(device?.localizedName ?? "unknown")"]
         if let device {
-            lines.append("Lenses: \(device.lenses.count); maxZoom: \(String(format: "%.1f×", device.maxZoomFactor))")
-            lines.append("Slow-mo: \(device.supportsSlowMotion); maxFPS: \(Int(device.maxFrameRate))")
+            lines.append("Lenses: \(Self.lensSummary(device.lenses)); max zoom \(String(format: "%.1f×", device.maxZoomFactor))")
+            lines.append("Slow-mo: \(device.supportsSlowMotion ? "yes" : "no"); max \(Int(device.maxFrameRate)) fps")
+            let supported = CameraCapability.allCases.filter { $0.isSupported(by: device) }.map { $0.summary(for: device) }
+            lines.append("iOS 26/27 support: " + (supported.isEmpty ? "none on this camera and OS" : supported.joined(separator: ", ")))
         }
-        lines.append("Preset: \(configuration.sessionPreset.rawValue)")
-        lines.append("Pixel format: \(pixelFormatString(configuration.videoPixelFormat))")
-        // Surface every toggle's actual landed state — some flip themselves off when the
-        // device doesn't support the feature (e.g. Live Photo requested but not supported
-        // on the front camera, multitasking requested on iPhone, depth on a single-camera
-        // device). Without this the user sees the toggle stay green and assumes it took.
-        lines.append("Outputs: " + applyedOutputsSummary())
-        lines.append("Photo features: " + appliedPhotoFeaturesSummary())
+        lines.append("Preset: \(configuration.sessionPreset.rawValue); pixel format \(Self.pixelFormatName(configuration.videoPixelFormat))")
+        // What the session has, not what was asked: features drop out when the camera can't
+        // do them (Live Photo on some front cameras, depth on a single camera, multitasking on
+        // iPhone).
+        lines.append("Outputs: " + (landed.outputs.isEmpty ? "none" : landed.outputs.joined(separator: ", ")))
+        lines.append("Photo features: " + photoFeaturesSummary())
+        lines.append("iOS 26/27 landed: " + modernLandedSummary())
         return lines.joined(separator: "\n")
     }
 
-    private func applyedOutputsSummary() -> String {
-        var parts: [String] = []
-        if configuration.includesAudio { parts.append("audio") }
-        if configuration.includesVideoDataOutput { parts.append("video-data") }
-        if configuration.includesPhotoOutput { parts.append("photo") }
-        if configuration.includesMovieFileOutput { parts.append("movie") }
-        return parts.isEmpty ? "none" : parts.joined(separator: ", ")
+    /// The photo-output features that are on, then the requested ones that didn't land.
+    private func photoFeaturesSummary() -> String {
+        let features: [(name: String, requested: Bool, landed: Bool)] = [
+            ("live", configuration.enableLivePhoto, landed.livePhoto),
+            ("depth", configuration.enableDepthDataDelivery, landed.depthDelivery),
+            ("matte", configuration.enablePortraitEffectsMatteDelivery, landed.matteDelivery),
+            ("responsive", configuration.enableResponsiveCapture, landed.responsiveCapture),
+            ("deferred", configuration.enableAutoDeferredPhotoDelivery, landed.autoDeferredDelivery),
+            ("ZSL", configuration.enableZeroShutterLag, landed.zeroShutterLag),
+            ("multitask", configuration.enableMultitaskingCameraAccess, landed.multitasking),
+        ]
+        let on = features.filter(\.landed).map(\.name)
+        let dropped = features.filter { $0.requested && !$0.landed }.map(\.name)
+        var text = on.isEmpty ? "none" : on.joined(separator: ", ")
+        if !dropped.isEmpty {
+            text += " (requested but off: \(dropped.joined(separator: ", ")))"
+        }
+        return text
     }
 
-    private func appliedPhotoFeaturesSummary() -> String {
+    /// What the iOS 26 / 27 settings turned into once the session started.
+    private func modernLandedSummary() -> String {
+        let state = camera.state
         var parts: [String] = []
-        if configuration.enableLivePhoto { parts.append("live") }
-        if configuration.enableDepthDataDelivery { parts.append("depth") }
-        if configuration.enablePortraitEffectsMatteDelivery { parts.append("matte") }
-        if configuration.enableResponsiveCapture { parts.append("responsive") }
-        if configuration.enableAutoDeferredPhotoDelivery { parts.append("deferred") }
-        if configuration.enableZeroShutterLag { parts.append("ZSL") }
-        if configuration.enableMultitaskingCameraAccess { parts.append("multitask") }
-        return parts.isEmpty ? "none" : parts.joined(separator: ", ")
+        if let option = DeferredStartOption.allCases.first(where: { $0.value == configuration.deferredStart }) {
+            parts.append("deferred start \(option.label.lowercased()) (requested)")
+        }
+        if configuration.lensSmudgeDetectionInterval != nil {
+            parts.append("smudge \(state.lensSmudgeStatus)")
+        }
+        if configuration.enableCinematicVideo {
+            parts.append(state.isCinematicVideoCaptureEnabled ? "Cinematic Video on" : "Cinematic Video unavailable")
+        }
+        if configuration.enableBluetoothHighQualityRecording, configuration.includesAudio {
+            parts.append("AirPods HQ mic (requested)")
+        }
+        if let compensation = configuration.enableCameraSensorOrientationCompensation {
+            parts.append("orientation compensation \(compensation ? "on" : "off") (requested)")
+        }
+        return parts.isEmpty ? "nothing requested" : parts.joined(separator: ", ")
     }
 
-    private func pixelFormatString(_ format: OSType) -> String {
+    /// Focal lengths as Studio's lens chips label them. iOS 26 reports Apple's nominal
+    /// values; older systems derive them from each lens's field of view.
+    private static func lensSummary(_ lenses: [PRMLens]) -> String {
+        guard !lenses.isEmpty else { return "none" }
+        let focalLengths = lenses.map { "\(Int($0.snapping().focalLength35mm.rounded()))" }.joined(separator: "/")
+        let source = lenses.allSatisfy { $0.focalLengthSource == .nominal } ? "nominal" : "from FOV"
+        return "\(focalLengths) mm (\(source))"
+    }
+
+    private static func pixelFormatName(_ format: OSType) -> String {
         switch format {
         case kCVPixelFormatType_32BGRA: "32BGRA"
         case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: "420YpCbCr8 (video range)"
         case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange: "420YpCbCr8 (full range)"
         default: "0x\(String(format, radix: 16))"
         }
+    }
+
+    /// Reads the session's outputs and photo-output flags in one turn on the camera actor.
+    @PRMCameraActor
+    private static func readLandedState(_ session: PRMCameraSession) -> LandedState {
+        var state = LandedState()
+        if session.audioDeviceInput != nil { state.outputs.append("audio") }
+        if session.videoDataOutput != nil { state.outputs.append("video-data") }
+        if session.photoOutput != nil { state.outputs.append("photo") }
+        if session.movieFileOutput != nil { state.outputs.append("movie") }
+        if let metadata = session.metadataOutput {
+            state.outputs.append("metadata (\(metadata.metadataObjectTypes.count) types)")
+        }
+        if let photo = session.photoOutput {
+            state.livePhoto = photo.isLivePhotoCaptureEnabled
+            state.depthDelivery = photo.isDepthDataDeliveryEnabled
+            state.matteDelivery = photo.isPortraitEffectsMatteDeliveryEnabled
+            state.responsiveCapture = photo.isResponsiveCaptureEnabled
+            state.autoDeferredDelivery = photo.isAutoDeferredPhotoDeliveryEnabled
+            state.zeroShutterLag = photo.isZeroShutterLagEnabled
+        }
+        state.multitasking = session.session.isMultitaskingCameraAccessEnabled
+        return state
+    }
+}
+
+// MARK: - CameraPreviewHostDelegate
+
+extension ConfigurationLabViewController: CameraPreviewHostDelegate {
+    func cameraHostConfigure(_ host: CameraPreviewHost) async throws {
+        try await host.camera.configure(configuration)
+    }
+
+    func cameraHostDidConfigure(_ host: CameraPreviewHost) async {
+        // Without the video data output the preview gets no frames; say so instead of
+        // showing a frozen frame.
+        previewPlaceholder.isHidden = configuration.includesVideoDataOutput
+        // The session-based wrapper resolves whatever photo output this configuration
+        // attached, at each capture.
+        photoCapture = photoCapture ?? PRMPhotoCapture(session: host.camera.session)
+        let detects = !configuration.metadataObjectTypes.isEmpty || configuration.enableCinematicVideo
+        detectionLabel.isHidden = !detects
+        detectionLabel.text = Self.detectionSummary([])
+    }
+
+    func cameraHostDidStart(_: CameraPreviewHost) async {
+        // Smudge status, Cinematic Video and the metadata output settle during start.
+        await camera.refreshState()
+        statusLabel.text = await describeApplied()
+        setBusy(applying: false)
+    }
+
+    func cameraHost(_: CameraPreviewHost, didFailToConfigure error: any Error) {
+        landed = LandedState()
+        statusLabel.text = "Configure failed: \(error.localizedDescription)"
+        previewPlaceholder.text = "Configure failed; see the status"
+        previewPlaceholder.isHidden = false
+        setBusy(applying: false)
+        toaster.report(error, context: "Configure")
+    }
+
+    func cameraHost(_: CameraPreviewHost, didReceive error: PRMSessionError) {
+        toaster.report(error, context: "Camera")
     }
 }
 
@@ -562,6 +645,8 @@ final class ConfigurationLabViewController: UIViewController {
 private protocol PickerOption {
     var label: String { get }
 }
+
+extension StabilizationOption: PickerOption {}
 
 private enum SessionPresetOption: CaseIterable, PickerOption {
     case photo, hd720, hd1080, hd4K, high, medium, low
@@ -671,24 +756,113 @@ private enum QualityOption: CaseIterable, PickerOption {
     }
 }
 
-private enum StabilizationOption: CaseIterable, PickerOption {
-    case auto, off, standard, cinematic
+private enum DeferredStartOption: CaseIterable, PickerOption {
+    case system, off, photoAndMovie
 
-    var value: AVCaptureVideoStabilizationMode {
+    var value: PRMDeferredStart {
         switch self {
-        case .auto: .auto
-        case .off: .off
-        case .standard: .standard
-        case .cinematic: .cinematic
+        case .system: .systemDefault
+        case .off: .disabled
+        case .photoAndMovie: .photoAndMovie
         }
     }
 
     var label: String {
         switch self {
-        case .auto: "Auto"
+        case .system: "System"
         case .off: "Off"
-        case .standard: "Std"
-        case .cinematic: "Cinem"
+        case .photoAndMovie: "Photo+Movie"
+        }
+    }
+}
+
+private enum SmudgeDetectionOption: CaseIterable, PickerOption {
+    case off, once, continuous, every30Seconds
+
+    /// `nil` = off, `.invalid` = once per session start, `.zero` = continuously.
+    var interval: CMTime? {
+        switch self {
+        case .off: nil
+        case .once: .invalid
+        case .continuous: .zero
+        case .every30Seconds: CMTime(value: 30, timescale: 1)
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .off: "Off"
+        case .once: "Once"
+        case .continuous: "Always"
+        case .every30Seconds: "30 s"
+        }
+    }
+}
+
+private enum OrientationCompensationOption: CaseIterable, PickerOption {
+    case system, on, off
+
+    var value: Bool? {
+        switch self {
+        case .system: nil
+        case .on: true
+        case .off: false
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .system: "System"
+        case .on: "On"
+        case .off: "Off"
+        }
+    }
+}
+
+private enum DetectionOption: CaseIterable, PickerOption {
+    case off, faces, people, pets
+
+    var types: [AVMetadataObject.ObjectType] {
+        switch self {
+        case .off: []
+        case .faces: [.face]
+        case .people: [.face, .humanBody, .humanFullBody]
+        case .pets: Self.petTypes
+        }
+    }
+
+    /// Cat and dog heads are iOS 26+; bodies are older.
+    private static var petTypes: [AVMetadataObject.ObjectType] {
+        if #available(iOS 26.0, *) {
+            return [.catHead, .catBody, .dogHead, .dogBody]
+        }
+        return [.catBody, .dogBody]
+    }
+
+    var label: String {
+        switch self {
+        case .off: "Off"
+        case .faces: "Faces"
+        case .people: "People"
+        case .pets: "Pets"
+        }
+    }
+}
+
+private enum CodecOption: CaseIterable, PickerOption {
+    case heic, jpeg
+
+    var value: AVVideoCodecType {
+        switch self {
+        case .heic: .hevc
+        case .jpeg: .jpeg
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .heic: "HEIC"
+        case .jpeg: "JPEG"
         }
     }
 }

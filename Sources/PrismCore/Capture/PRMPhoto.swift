@@ -3,7 +3,7 @@ import Foundation
 
 /// A captured photo, ready to save or post-process.
 ///
-/// Returned by ``PRMPhotoCapture/capturePhoto(with:settings:applying:)``.
+/// Returned by ``PRMPhotoCapture/capturePhoto(settings:applying:context:willCapture:)``.
 public struct PRMPhoto: @unchecked Sendable {
     /// Encoded image data (JPEG, HEIC, etc. — matches `PRMPhotoSettings.codec`).
     public let data: Data

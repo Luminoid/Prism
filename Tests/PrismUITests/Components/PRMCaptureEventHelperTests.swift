@@ -40,15 +40,6 @@
         }
 
         @Test
-        func `makeInteraction returns an AVCaptureEventInteraction`() {
-            let helper = PRMCaptureEventHelper()
-            let interaction = helper.makeInteraction()
-            // Mere construction is the assertion — AVCaptureEventInteraction has no inspectable
-            // public state, and creating one requires the closures (which the helper supplies).
-            _ = interaction
-        }
-
-        @Test
         func `makeInteraction is memoized — repeated calls return the same instance`() {
             // The helper memoizes its `AVCaptureEventInteraction` so callers can invoke
             // `makeInteraction()` multiple times (e.g. from re-attachment paths like
@@ -59,6 +50,40 @@
             let a = helper.makeInteraction()
             let b = helper.makeInteraction()
             #expect(a === b)
+        }
+
+        @Test
+        func `Capture sounds default to nil`() {
+            let helper = PRMCaptureEventHelper()
+            #expect(helper.primarySound == nil)
+            #expect(helper.secondarySound == nil)
+        }
+
+        @Test(.enabled(if: OSAvailability.isIOS26))
+        func `System capture sounds resolve on iOS 26`() {
+            guard #available(iOS 26.0, *) else { return }
+            #expect(PRMCaptureSound.shutter.makeEventSound() != nil)
+            #expect(PRMCaptureSound.beginRecording.makeEventSound() != nil)
+            #expect(PRMCaptureSound.endRecording.makeEventSound() != nil)
+        }
+
+        @Test(.enabled(if: OSAvailability.isIOS26))
+        func `A missing custom sound file resolves to nil`() {
+            guard #available(iOS 26.0, *) else { return }
+            let missing = URL(fileURLWithPath: "/nonexistent/prism-shutter.caf")
+            #expect(PRMCaptureSound.custom(missing).makeEventSound() == nil)
+        }
+
+        @Test
+        func `Custom capture sounds toggle the global AVKit flag`() {
+            let original = PRMCaptureEventHelper.usesCustomCaptureSounds
+            defer { PRMCaptureEventHelper.usesCustomCaptureSounds = original }
+            PRMCaptureEventHelper.usesCustomCaptureSounds = true
+            if #available(iOS 26.0, *) {
+                #expect(PRMCaptureEventHelper.usesCustomCaptureSounds)
+            } else {
+                #expect(!PRMCaptureEventHelper.usesCustomCaptureSounds)
+            }
         }
     }
 #endif

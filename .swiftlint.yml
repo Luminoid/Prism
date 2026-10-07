@@ -26,6 +26,7 @@ opt_in_rules:
 included:
   - Sources
   - Tests
+  - Example/Sources
 
 # Case-sensitive paths to ignore during linting. Takes precedence over `included`. Wildcards
 # are supported.

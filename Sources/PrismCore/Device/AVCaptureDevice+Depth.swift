@@ -23,6 +23,11 @@ public extension AVCaptureDevice {
     /// previews through Metal at full resolution every frame, which kills the preview
     /// frame rate on Pro models.
     ///
+    /// Turns geometric distortion correction off on virtual devices (depth needs
+    /// uncorrected frames). ``PRMCameraSession`` turns it back on when the device leaves the
+    /// depth format or the session; apps driving the device directly should set
+    /// `isGeometricDistortionCorrectionEnabled` back themselves.
+    ///
     /// - Returns: `true` if a depth format is now active, `false` if the device has
     ///   no depth-capable formats.
     /// - Throws: If the device cannot be locked for configuration.
@@ -47,32 +52,14 @@ public extension AVCaptureDevice {
             // Active format doesn't support depth — pick a depth-capable one. Prefer
             // a 1080p-class option (largest format ≤ 1920px wide); fall back to the
             // smallest depth-capable format if no sub-4K option exists.
-            let targetMaxPixels: Int32 = 1920 * 1080
-            var bestSubHD: AVCaptureDevice.Format?
-            var bestSubHDPixels: Int32 = 0
-            var smallest: AVCaptureDevice.Format?
-            var smallestPixels: Int32 = .max
-            for format in formats {
-                guard !format.supportedDepthDataFormats.isEmpty else { continue }
-                let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-                let pixels = dims.width * dims.height
-                if pixels <= targetMaxPixels, pixels > bestSubHDPixels {
-                    bestSubHD = format
-                    bestSubHDPixels = pixels
-                }
-                if pixels < smallestPixels {
-                    smallest = format
-                    smallestPixels = pixels
-                }
-            }
-            guard let format = bestSubHD ?? smallest,
+            guard let format = Self.prm_hdClassFormat(from: formats, where: { !$0.supportedDepthDataFormats.isEmpty }),
                   let depthFormat = format.supportedDepthDataFormats.first
             else { return false }
             targetFormat = format
             targetDepthFormat = depthFormat
         }
 
-        try withConfigurationLock {
+        try prm_withConfigurationLock {
             // Geometric distortion correction is enabled by default on multi-camera
             // virtual devices (builtInTripleCamera / builtInDualCamera). When GDC is on,
             // AVFoundation suppresses depth + camera calibration data delivery because
@@ -80,10 +67,13 @@ public extension AVCaptureDevice {
             // The symptom matches the iPhone Pro reports exactly: depth ancillaries
             // arrive but `depthDataMap` is internally null, with no error surfaced.
             // Disable GDC before applying the depth format. See Apple Developer Forum
-            // thread 131829 (Dual delivery with empty calibration data).
+            // thread 131829 (Dual delivery with empty calibration data). The session turns
+            // it back on when the device leaves the depth format or the session
+            // (`prm_restoreGeometricDistortionCorrectionIfNeeded()`).
             #if !os(macOS)
                 if isGeometricDistortionCorrectionSupported, isGeometricDistortionCorrectionEnabled {
                     isGeometricDistortionCorrectionEnabled = false
+                    prm_noteDisabledByPrism(.geometricDistortionCorrection)
                 }
             #endif
 

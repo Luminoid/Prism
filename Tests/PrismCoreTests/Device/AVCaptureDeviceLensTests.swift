@@ -10,11 +10,11 @@ struct AVCaptureDeviceLensTests {
     func `Public method signatures compile`() {
         let setFocusMode: (AVCaptureDevice) -> (AVCaptureDevice.FocusMode) throws -> Void =
             { device in device.prm_setFocusMode }
-        let setLensAsync: (AVCaptureDevice) -> (Float) async throws -> Void =
+        let setLensAwaiting: (AVCaptureDevice) -> (Float, TimeInterval) async throws -> Void =
             { device in device.prm_setLensPosition }
-        let setLensSync: (AVCaptureDevice) -> (Float, (@Sendable (CMTime) -> Void)?) throws -> Void =
-            { device in device.prm_setLensPositionAsync }
-        _ = (setFocusMode, setLensAsync, setLensSync)
-        #expect(true)
+        let setLensWithCompletion: (AVCaptureDevice) -> (Float, @escaping @Sendable (CMTime) -> Void) throws -> Void =
+            { device in device.prm_setLensPosition }
+        let supportsCustom: KeyPath<AVCaptureDevice, Bool> = \.prm_supportsCustomLensPosition
+        _ = (setFocusMode, setLensAwaiting, setLensWithCompletion, supportsCustom)
     }
 }

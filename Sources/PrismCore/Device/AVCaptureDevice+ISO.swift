@@ -9,7 +9,7 @@ public extension AVCaptureDevice {
     /// `duration = AVCaptureDevice.currentExposureDuration`.
     func prm_setISO(_ iso: Float, completion: (@Sendable (CMTime) -> Void)? = nil) throws {
         try prm_setCustomExposure(
-            duration: AVCaptureDevice.currentExposureDuration,
+            duration: Self.currentExposureDuration,
             iso: iso,
             completion: completion
         )
@@ -24,7 +24,7 @@ public extension AVCaptureDevice {
         let duration = CMTimeMakeWithSeconds(seconds, preferredTimescale: 1_000_000)
         try prm_setCustomExposure(
             duration: duration,
-            iso: AVCaptureDevice.currentISO,
+            iso: Self.currentISO,
             completion: completion
         )
     }

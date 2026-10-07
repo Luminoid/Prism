@@ -81,6 +81,9 @@
             }
         }
 
+        /// Plays a selection tick when the device becomes level. Off by default.
+        public var hapticsEnabled = false
+
         /// The current roll angle in degrees (read-only). Range is `(-180, 180]`.
         public private(set) var currentRollDegrees: Double = 0
 
@@ -98,10 +101,18 @@
         /// single CMMotionManager per process is preferred. The default `CMMotionManager()` is
         /// the convenient choice for apps that only show one level indicator at a time.
         private nonisolated(unsafe) let motionManager: CMMotionManager
-        /// Whether this view owns the motion manager — if `false`, `deinit` won't stop it,
-        /// leaving other consumers (or another `PRMLevelIndicatorView` sharing the same
-        /// manager) unaffected. `nonisolated` because `deinit` is nonisolated.
+        /// Whether this view owns the motion manager. An owned manager gets this view's push
+        /// handler; a shared one is only read (see ``init(motionManager:)``), so the view
+        /// never replaces another consumer's handler or stops updates it didn't start.
+        /// `nonisolated` because `deinit` is nonisolated.
         private nonisolated let ownsMotionManager: Bool
+        /// Shared manager only: whether this view started its (pull) updates, so it stops
+        /// only those.
+        private nonisolated(unsafe) var startedSharedUpdates = false
+        /// Shared manager only: polls `deviceMotion` at 30 Hz while active.
+        private nonisolated(unsafe) var sharedPollTimer: Timer?
+        /// The whole degree last written to `accessibilityValue` while tilted.
+        private var announcedDegrees: Int?
         private let motionQueue = OperationQueue()
         /// Tracks previous level state to avoid redundant color/accessibility updates.
         private var wasLevel: Bool = false
@@ -123,8 +134,10 @@
 
         /// Creates a level indicator that shares the given `CMMotionManager`.
         ///
-        /// The view will not stop motion updates on deinit — the manager's lifecycle stays
-        /// with the caller.
+        /// The view reads the manager's latest `deviceMotion` instead of installing its own
+        /// handler, so other consumers keep theirs. If device-motion updates aren't running
+        /// when the view activates, it starts pull updates and stops them again when it
+        /// deactivates; updates someone else started are left alone.
         public convenience init(motionManager: CMMotionManager) {
             self.init(motionManager: motionManager, ownsMotionManager: false)
         }
@@ -142,7 +155,8 @@
         }
 
         deinit {
-            if ownsMotionManager {
+            sharedPollTimer?.invalidate()
+            if ownsMotionManager || startedSharedUpdates {
                 motionManager.stopDeviceMotionUpdates()
             }
         }
@@ -151,7 +165,7 @@
             backgroundColor = .clear
             isUserInteractionEnabled = false
             isAccessibilityElement = true
-            accessibilityLabel = "Level indicator"
+            accessibilityLabel = String(localized: "Level indicator", bundle: .module)
 
             shapeLayer.fillColor = nil
             shapeLayer.strokeColor = lineColor.cgColor
@@ -163,7 +177,7 @@
             layer.addSublayer(shapeLayer)
 
             motionQueue.maxConcurrentOperationCount = 1
-            motionQueue.name = "com.luminoid.Prism.LevelIndicator"
+            motionQueue.name = "dev.luminoid.prism.levelIndicator"
         }
 
         // MARK: - Layout
@@ -179,78 +193,125 @@
 
         // MARK: - Motion Updates
 
-        private nonisolated func startMotionUpdates() {
+        private func startMotionUpdates() {
             #if targetEnvironment(simulator)
                 // CoreMotion plist lookup crashes on Simulator — no motion hardware available.
                 return
             #else
                 guard motionManager.isDeviceMotionAvailable else { return }
-                motionManager.deviceMotionUpdateInterval = 1.0 / 60.0
-
-                motionManager.startDeviceMotionUpdates(to: motionQueue) { [weak self] motion, _ in
-                    guard let motion else { return }
-                    // Use gravity vector instead of attitude.roll — Euler angles
-                    // suffer from gimbal lock near vertical, causing wild values.
-                    // atan2(-gx, -gy) projects gravity onto the screen plane and
-                    // returns 0 when level in portrait, ±π/2 in landscape, ±π upside-down.
-                    let gx = motion.gravity.x
-                    let gy = motion.gravity.y
-                    let rawRollRadians = atan2(-gx, -gy)
-
-                    Task { @MainActor [weak self] in
-                        guard let self else { return }
-
-                        // Low-pass filter (exponential moving average) to smooth jitter.
-                        let alpha = self.smoothingFactor
-                        self.filteredRollRadians = alpha * rawRollRadians + (1.0 - alpha) * self.filteredRollRadians
-
-                        let rollDegrees = self.filteredRollRadians * 180.0 / .pi
-                        self.currentRollDegrees = rollDegrees
-
-                        // Highlight whenever the device is near any cardinal orientation
-                        // (portrait, landscape-left, landscape-right, upside-down). Deviation
-                        // from the nearest 90° multiple is wrapped to (-45°, 45°].
-                        var deviationRadians = self.filteredRollRadians
-                            .truncatingRemainder(dividingBy: .pi / 2)
-                        if deviationRadians > .pi / 4 { deviationRadians -= .pi / 2 }
-                        if deviationRadians < -.pi / 4 { deviationRadians += .pi / 2 }
-                        let absDeviationDegrees = abs(deviationRadians) * 180.0 / .pi
-
-                        // Hysteresis: harder to exit level state than to enter it.
-                        let leveled = if self.isLevel {
-                            absDeviationDegrees <= self.levelThreshold + self.hysteresisMargin
-                        } else {
-                            absDeviationDegrees <= self.levelThreshold
-                        }
-                        self.isLevel = leveled
-
-                        // Snap-to-cardinal: when leveled, subtract the residual deviation so
-                        // the line aligns with the nearest 90° multiple (perfectly horizontal
-                        // in portrait/upside-down, perfectly vertical in landscape).
-                        let displayRadians = leveled
-                            ? self.filteredRollRadians - deviationRadians
-                            : self.filteredRollRadians
-                        self.applyRotation(radians: displayRadians)
-
-                        // Only update color and accessibility on state transitions.
-                        if leveled != self.wasLevel {
-                            self.wasLevel = leveled
-                            self.updateLineColor()
-                            self.accessibilityValue = leveled
-                                ? "Level"
-                                : String(format: "%.1f degrees", rollDegrees)
-                        }
-                    }
+                guard ownsMotionManager else {
+                    startSharedMotionPolling()
+                    return
                 }
+                motionManager.deviceMotionUpdateInterval = 1.0 / 60.0
+                motionManager.startDeviceMotionUpdates(to: motionQueue, withHandler: Self.motionHandler(for: self))
             #endif
         }
 
+        /// Builds the owned manager's push handler outside MainActor. `CMDeviceMotionHandler`
+        /// isn't `@Sendable`, so a closure written inside a MainActor method is inferred
+        /// MainActor-isolated, and CoreMotion calling it on `motionQueue` traps in the
+        /// runtime's executor check (`_dispatch_assert_queue_fail`). Formed here, it's
+        /// nonisolated and hops to the main actor only to apply the sample.
+        private nonisolated static func motionHandler(for view: PRMLevelIndicatorView) -> CMDeviceMotionHandler {
+            { [weak view] motion, _ in
+                guard let motion else { return }
+                let gravityX = motion.gravity.x
+                let gravityY = motion.gravity.y
+                Task { @MainActor [weak view] in
+                    view?.handleGravity(x: gravityX, y: gravityY)
+                }
+            }
+        }
+
+        /// Shared manager: read its latest sample on a timer rather than taking over its
+        /// handler.
+        private func startSharedMotionPolling() {
+            if !motionManager.isDeviceMotionActive {
+                motionManager.startDeviceMotionUpdates()
+                startedSharedUpdates = true
+            }
+            sharedPollTimer?.invalidate()
+            sharedPollTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, let motion = self.motionManager.deviceMotion else { return }
+                    self.handleGravity(x: motion.gravity.x, y: motion.gravity.y)
+                }
+            }
+        }
+
+        /// Turns one gravity sample into the line's rotation, color and accessibility value.
+        private func handleGravity(x gravityX: Double, y gravityY: Double) {
+            // Use gravity vector instead of attitude.roll — Euler angles
+            // suffer from gimbal lock near vertical, causing wild values.
+            // atan2(-gx, -gy) projects gravity onto the screen plane and
+            // returns 0 when level in portrait, ±π/2 in landscape, ±π upside-down.
+            let rawRollRadians = atan2(-gravityX, -gravityY)
+
+            // Low-pass filter (exponential moving average) to smooth jitter.
+            filteredRollRadians = smoothingFactor * rawRollRadians + (1.0 - smoothingFactor) * filteredRollRadians
+
+            let rollDegrees = filteredRollRadians * 180.0 / .pi
+            currentRollDegrees = rollDegrees
+
+            // Highlight whenever the device is near any cardinal orientation
+            // (portrait, landscape-left, landscape-right, upside-down). Deviation
+            // from the nearest 90° multiple is wrapped to (-45°, 45°].
+            var deviationRadians = filteredRollRadians.truncatingRemainder(dividingBy: .pi / 2)
+            if deviationRadians > .pi / 4 { deviationRadians -= .pi / 2 }
+            if deviationRadians < -.pi / 4 { deviationRadians += .pi / 2 }
+            let deviationDegrees = deviationRadians * 180.0 / .pi
+
+            // Hysteresis: harder to exit level state than to enter it.
+            let leveled = if isLevel {
+                abs(deviationDegrees) <= levelThreshold + hysteresisMargin
+            } else {
+                abs(deviationDegrees) <= levelThreshold
+            }
+            isLevel = leveled
+
+            // Snap-to-cardinal: when leveled, subtract the residual deviation so
+            // the line aligns with the nearest 90° multiple (perfectly horizontal
+            // in portrait/upside-down, perfectly vertical in landscape).
+            let displayRadians = leveled ? filteredRollRadians - deviationRadians : filteredRollRadians
+            applyRotation(radians: displayRadians)
+
+            if leveled != wasLevel {
+                wasLevel = leveled
+                updateLineColor()
+                if leveled, hapticsEnabled {
+                    UISelectionFeedbackGenerator(view: self).selectionChanged()
+                }
+            }
+            updateAccessibilityValue(leveled: leveled, deviationDegrees: deviationDegrees)
+        }
+
+        /// "Level", or the tilt from the nearest level orientation in whole degrees, rewritten
+        /// only when that number changes (samples arrive 30-60 times a second).
+        private func updateAccessibilityValue(leveled: Bool, deviationDegrees: Double) {
+            let degrees: Int? = leveled ? nil : Int(deviationDegrees.rounded())
+            guard degrees != announcedDegrees || accessibilityValue == nil else { return }
+            announcedDegrees = degrees
+            if let degrees {
+                accessibilityValue = String(localized: "Tilted \(degrees) degrees", bundle: .module)
+            } else {
+                accessibilityValue = String(localized: "Level", bundle: .module)
+            }
+        }
+
         private func stopMotionUpdates() {
-            motionManager.stopDeviceMotionUpdates()
+            sharedPollTimer?.invalidate()
+            sharedPollTimer = nil
+            if ownsMotionManager || startedSharedUpdates {
+                motionManager.stopDeviceMotionUpdates()
+                startedSharedUpdates = false
+            }
             currentRollDegrees = 0
             filteredRollRadians = 0
             isLevel = false
             wasLevel = false
+            announcedDegrees = nil
+            accessibilityValue = nil
             shapeLayer.transform = CATransform3DIdentity
             updateLineColor()
         }
@@ -274,12 +335,10 @@
             shapeLayer.strokeColor = isLevel ? leveledColor.cgColor : lineColor.cgColor
         }
 
+        /// The rotation is the reading itself, not decoration, so it applies with Reduce Motion
+        /// on too (implicit animations are already off, so nothing animates).
         private func applyRotation(radians: Double) {
-            if UIAccessibility.isReduceMotionEnabled {
-                shapeLayer.transform = CATransform3DIdentity
-            } else {
-                shapeLayer.transform = CATransform3DMakeRotation(CGFloat(radians), 0, 0, 1)
-            }
+            shapeLayer.transform = CATransform3DMakeRotation(CGFloat(radians), 0, 0, 1)
         }
     }
 #endif

@@ -32,11 +32,11 @@ public struct PRMRenderContext: @unchecked Sendable {
     /// - Returns: A configured context, or `nil` if Metal is unavailable.
     public init?(name: String = "PRMRenderContext") {
         guard let device = MTLCreateSystemDefaultDevice() else {
-            PRMLogger.filter.error("Metal device unavailable — cannot create PRMRenderContext")
+            PRMLog.error(.filter, "Metal device unavailable — cannot create PRMRenderContext")
             return nil
         }
         guard let queue = device.makeCommandQueue() else {
-            PRMLogger.filter.error("Failed to create Metal command queue")
+            PRMLog.error(.filter, "Failed to create Metal command queue")
             return nil
         }
         let ciContext = CIContext(

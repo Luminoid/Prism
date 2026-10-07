@@ -34,48 +34,42 @@ public final class PRMVideoRecorder: NSObject, @unchecked Sendable {
         case finalizing
     }
 
-    /// Resolution strategy for the underlying `AVCaptureMovieFileOutput`.
-    private enum OutputResolver: @unchecked Sendable {
-        /// Fixed output instance. Used by the legacy `init(output:)`.
-        case fixed(AVCaptureMovieFileOutput)
-        /// Dynamic lookup against a session. Used by `init(session:)` — re-resolves
-        /// at every `start()` so format-swap-driven output re-attaches don't strand
-        /// the recorder against a dead output instance.
-        case dynamic(@Sendable () async -> AVCaptureMovieFileOutput?)
-    }
+    private let resolver: PRMOutputResolver<AVCaptureMovieFileOutput>
 
-    private let resolver: OutputResolver
-    public private(set) var state: State = .idle
+    /// The current state. Every transition happens under the recorder's lock, so a start,
+    /// stop or cancel racing another sees a consistent value.
+    public var state: State {
+        lock.lock()
+        defer { lock.unlock() }
+        return currentState
+    }
 
     /// The output the recorder was constructed against (legacy init) or — for the
-    /// session-based init — the output snapshotted at construction time. The
-    /// session-based init resolves the LIVE output at `start()` time; this property
-    /// is a stable reference for back-compat only and may be stale after a format
-    /// swap. Prefer the session-based init.
-    public var output: AVCaptureMovieFileOutput {
-        if case let .fixed(out) = resolver {
-            return out
-        }
-        // Resolved lazily for the session-based init via `currentOutput()`; the
-        // property is provided for back-compat with code that read `.output` once
-        // at construction time. Production callers should rely on `start()` to
-        // resolve a fresh reference.
-        if let cached = sessionCachedOutput {
-            return cached
-        }
-        // Safe fallback: a fresh empty output. Should never be used in practice
-        // because session-based callers go through `start()` which calls the
-        // dynamic resolver. This branch only fires if a caller reads `.output`
-        // before any `start()` has resolved one.
-        return AVCaptureMovieFileOutput()
+    /// session-based init — the output the last ``start(rotationAngle:stabilizationMode:)``
+    /// resolved, `nil` before that. Recording always resolves the live output itself.
+    public var output: AVCaptureMovieFileOutput? {
+        resolver.latest
     }
 
-    /// Cached output from the most recent `start()` resolution (session-based init
-    /// only). Updated under `lock`.
-    private var sessionCachedOutput: AVCaptureMovieFileOutput?
-
-    private var startContinuation: CheckedContinuation<Void, Error>?
-    private var stopContinuation: CheckedContinuation<PRMRecording, Error>?
+    // Guarded by `lock`.
+    private var currentState: State = .idle
+    private var startContinuation: CheckedContinuation<Void, any Error>?
+    private var stopContinuation: CheckedContinuation<PRMRecording, any Error>?
+    /// Set while a `start()` is resolving its output, so a second one can't overlap it.
+    private var isStarting = false
+    /// Set when the task awaiting `start()` is cancelled before recording began, so a
+    /// finish without a start reports `.cancelled` rather than a failure.
+    private var isStartCancelled = false
+    /// Set by ``cancel()`` (or a start cancelled after the output began): the finish that
+    /// follows deletes the file, since no caller ever receives its URL.
+    private var discardsFinishedRecording = false
+    /// The recording's start time, kept while `.finalizing` so the finished recording reports its duration.
+    private var finalizingStartedAt: Date?
+    /// The file being started, recorded or finalized. Finish callbacks for any other file
+    /// are stale and leave the state alone.
+    private var activeURL: URL?
+    /// The output recording to ``activeURL``; stop and cancel go to it.
+    private var recordingOutput: AVCaptureMovieFileOutput?
 
     private let lock = NSLock()
 
@@ -86,7 +80,7 @@ public final class PRMVideoRecorder: NSObject, @unchecked Sendable {
     /// slo-mo activation), `start()` will fail with a typed error. Prefer
     /// ``init(session:)`` for any session that may swap formats.
     public init(output: AVCaptureMovieFileOutput) {
-        resolver = .fixed(output)
+        resolver = PRMOutputResolver(fixed: output)
         super.init()
     }
 
@@ -96,15 +90,11 @@ public final class PRMVideoRecorder: NSObject, @unchecked Sendable {
     /// invisible to the caller — the next `start()` automatically picks up the
     /// fresh output instance.
     ///
-    /// `start()` throws ``PRMSessionError/videoRecordingFailed`` if the session
+    /// `start()` throws ``PRMSessionError/videoRecordingFailed(_:)`` if the session
     /// has no movie output attached at start time (i.e. the consuming app forgot
     /// to call `setMovieFileOutputAttached(true)` for video mode).
     public init(session: PRMCameraSession) {
-        // `nonisolated(unsafe)` is safe here — the closure only reads the actor-
-        // isolated `movieFileOutput` snapshot through `await`, never mutates it.
-        // The `@PRMCameraActor` isolation on the read ensures consistency with
-        // any concurrent session reconfigure.
-        resolver = .dynamic { [weak session] in
+        resolver = PRMOutputResolver { [weak session] in
             guard let session else { return nil }
             return await session.movieFileOutput
         }
@@ -114,59 +104,99 @@ public final class PRMVideoRecorder: NSObject, @unchecked Sendable {
     // MARK: - Start / Stop
 
     /// Starts recording to a new tmp file. Returns when the file output has actually begun.
+    /// A no-op while already recording.
     ///
     /// Honors `Task` cancellation: if the surrounding task is cancelled while waiting for the
     /// file output to begin, recording is stopped and the call throws ``PRMSessionError/cancelled``.
+    ///
+    /// - Throws: ``PRMSessionError/videoRecordingFailed(_:)`` while the previous recording is
+    ///   still finalizing (starting then would make its finish look like this recording's),
+    ///   while another `start()` is under way, or when the movie output or its video
+    ///   connection is missing; ``PRMSessionError/captureFailed(_:)`` when AVFoundation fails
+    ///   the recording before it begins.
     public func start(
         rotationAngle: CGFloat? = nil,
         stabilizationMode: AVCaptureVideoStabilizationMode? = nil
     ) async throws {
-        PRMLogger.trace(
+        PRMLog.debug(
             .capture,
             "PRMVideoRecorder.start(rotation=\(rotationAngle.map { String(describing: $0) } ?? "nil"), stab=\(stabilizationMode?.rawValue.description ?? "nil"))"
         )
-        if case .recording = state { return }
+        guard try reserveStart() else { return }
+        let url = PRMTempFile.url(withExtension: "mov")
+        let resolvedOutput: AVCaptureMovieFileOutput
+        do {
+            resolvedOutput = try await preparedOutput(rotationAngle: rotationAngle, stabilizationMode: stabilizationMode)
+        } catch {
+            releaseStartReservation()
+            throw error
+        }
 
-        // Resolve the LIVE output at start time. For session-based recorders this
-        // re-reads `session.movieFileOutput` — necessary because Prism may have
-        // detached + re-attached the movie output during a format-swap-driven
-        // `setFrameRate` (slo-mo activation). For legacy `init(output:)`
-        // recorders, the resolver returns the fixed reference.
-        let resolvedOutput = await currentOutput()
-        guard let resolvedOutput else {
+        try await withTaskCancellationHandler {
+            try await waitForRecordingStart(url: url, output: resolvedOutput) {
+                resolvedOutput.startRecording(to: url, recordingDelegate: self)
+            }
+        } onCancel: { [weak self] in
+            self?.markStartCancelled()
+        }
+        PRMLog.notice(.capture, "Recording started", private: url.path)
+    }
+
+    /// Claims the start. `false` when already recording (no-op); throws while finalizing or
+    /// while another start is under way.
+    private nonisolated func reserveStart() throws -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        switch currentState {
+        case .recording:
+            return false
+        case .finalizing:
+            throw PRMSessionError.videoRecordingFailed("The previous recording is still finalizing")
+        case .idle:
+            guard !isStarting else {
+                throw PRMSessionError.videoRecordingFailed("A recording is already starting")
+            }
+            isStarting = true
+            return true
+        }
+    }
+
+    private nonisolated func releaseStartReservation() {
+        lock.lock()
+        defer { lock.unlock() }
+        isStarting = false
+    }
+
+    /// Resolves the live movie output and checks its video connection.
+    ///
+    /// `startRecording` raises `NSInvalidArgumentException` ("No active/enabled
+    /// connections") when the connection is missing or inactive, and an uncaught ObjC
+    /// exception in a Swift async context terminates the process. A typed error lets the
+    /// app show a "video pipeline not ready" message and reconfigure instead. This covers
+    /// the class of bug where another path detached the movie output (a mode-switch race, a
+    /// full reconfigure) between the app deciding it's in video mode and the user tapping
+    /// record.
+    private func preparedOutput(
+        rotationAngle: CGFloat?,
+        stabilizationMode: AVCaptureVideoStabilizationMode?
+    ) async throws -> AVCaptureMovieFileOutput {
+        guard let resolvedOutput = await resolver.resolve() else {
+            PRMLog.error(.capture, "Recording refused: no movie file output attached to the session")
             throw PRMSessionError.videoRecordingFailed(
                 "AVCaptureMovieFileOutput is not attached to the session — call setMovieFileOutputAttached(true) before recording"
             )
         }
-
-        // Cache the resolved output for legacy callers reading `.output` after a
-        // session-based session reconfigure (back-compat surface). Use the
-        // dedicated helper instead of inline `lock.lock()` because direct
-        // `NSLock.lock` is unavailable from async contexts; the helper does the
-        // same work inside a non-async scope where `NSLock` is the right tool
-        // (the critical section is too short to justify an actor).
-        cacheResolvedOutput(resolvedOutput)
-
-        let url = PRMTempFile.url(withExtension: "mov")
-        // Validate the video connection exists AND is enabled BEFORE calling
-        // `startRecording`. AVFoundation's underlying ObjC implementation throws
-        // `NSInvalidArgumentException` ("*** -[AVCaptureMovieFileOutput
-        // startRecordingToOutputFileURL:recordingDelegate:] No active/enabled
-        // connections") when it doesn't, and an uncaught ObjC exception in a Swift
-        // async context terminates the process — there's no try/catch we can wrap
-        // around it. Surface a typed Swift error instead so the consuming app can
-        // show a "video pipeline not ready" toast and reconfigure.
-        //
-        // This guards against the class of bug where some other code path detached
-        // the movie output (mode-switch race, full session reconfigure that didn't
-        // preserve runtime mutations, etc.) between the consuming app deciding it's
-        // in video mode and the user tapping record.
         guard let connection = resolvedOutput.connection(with: .video) else {
+            PRMLog.error(.capture, "Recording refused: movie file output has no video connection")
             throw PRMSessionError.videoRecordingFailed(
                 "AVCaptureMovieFileOutput has no video connection — was the movie output attached to the session?"
             )
         }
         guard connection.isEnabled, connection.isActive else {
+            PRMLog.error(
+                .capture,
+                "Recording refused: movie video connection isEnabled=\(connection.isEnabled), isActive=\(connection.isActive)"
+            )
             throw PRMSessionError.videoRecordingFailed(
                 "AVCaptureMovieFileOutput connection is not active/enabled — the session may be misconfigured or interrupted"
             )
@@ -177,42 +207,42 @@ public final class PRMVideoRecorder: NSObject, @unchecked Sendable {
         if let stabilizationMode {
             connection.prm_setStabilization(stabilizationMode)
         }
+        return resolvedOutput
+    }
 
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                lock.lock()
-                startContinuation = continuation
-                state = .recording(url: url, startedAt: Date())
-                lock.unlock()
-                resolvedOutput.startRecording(to: url, recordingDelegate: self)
-            }
-        } onCancel: { [weak self] in
-            // Stop on whatever output is current — for session-based recorders
-            // the consuming app may have hopped the output again between start
-            // and cancel; resolve fresh so we don't ask a dead output to stop.
-            Task { await self?.currentOutput()?.stopRecording() }
+    /// Installs the start continuation, calls `begin` (which asks the output to record),
+    /// and suspends until the delegate reports the start, or a finish that came first.
+    /// Separate from `start()` so tests can drive the delegate without a capture session.
+    func waitForRecordingStart(url: URL, output: AVCaptureMovieFileOutput? = nil, begin: () -> Void) async throws {
+        // A task cancelled before this point already ran its `onCancel` (finding no
+        // continuation to flag), so carry the cancellation in here.
+        let alreadyCancelled = Task.isCancelled
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+            lock.lock()
+            startContinuation = continuation
+            isStartCancelled = alreadyCancelled
+            discardsFinishedRecording = false
+            isStarting = false
+            activeURL = url
+            recordingOutput = output ?? resolver.latest
+            currentState = .recording(url: url, startedAt: Date())
+            lock.unlock()
+            begin()
         }
     }
 
-    /// Returns the live `AVCaptureMovieFileOutput` per the configured resolver.
-    /// Synchronous for `init(output:)`, actor-isolated read for `init(session:)`.
-    private func currentOutput() async -> AVCaptureMovieFileOutput? {
-        switch resolver {
-        case let .fixed(out):
-            out
-        case let .dynamic(resolve):
-            await resolve()
-        }
-    }
-
-    /// Non-async cache update under the recorder's lock. Extracted from `start()`
-    /// because `NSLock.lock` is not available in async contexts; calling it from
-    /// a `nonisolated` helper sidesteps that restriction (the critical section is
-    /// O(1) memory stores, too small to justify an actor).
-    private nonisolated func cacheResolvedOutput(_ output: AVCaptureMovieFileOutput) {
+    /// Flags a start whose task was cancelled and stops the output it asked to record.
+    private nonisolated func markStartCancelled() {
         lock.lock()
-        defer { lock.unlock() }
-        sessionCachedOutput = output
+        let pending = startContinuation != nil
+        if pending {
+            isStartCancelled = true
+        }
+        let output = recordingOutput
+        lock.unlock()
+        if pending {
+            output?.stopRecording()
+        }
     }
 
     /// Stops recording. Returns when the file is finalized.
@@ -220,25 +250,52 @@ public final class PRMVideoRecorder: NSObject, @unchecked Sendable {
     /// Honors `Task` cancellation: cancellation during finalization does NOT abort writing
     /// (the file is already being flushed by AVFoundation) — the call still resumes when the
     /// delegate fires, so the caller gets the partial recording. Use ``cancel()`` to discard.
+    ///
+    /// - Throws: ``PRMSessionError/videoRecordingFailed(_:)`` when not recording (including a
+    ///   second `stop()` while the first finalizes); ``PRMSessionError/captureFailed(_:)``
+    ///   when AVFoundation fails the recording.
     public func stop() async throws -> PRMRecording {
-        PRMLogger.trace(.capture, "PRMVideoRecorder.stop")
-        guard case .recording = state else {
-            throw PRMSessionError.videoRecordingFailed("Not currently recording")
-        }
+        PRMLog.debug(.capture, "PRMVideoRecorder.stop")
         return try await withCheckedThrowingContinuation { continuation in
             lock.lock()
+            guard case let .recording(_, startedAt) = currentState, stopContinuation == nil else {
+                lock.unlock()
+                continuation.resume(throwing: PRMSessionError.videoRecordingFailed("Not currently recording"))
+                return
+            }
             stopContinuation = continuation
-            state = .finalizing
+            finalizingStartedAt = startedAt
+            currentState = .finalizing
+            let output = recordingOutput ?? resolver.latest
             lock.unlock()
-            output.stopRecording()
+            output?.stopRecording()
         }
     }
 
-    /// Stops recording and discards the file. Use when the user aborts mid-recording.
+    /// Stops recording and discards the file once AVFoundation has finished writing it. Use
+    /// when the user aborts mid-recording. The recorder is `.finalizing` until then, so a
+    /// new ``start(rotationAngle:stabilizationMode:)`` waits for the discard instead of
+    /// racing it.
     public func cancel() {
-        guard case let .recording(url, _) = state else { return }
-        output.stopRecording()
-        PRMTempFile.remove(url)
+        lock.lock()
+        guard case .recording = currentState else {
+            lock.unlock()
+            return
+        }
+        discardsFinishedRecording = true
+        currentState = .finalizing
+        let output = recordingOutput ?? resolver.latest
+        lock.unlock()
+        PRMLog.notice(.capture, "Recording cancelled; discarding the file")
+        output?.stopRecording()
+    }
+
+    /// AVFoundation's error as a ``PRMSessionError``, keeping an `AVError`'s code.
+    static func sessionError(for error: any Error) -> PRMSessionError {
+        if let avError = error as? AVError {
+            return .captureFailed(avError)
+        }
+        return .videoRecordingFailed(error.localizedDescription)
     }
 }
 
@@ -253,7 +310,22 @@ extension PRMVideoRecorder: AVCaptureFileOutputRecordingDelegate {
         lock.lock()
         let continuation = startContinuation
         startContinuation = nil
+        // A start cancelled by its task, or a recording `cancel()` is already discarding.
+        let cancelled = continuation != nil && (isStartCancelled || discardsFinishedRecording)
+        isStartCancelled = false
+        if cancelled {
+            // Stop it, drop the file when the finish arrives, and fail `start()` rather than
+            // report a recording nobody will stop.
+            discardsFinishedRecording = true
+            currentState = .finalizing
+        }
         lock.unlock()
+        if cancelled {
+            PRMLog.notice(.capture, "Recording started after start() was cancelled; stopping it")
+            output.stopRecording()
+            continuation?.resume(throwing: PRMSessionError.cancelled)
+            return
+        }
         continuation?.resume()
     }
 
@@ -261,20 +333,92 @@ extension PRMVideoRecorder: AVCaptureFileOutputRecordingDelegate {
         _ output: AVCaptureFileOutput,
         didFinishRecordingTo outputFileURL: URL,
         from connections: [AVCaptureConnection],
-        error: Error?
+        error: (any Error)?
     ) {
         lock.lock()
-        let continuation = stopContinuation
-        stopContinuation = nil
-        let startedAt: Date? = if case let .recording(_, started) = state { started } else { nil }
-        state = .idle
-        lock.unlock()
-
-        if let error {
-            continuation?.resume(throwing: PRMSessionError.videoRecordingFailed(error.localizedDescription))
+        if let activeURL, activeURL.lastPathComponent != outputFileURL.lastPathComponent {
+            lock.unlock()
+            PRMLog.warning(.capture, "Ignoring a finish for a recording that isn't the active one", private: outputFileURL.path)
             return
         }
-        let duration = startedAt.map { Date().timeIntervalSince($0) } ?? 0
+        let continuation = stopContinuation
+        stopContinuation = nil
+        // A finish that arrives while `start()` is still waiting means recording failed (or
+        // was stopped) before it began; `didStartRecordingTo` will never come, so resume it
+        // here or `start()` hangs.
+        let pendingStart = startContinuation
+        startContinuation = nil
+        let startCancelled = isStartCancelled
+        isStartCancelled = false
+        let discards = discardsFinishedRecording
+        discardsFinishedRecording = false
+        let startedAt: Date? = if case let .recording(_, started) = currentState { started } else { finalizingStartedAt }
+        finalizingStartedAt = nil
+        activeURL = nil
+        recordingOutput = nil
+        currentState = .idle
+        lock.unlock()
+
+        let recordedSeconds = CMTimeGetSeconds(output.recordedDuration)
+        let summary = "\(recordedSeconds.isFinite ? String(format: "%.1f", recordedSeconds) : "?") s, \(output.recordedFileSize) bytes"
+
+        if discards, pendingStart == nil {
+            PRMLog.notice(.capture, "Discarded the cancelled recording (\(summary))", private: outputFileURL.path, error: error)
+            PRMTempFile.remove(outputFileURL)
+            continuation?.resume(throwing: PRMSessionError.cancelled)
+            return
+        }
+
+        if let pendingStart {
+            if startCancelled || discards {
+                PRMLog.notice(.capture, "Recording cancelled before it started")
+                pendingStart.resume(throwing: PRMSessionError.cancelled)
+            } else if let error {
+                PRMLog.error(.capture, "Recording failed before it started", private: outputFileURL.path, error: error)
+                pendingStart.resume(throwing: Self.sessionError(for: error))
+            } else {
+                PRMLog.error(.capture, "Recording finished before it started", private: outputFileURL.path)
+                pendingStart.resume(throwing: PRMSessionError.videoRecordingFailed("Recording finished before it started"))
+            }
+            // The caller never sees this URL, so nothing else will clean it up.
+            PRMTempFile.remove(outputFileURL)
+            continuation?.resume(throwing: PRMSessionError.videoRecordingFailed("Recording never started"))
+            return
+        }
+
+        // AVFoundation measures what it wrote; the wall clock is the fallback (tests, or a
+        // file output that reports nothing).
+        let duration = recordedSeconds.isFinite && recordedSeconds > 0
+            ? recordedSeconds
+            : startedAt.map { Date().timeIntervalSince($0) } ?? 0
+        if let error {
+            // AVFoundation can report an error for a recording that still finished
+            // (maximum duration or file size reached, for example): that file is usable.
+            let finished = (error as NSError).userInfo[AVErrorRecordingSuccessfullyFinishedKey] as? Bool ?? false
+            if finished {
+                PRMLog.notice(.capture, "Recording finished with a limit reached (\(summary))", private: outputFileURL.path, error: error)
+                continuation?.resume(returning: PRMRecording(url: outputFileURL, duration: duration))
+                return
+            }
+            if continuation == nil {
+                PRMLog.error(
+                    .capture,
+                    "Recording ended with an error while no stop() was pending (\(summary))",
+                    private: outputFileURL.path,
+                    error: error
+                )
+            } else {
+                PRMLog.error(.capture, "Recording failed (\(summary))", private: outputFileURL.path, error: error)
+            }
+            continuation?.resume(throwing: Self.sessionError(for: error))
+            return
+        }
+        if continuation == nil {
+            // The session stopped underneath the recording.
+            PRMLog.notice(.capture, "Recording finished while no stop() was pending (\(summary))", private: outputFileURL.path)
+        } else {
+            PRMLog.notice(.capture, "Recording finished: \(summary)", private: outputFileURL.path)
+        }
         continuation?.resume(returning: PRMRecording(url: outputFileURL, duration: duration))
     }
 }

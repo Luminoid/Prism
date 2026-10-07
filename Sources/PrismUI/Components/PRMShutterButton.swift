@@ -45,9 +45,7 @@
             set {
                 let clamped = max(newValue, 44)
                 if clamped != newValue {
-                    PRMLogger.general.warning(
-                        "PRMShutterButton.buttonSize (\(newValue, privacy: .public)) below 44pt HIG minimum; clamped to 44."
-                    )
+                    PRMLog.warning(.general, "PRMShutterButton.buttonSize (\(newValue)) below 44pt HIG minimum; clamped to 44.")
                 }
                 guard clamped != effectiveButtonSize else { return }
                 effectiveButtonSize = clamped
@@ -58,9 +56,20 @@
 
         private var effectiveButtonSize: CGFloat = 76
 
-        public var onTap: (() -> Void)?
-        public var onLongPressBegan: (() -> Void)?
+        public var onTap: (() -> Void)? {
+            didSet { updateAccessibility() }
+        }
+
+        /// Press-and-hold start (QuickTake-style video). VoiceOver users get the hold as a
+        /// custom action ("Start video recording", then "Stop video recording").
+        public var onLongPressBegan: (() -> Void)? {
+            didSet { updateAccessibility() }
+        }
+
         public var onLongPressEnded: (() -> Void)?
+
+        /// Plays a light impact on each tap and press-and-hold start. Off by default.
+        public var hapticsEnabled = false
 
         public private(set) var mode: Mode = .photo
 
@@ -68,6 +77,8 @@
 
         private let ringView = UIView()
         private let innerView = UIView()
+        /// Whether a press-and-hold (or its VoiceOver action) is under way.
+        private var isHolding = false
 
         // MARK: - Init
 
@@ -84,8 +95,8 @@
         private func setup() {
             backgroundColor = .clear
             isAccessibilityElement = true
-            accessibilityLabel = String(localized: "Capture", bundle: .module)
             accessibilityTraits = .button
+            updateAccessibility()
 
             addSubview(ringView)
             ringView.addSubview(innerView)
@@ -134,6 +145,55 @@
             guard mode != self.mode else { return }
             self.mode = mode
             applyMode(animated: animated)
+            updateAccessibility()
+        }
+
+        // MARK: - Accessibility
+
+        /// The label follows the mode (VoiceOver reads what a tap will do), and the
+        /// press-and-hold gesture, which VoiceOver can't perform, is offered as custom actions.
+        private func updateAccessibility() {
+            accessibilityLabel = switch mode {
+            case .photo: String(localized: "Capture", bundle: .module)
+            case .recording: String(localized: "Start recording", bundle: .module)
+            case .recordingActive: String(localized: "Stop recording", bundle: .module)
+            }
+            guard onLongPressBegan != nil else {
+                accessibilityCustomActions = nil
+                return
+            }
+            let action = if isHolding {
+                UIAccessibilityCustomAction(name: String(localized: "Stop video recording", bundle: .module)) { [weak self] _ in
+                    self?.endHold()
+                    return true
+                }
+            } else {
+                UIAccessibilityCustomAction(name: String(localized: "Start video recording", bundle: .module)) { [weak self] _ in
+                    self?.beginHold()
+                    return true
+                }
+            }
+            accessibilityCustomActions = [action]
+        }
+
+        private func beginHold() {
+            guard !isHolding else { return }
+            isHolding = true
+            playHaptic()
+            onLongPressBegan?()
+            updateAccessibility()
+        }
+
+        private func endHold() {
+            guard isHolding else { return }
+            isHolding = false
+            onLongPressEnded?()
+            updateAccessibility()
+        }
+
+        private func playHaptic() {
+            guard hapticsEnabled else { return }
+            UIImpactFeedbackGenerator(style: .light, view: self).impactOccurred()
         }
 
         private func applyMode(animated: Bool) {
@@ -196,15 +256,16 @@
         // MARK: - Gestures
 
         @objc private func handleTap() {
+            playHaptic()
             onTap?()
         }
 
         @objc private func handleLongPress(_ gesture: UILongPressGestureRecognizer) {
             switch gesture.state {
             case .began:
-                onLongPressBegan?()
+                beginHold()
             case .ended, .cancelled:
-                onLongPressEnded?()
+                endHold()
             default: break
             }
         }

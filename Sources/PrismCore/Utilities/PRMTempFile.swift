@@ -35,33 +35,31 @@ public enum PRMTempFile: Sendable {
         do {
             contents = try fileManager.contentsOfDirectory(at: url, includingPropertiesForKeys: nil)
         } catch {
-            PRMLogger.general.warning(
-                "PRMTempFile.clearAll: cannot list \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)"
-            )
+            PRMLog.warning(.general, "PRMTempFile.clearAll: cannot list the temp directory", private: url.path, error: error)
             return
         }
         for fileURL in contents {
             do {
                 try fileManager.removeItem(at: fileURL)
             } catch {
-                PRMLogger.general.warning(
-                    "PRMTempFile.clearAll: cannot remove \(fileURL.path, privacy: .public): \(error.localizedDescription, privacy: .public)"
-                )
+                PRMLog.warning(.general, "PRMTempFile.clearAll: cannot remove a file", private: fileURL.path, error: error)
             }
         }
     }
 
-    /// Removes a single file. Returns `true` if the file existed and was removed.
-    /// Failures are logged at warning level.
+    /// Removes a single file. Returns `true` if the file existed and was removed. A file
+    /// that doesn't exist returns `false` silently (a Live Photo movie that was never
+    /// written, a second cleanup of the same file); other failures are logged at warning
+    /// level.
     @discardableResult
     public static func remove(_ url: URL) -> Bool {
         do {
             try FileManager.default.removeItem(at: url)
             return true
+        } catch CocoaError.fileNoSuchFile {
+            return false
         } catch {
-            PRMLogger.general.warning(
-                "PRMTempFile.remove: cannot remove \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)"
-            )
+            PRMLog.warning(.general, "PRMTempFile.remove: cannot remove a file", private: url.path, error: error)
             return false
         }
     }
@@ -92,9 +90,7 @@ public enum PRMTempFile: Sendable {
                 options: [.skipsHiddenFiles]
             )
         } catch {
-            PRMLogger.general.warning(
-                "PRMTempFile.sweepStaleFiles: cannot list \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)"
-            )
+            PRMLog.warning(.general, "PRMTempFile.sweepStaleFiles: cannot list the temp directory", private: url.path, error: error)
             return
         }
         var removed = 0
@@ -106,15 +102,11 @@ public enum PRMTempFile: Sendable {
                 try fileManager.removeItem(at: fileURL)
                 removed += 1
             } catch {
-                PRMLogger.general.warning(
-                    "PRMTempFile.sweepStaleFiles: cannot remove \(fileURL.path, privacy: .public): \(error.localizedDescription, privacy: .public)"
-                )
+                PRMLog.warning(.general, "PRMTempFile.sweepStaleFiles: cannot remove a file", private: fileURL.path, error: error)
             }
         }
         if removed > 0 {
-            PRMLogger.general.notice(
-                "PRMTempFile.sweepStaleFiles: removed \(removed, privacy: .public) stale file(s) older than \(Int(maxAge), privacy: .public)s"
-            )
+            PRMLog.notice(.general, "PRMTempFile.sweepStaleFiles: removed \(removed) stale file(s) older than \(Int(maxAge))s")
         }
     }
 
@@ -126,9 +118,7 @@ public enum PRMTempFile: Sendable {
         do {
             try fileManager.createDirectory(at: url, withIntermediateDirectories: true)
         } catch {
-            PRMLogger.general.error(
-                "PRMTempFile: cannot create directory \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)"
-            )
+            PRMLog.error(.general, "PRMTempFile: cannot create the temp directory", private: url.path, error: error)
         }
     }
 }

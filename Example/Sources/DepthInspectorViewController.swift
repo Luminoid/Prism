@@ -1,5 +1,6 @@
 @preconcurrency import AVFoundation
 import CoreImage
+import os
 import PrismCore
 import PrismUI
 import SnapKit
@@ -7,298 +8,302 @@ import UIKit
 
 // MARK: - DepthInspectorViewController
 
-/// Live depth-data inspector built on `PRMDepthCapture`.
+/// Live depth next to the color preview.
 ///
-/// Exercises the entire `PRMDepthCapture` enum:
-/// - `isSupported(on:)` to gate the UI,
-/// - `setEnabled(_:on:)` / `isEnabled(on:)` to toggle depth delivery on the photo output,
-/// - `addDepthDataOutput(to:delegate:queue:)` to attach a live `AVCaptureDepthDataOutput`,
-/// - `setFiltering(_:on:)` to toggle the temporal smoothing filter.
+/// Exercises the depth surface:
+/// - `PRMCamera.enableDepthFormat()` to move to a format that streams depth,
+/// - `PRMDepthCapture.isSupported(on:)` to gate the UI,
+/// - `PRMDepthCapture.setEnabled(_:on:)` for depth delivery on the photo output,
+/// - `PRMCameraSession.attachDepthDataOutput(delegate:queue:filteringEnabled:)` for the live
+///   stream, which the session keeps across reconfigures,
+/// - `PRMDepthCapture.setFiltering(_:on:)` for the temporal smoothing filter.
 ///
-/// The depth map is converted to a grayscale CIImage and pushed to a `PRMPreviewView` next to
-/// the color preview so the two streams can be compared side-by-side.
+/// The depth map is converted to grayscale and drawn by a second `PRMPreviewView`, sized and
+/// fitted like the color preview so the two line up point for point.
 @MainActor
 final class DepthInspectorViewController: UIViewController {
-    // MARK: - Camera / pipeline
+    // MARK: - Properties
 
-    private let camera = PRMCamera()
-    private let pipeline = PRMFilterPipeline()
-
-    /// Two render contexts so the color and depth previews don't fight over a Metal command queue.
-    private let colorContext: PRMRenderContext = {
-        guard let context = PRMRenderContext(name: "DepthInspector.Color") else {
-            fatalError("Metal is unavailable on this device — Prism preview requires Metal.")
-        }
-        return context
-    }()
-
-    private let depthContext: PRMRenderContext = {
-        guard let context = PRMRenderContext(name: "DepthInspector.Depth") else {
-            fatalError("Metal is unavailable on this device — Prism preview requires Metal.")
-        }
-        return context
-    }()
-
-    private lazy var colorPreview = PRMPreviewView(context: colorContext)
+    private let host = CameraPreviewHost(name: "DepthInspector.Color")
+    /// A second render context, so the color and depth previews don't share a command queue.
+    private let depthContext = CameraPreviewHost.makeRenderContext(name: "DepthInspector.Depth")
     private lazy var depthPreview = PRMPreviewView(context: depthContext)
+    private lazy var depthDelegate = DepthDelegate(context: depthContext, previewView: depthPreview)
+    private let depthQueue = DispatchQueue(label: "dev.luminoid.prism.example.depth", qos: .userInitiated)
+    /// The live-preview and smoothing switches' camera calls, latest wins.
+    private let runner = LatestWinsRunner()
+    private lazy var toaster = ToastPresenter(hostView: view, below: host.previewView.snp.top)
 
-    private var depthOutput: AVCaptureDepthDataOutput?
-    private let depthQueue = DispatchQueue(label: "com.luminoid.PrismExample.Depth", qos: .userInitiated)
-    private let depthDelegate = DepthDelegate()
+    // MARK: - Views
 
-    // MARK: - UI
+    private lazy var statusLabel: PaddedLabel = {
+        let label = PaddedLabel()
+        label.text = "Checking depth support…"
+        label.font = ExampleFont.scaled(13, weight: .medium, style: .footnote)
+        label.textColor = .white
+        label.backgroundColor = UIColor.white.withAlphaComponent(0.08)
+        label.numberOfLines = 0
+        return label
+    }()
 
-    private let statusLabel = UILabel()
-    private let filteringSwitch = UISwitch()
-    private let enabledSwitch = UISwitch()
-    private let filteringLabel = UILabel()
-    private let enabledLabel = UILabel()
-    private let toolbar = UIStackView()
+    private lazy var enabledSwitch: UISwitch = {
+        // On by default: the boot attaches the live depth output whenever the camera supports
+        // depth, so the tile paints from the first frame. Off hides the tile and turns
+        // photo-output depth delivery off.
+        let toggle = UISwitch()
+        toggle.isOn = true
+        toggle.isEnabled = false
+        toggle.accessibilityLabel = "Live depth preview"
+        toggle.addAction(UIAction { [weak self] action in
+            guard let self, let toggle = action.sender as? UISwitch else { return }
+            setDepthEnabled(toggle.isOn)
+        }, for: .valueChanged)
+        return toggle
+    }()
+
+    private lazy var filteringSwitch: UISwitch = {
+        // Off by default, so raw depth jitter can be compared with the smoothed stream.
+        let toggle = UISwitch()
+        toggle.isOn = false
+        toggle.isEnabled = false
+        toggle.accessibilityLabel = "Temporal smoothing"
+        toggle.addAction(UIAction { [weak self] action in
+            guard let self, let toggle = action.sender as? UISwitch else { return }
+            setFiltering(toggle.isOn)
+        }, for: .valueChanged)
+        return toggle
+    }()
 
     // MARK: - Lifecycle
 
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .black
-        overrideUserInterfaceStyle = .dark
         navigationItem.title = "Depth Inspector"
+        navigationItem.largeTitleDisplayMode = .never
+        host.delegate = self
         setupLayout()
-        wireDepthDelegate()
-        Task { await bootCamera() }
     }
 
-    override func viewWillDisappear(_ animated: Bool) {
-        super.viewWillDisappear(animated)
-        Task { await camera.stop() }
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        host.viewWillAppear()
+    }
+
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        runner.cancelAll()
+        host.viewDidDisappear()
     }
 
     // MARK: - Layout
 
+    /// Laid out bottom-up so the switches and status always fit: they pin to the safe area's
+    /// bottom and the two previews share the space above equally. Both previews use the same
+    /// rotation and `.fit`, so a point in the color tile sits at the same place in the depth
+    /// tile.
     private func setupLayout() {
-        // Color + depth share the same rotation and contentFit so a feature at view
-        // coordinate (x, y) in the color preview lines up with the same coordinate in
-        // the depth preview. The previous setup used `.fill` for color and `.fit` for
-        // depth, which only matched if the screen happened to share the sensor's
-        // aspect ratio — on every iPhone with a different half-screen aspect the depth
-        // map would visibly slide vs. the color frame as the user moved the camera.
-        // Both use `.fit` (letterbox the full sensor frame) so the user can directly
-        // compare a point's depth against the corresponding color pixel.
-        // Both previews use identical sizing + contentFit so the depth tile spatially
-        // tracks the color tile. Equal heights (was 0.45 / 0.40 — slightly uneven) keep
-        // the rotated portrait frames the same physical size, so a point in the color
-        // preview lines up vertically with the same point in the depth preview.
-        // Lay out from BOTTOM up so the toolbar + status block always fit. Top-down
-        // layout with `colorPreview.height = view.height * 0.42` + `depthPreview.height =
-        // colorPreview.height` + status + toolbar overflowed the bottom safe area on
-        // shorter devices (depth tile got clipped 20-40 pt). Bottom-up: toolbar pins to
-        // safeArea.bottom, status pins above toolbar, color + depth share the remaining
-        // top region equally.
+        let toolbar = UIStackView(arrangedSubviews: [
+            makeSwitchRow(title: "Live depth preview", toggle: enabledSwitch),
+            makeSwitchRow(title: "Temporal smoothing (PRMDepthCapture.setFiltering)", toggle: filteringSwitch),
+        ])
         toolbar.axis = .vertical
         toolbar.spacing = 12
         view.addSubview(toolbar)
-
-        statusLabel.text = "Checking depth support…"
-        statusLabel.font = .systemFont(ofSize: 13, weight: .medium)
-        statusLabel.textColor = .white
-        statusLabel.numberOfLines = 0
         view.addSubview(statusLabel)
 
-        view.addSubview(colorPreview)
-        colorPreview.rotation = .rotate90
+        let colorPreview = host.previewView
         colorPreview.contentFit = .fit
+        view.addSubview(colorPreview)
         colorPreview.snp.makeConstraints {
             $0.top.equalTo(view.safeAreaLayoutGuide)
             $0.leading.trailing.equalToSuperview()
         }
-        addLabel("COLOR", on: colorPreview)
+        addTileLabel("COLOR", on: colorPreview)
 
-        view.addSubview(depthPreview)
-        depthPreview.rotation = .rotate90
         depthPreview.contentFit = .fit
+        view.addSubview(depthPreview)
         depthPreview.snp.makeConstraints {
             $0.top.equalTo(colorPreview.snp.bottom)
             $0.leading.trailing.equalToSuperview()
             $0.height.equalTo(colorPreview)
-            // Anchor depth's bottom to the status label's top so the two previews share
-            // whatever vertical room is left after the toolbar + status block reserve
-            // their height. No more clipping on shorter devices.
             $0.bottom.equalTo(statusLabel.snp.top).offset(-12)
         }
-        addLabel("DEPTH", on: depthPreview)
+        addTileLabel("DEPTH", on: depthPreview)
 
         statusLabel.snp.makeConstraints {
             $0.bottom.equalTo(toolbar.snp.top).offset(-12)
-            $0.leading.equalToSuperview().offset(16)
-            $0.trailing.equalToSuperview().offset(-16)
+            $0.leading.trailing.equalToSuperview().inset(16)
         }
-
-        enabledLabel.text = "Live depth preview"
-        enabledLabel.textColor = .white
-        enabledLabel.font = .systemFont(ofSize: 13)
-        let enabledRow = UIStackView(arrangedSubviews: [enabledLabel, enabledSwitch])
-        enabledRow.axis = .horizontal
-        enabledRow.alignment = .center
-        enabledRow.distribution = .equalSpacing
-        // Default ON: bootCamera() attaches the live depth output unconditionally when
-        // the device supports depth, so the depth tile is painting from the first frame.
-        // Starting the switch OFF made the toggle look broken — flipping it to ON had
-        // no visible effect because the preview was already active. Mirror reality: ON
-        // by default, flip OFF to mask the tile via alpha (delegate keeps publishing,
-        // we just gate at the view layer for a fast, allocation-free hide).
-        enabledSwitch.isOn = true
-        enabledSwitch.addAction(UIAction { [weak self] _ in self?.toggleDepthEnabled() }, for: .valueChanged)
-
-        filteringLabel.text = "Temporal smoothing (PRMDepthCapture.setFiltering)"
-        filteringLabel.textColor = .white
-        filteringLabel.font = .systemFont(ofSize: 13)
-        let filteringRow = UIStackView(arrangedSubviews: [filteringLabel, filteringSwitch])
-        filteringRow.axis = .horizontal
-        filteringRow.alignment = .center
-        filteringRow.distribution = .equalSpacing
-        // Default OFF so the user can compare raw depth jitter vs smoothed on demand —
-        // smoothing is a quality-of-life knob, not the default state of the API.
-        filteringSwitch.isOn = false
-        filteringSwitch.addAction(UIAction { [weak self] _ in self?.toggleFiltering() }, for: .valueChanged)
-
-        toolbar.addArrangedSubview(enabledRow)
-        toolbar.addArrangedSubview(filteringRow)
         toolbar.snp.makeConstraints {
-            $0.leading.equalToSuperview().offset(16)
-            $0.trailing.equalToSuperview().offset(-16)
+            $0.leading.trailing.equalToSuperview().inset(16)
             $0.bottom.equalTo(view.safeAreaLayoutGuide).offset(-16)
         }
     }
 
-    private func addLabel(_ text: String, on preview: PRMPreviewView) {
+    private func makeSwitchRow(title: String, toggle: UISwitch) -> UIView {
         let label = UILabel()
+        label.text = title
+        label.textColor = .white
+        label.font = ExampleFont.scaled(13, style: .subheadline)
+        label.adjustsFontForContentSizeCategory = true
+        label.numberOfLines = 0
+        // The switch carries the label for VoiceOver.
+        label.isAccessibilityElement = false
+        toggle.setContentCompressionResistancePriority(.required, for: .horizontal)
+        let row = UIStackView(arrangedSubviews: [label, toggle])
+        row.axis = .horizontal
+        row.alignment = .center
+        row.spacing = 12
+        return row
+    }
+
+    private func addTileLabel(_ text: String, on preview: PRMPreviewView) {
+        let label = PaddedLabel()
+        label.insets = UIEdgeInsets(top: 3, left: 8, bottom: 3, right: 8)
         label.text = text
         label.textColor = UIColor.white.withAlphaComponent(0.85)
-        label.font = .monospacedSystemFont(ofSize: 10, weight: .bold)
+        label.font = ExampleFont.monospaced(10, weight: .bold, style: .caption2, maximum: 14)
         label.backgroundColor = UIColor.black.withAlphaComponent(0.5)
-        label.textAlignment = .center
-        label.layer.cornerRadius = 4
-        label.layer.masksToBounds = true
         view.addSubview(label)
         label.snp.makeConstraints {
             $0.top.equalTo(preview).offset(8)
             $0.leading.equalTo(preview).offset(12)
-            $0.width.equalTo(60)
-            $0.height.equalTo(20)
         }
-    }
-
-    private func wireDepthDelegate() {
-        depthDelegate.context = depthContext
-        depthDelegate.previewView = depthPreview
-        // The "Photo-output depth delivery" toggle drives a flag the live-depth delegate
-        // checks before painting. Without this the toggle had no visible effect: it only
-        // gated `AVCapturePhotoOutput.isDepthDataDeliveryEnabled`, which is photo-only,
-        // not the live preview. The live preview comes from a separately-attached
-        // `AVCaptureDepthDataOutput`, so we drop frames at the delegate level to mirror
-        // the photo gate's intent visually.
-        depthDelegate.isDeliveryEnabled = true
-    }
-
-    // MARK: - Boot
-
-    private func bootCamera() async {
-        if PRMPermissions.cameraStatus() == .notDetermined {
-            _ = await PRMPermissions.requestCameraAccess()
-        }
-
-        do {
-            var config = PRMCameraConfiguration()
-            // Devices without dual/triple cameras can't deliver depth — request anyway, and let
-            // PRMDepthCapture.isSupported tell us at runtime.
-            config.enableDepthDataDelivery = true
-            try await camera.configure(config)
-        } catch {
-            statusLabel.text = "Cannot start camera: \(error.localizedDescription)"
-            return
-        }
-
-        pipeline.isEnabled = true
-        await camera.session.setVideoDataOutputDelegate(pipeline)
-        pipeline.onFrame = { [weak self] frame in
-            self?.colorPreview.update(frame.pixelBuffer)
-        }
-
-        await PRMCameraActor.shared.run { [self] in
-            guard let photoOutput = await camera.session.photoOutput else { return }
-            let supported = PRMDepthCapture.isSupported(on: photoOutput)
-            await MainActor.run {
-                // Switch reflects the live-preview gate, NOT
-                // `AVCapturePhotoOutput.isDepthDataDeliveryEnabled` (which is photo-side
-                // and starts false until a capture requests depth). The live tile is
-                // painting from the first depth frame, so default the switch ON when
-                // depth is supported. Off means "stop painting depth on screen."
-                self.enabledSwitch.isOn = supported
-                self.enabledSwitch.isEnabled = supported
-                self.filteringSwitch.isEnabled = supported
-                self.depthPreview.alpha = supported ? 1.0 : 0.0
-                self.depthDelegate.isDeliveryEnabled = supported
-                self.statusLabel.text = supported
-                    ? "Live depth preview on. Toggle smoothing to compare jitter."
-                    : "This device's camera does not deliver depth data (no dual/triple/TrueDepth camera)."
-            }
-            guard supported else { return }
-            // Also flip the photo-output delivery on so a subsequent depth-aware
-            // capture would land — keeps the toggle's name ("Live depth preview")
-            // semantically aligned with both surfaces.
-            PRMDepthCapture.setEnabled(true, on: photoOutput)
-            // Attach a live depth output so PRMPreviewView can render depth frames.
-            if let session = await camera.session.session as AVCaptureSession?,
-               let output = PRMDepthCapture.addDepthDataOutput(
-                   to: session,
-                   delegate: depthDelegate,
-                   queue: depthQueue
-               ) {
-                PRMDepthCapture.setFiltering(false, on: output)
-                await MainActor.run { self.depthOutput = output }
-            }
-        }
-
-        await camera.start()
     }
 
     // MARK: - Actions
 
-    private func toggleDepthEnabled() {
-        let target = enabledSwitch.isOn
-        // Mirror the toggle into the live-preview gate so flipping it actually changes
-        // what the user sees on screen (otherwise it only affects photo capture). Off →
-        // fully hide the depth tile so the user gets unambiguous feedback that the
-        // toggle worked; on → restore full opacity and let the delegate push frames again.
-        depthDelegate.isDeliveryEnabled = target
-        UIView.animate(withDuration: 0.2) { [self] in
-            depthPreview.alpha = target ? 1.0 : 0.0
+    /// Off hides the tile and stops the delegate drawing (cheaper than detaching the output),
+    /// and turns photo-output depth delivery off as well.
+    private func setDepthEnabled(_ enabled: Bool) {
+        depthDelegate.isDeliveryEnabled = enabled
+        let alpha: CGFloat = enabled ? 1 : 0
+        if UIAccessibility.isReduceMotionEnabled {
+            depthPreview.alpha = alpha
+        } else {
+            UIView.animate(withDuration: 0.2) { [depthPreview] in depthPreview.alpha = alpha }
         }
-        statusLabel.text = target
+        statusLabel.text = enabled
             ? "Live depth preview on. Toggle smoothing to compare jitter."
             : "Live depth preview off (photo-output delivery also off)."
-        Task { @PRMCameraActor in
-            guard let photoOutput = await camera.session.photoOutput else { return }
-            PRMDepthCapture.setEnabled(target, on: photoOutput)
+        runner.run("delivery") { [session = host.camera.session] in
+            await Self.setPhotoDepthDelivery(enabled, on: session)
         }
     }
 
-    private func toggleFiltering() {
-        guard let output = depthOutput else { return }
-        PRMDepthCapture.setFiltering(filteringSwitch.isOn, on: output)
+    private func setFiltering(_ enabled: Bool) {
+        runner.run("filtering") { [session = host.camera.session] in
+            await Self.setDepthFiltering(enabled, on: session)
+        }
+    }
+
+    // MARK: - Camera actor helpers
+
+    @PRMCameraActor
+    private static func photoOutputSupportsDepth(_ session: PRMCameraSession) -> Bool {
+        session.photoOutput.map(PRMDepthCapture.isSupported(on:)) ?? false
+    }
+
+    @PRMCameraActor
+    private static func setPhotoDepthDelivery(_ enabled: Bool, on session: PRMCameraSession) {
+        guard let photoOutput = session.photoOutput else { return }
+        PRMDepthCapture.setEnabled(enabled, on: photoOutput)
+    }
+
+    @PRMCameraActor
+    private static func setDepthFiltering(_ enabled: Bool, on session: PRMCameraSession) {
+        guard let output = session.depthDataOutput else { return }
+        PRMDepthCapture.setFiltering(enabled, on: output)
     }
 }
 
-// MARK: - Depth delegate
+// MARK: - CameraPreviewHostDelegate
 
+extension DepthInspectorViewController: CameraPreviewHostDelegate {
+    func cameraHostConfigure(_ host: CameraPreviewHost) async throws {
+        var configuration = PRMCameraConfiguration()
+        // Cameras without dual / triple / TrueDepth hardware can't deliver depth. Ask anyway
+        // and let the support check decide.
+        configuration.enableDepthDataDelivery = true
+        try await host.camera.configure(configuration)
+    }
+
+    func cameraHostDidConfigure(_ host: CameraPreviewHost) async {
+        // The `.photo` preset's default format on Pro iPhones streams no depth.
+        let hasDepthFormat = await host.camera.enableDepthFormat()
+        let session = host.camera.session
+        let supported = await Self.photoOutputSupportsDepth(session)
+        guard supported else {
+            depthPreview.alpha = 0
+            statusLabel.text = "This camera doesn't deliver depth data (no dual, triple or TrueDepth camera)."
+            return
+        }
+        // Delivery on the photo output too, so a depth-aware capture would get depth.
+        await Self.setPhotoDepthDelivery(true, on: session)
+        do {
+            try await session.attachDepthDataOutput(delegate: depthDelegate, queue: depthQueue, filteringEnabled: filteringSwitch.isOn)
+        } catch {
+            statusLabel.text = "Couldn't attach the depth stream."
+            toaster.report(error, context: "Depth stream")
+            return
+        }
+        enabledSwitch.isEnabled = true
+        filteringSwitch.isEnabled = true
+        depthDelegate.isDeliveryEnabled = enabledSwitch.isOn
+        depthPreview.alpha = enabledSwitch.isOn ? 1 : 0
+        statusLabel.text = hasDepthFormat
+            ? "Depth format active; live depth preview on. Toggle smoothing to compare jitter."
+            : "No depth-capable format on this camera; the depth stream may stay empty."
+    }
+
+    func cameraHost(_: CameraPreviewHost, didFailToConfigure error: any Error) {
+        statusLabel.text = "Cannot start the camera."
+        toaster.report(error, context: "Camera start")
+    }
+
+    func cameraHost(_: CameraPreviewHost, didReceive error: PRMSessionError) {
+        toaster.report(error, context: "Camera")
+    }
+
+    func cameraHost(_: CameraPreviewHost, didOrientPreview rotation: PRMPreviewView.Rotation, mirroring: Bool) {
+        // Depth maps arrive in the same sensor orientation as the color frames.
+        depthPreview.rotation = rotation
+        depthPreview.mirroring = mirroring
+    }
+}
+
+// MARK: - DepthDelegate
+
+/// Turns depth frames into grayscale pixel buffers for the depth preview, on the depth queue.
+///
+/// `isDeliveryEnabled` is written on the main actor and read on the depth queue, so it lives
+/// behind a lock; the pixel-buffer pool is only touched on the depth queue (a serial queue).
 private final class DepthDelegate: NSObject, AVCaptureDepthDataOutputDelegate, @unchecked Sendable {
-    var context: PRMRenderContext?
-    weak var previewView: PRMPreviewView?
-    /// Mirrors the "Photo-output depth delivery" toggle. When `false` the delegate drops
-    /// frames so the preview goes dark — mirrors the toggle's photo-side intent
-    /// visually. AVFoundation always streams from `AVCaptureDepthDataOutput` once
-    /// attached; we gate at the delegate instead of detaching the output (cheaper, no
-    /// session reconfig churn).
-    var isDeliveryEnabled: Bool = true
+    // MARK: - Properties
+
+    private let context: PRMRenderContext
+    private weak var previewView: PRMPreviewView?
+    private let deliveryEnabled = OSAllocatedUnfairLock(initialState: true)
+    private var cachedPool: CVPixelBufferPool?
+    private var cachedPoolWidth = 0
+    private var cachedPoolHeight = 0
+
+    /// When `false` the delegate drops frames and the tile stops updating.
+    var isDeliveryEnabled: Bool {
+        get { deliveryEnabled.withLock { $0 } }
+        set { deliveryEnabled.withLock { $0 = newValue } }
+    }
+
+    // MARK: - Init
+
+    init(context: PRMRenderContext, previewView: PRMPreviewView) {
+        self.context = context
+        self.previewView = previewView
+        super.init()
+    }
+
+    // MARK: - AVCaptureDepthDataOutputDelegate
 
     func depthDataOutput(
         _ output: AVCaptureDepthDataOutput,
@@ -307,43 +312,39 @@ private final class DepthDelegate: NSObject, AVCaptureDepthDataOutputDelegate, @
         connection: AVCaptureConnection
     ) {
         guard isDeliveryEnabled else { return }
-        // Convert disparity to a normalized grayscale CIImage and push to the depth preview.
-        let converted = depthData.depthDataType == kCVPixelFormatType_DisparityFloat32
+        let disparity = depthData.depthDataType == kCVPixelFormatType_DisparityFloat32
             ? depthData
             : depthData.converting(toDepthDataType: kCVPixelFormatType_DisparityFloat32)
-        let map = converted.depthDataMap
-        // Normalize disparity to 0...1 visually (CIImage already in float; clamp via tonemap).
-        let ciImage = CIImage(cvPixelBuffer: map)
-            .applyingFilter("CIColorControls", parameters: [
-                kCIInputSaturationKey: 0.0,
-                kCIInputContrastKey: 4.0,
-                kCIInputBrightnessKey: -0.2,
-            ])
-
-        guard let context, let pool = depthPool(width: CVPixelBufferGetWidth(map), height: CVPixelBufferGetHeight(map)) else { return }
-        var output: CVPixelBuffer?
-        CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &output)
-        guard let outputBuffer = output else { return }
-        context.ciContext.render(ciImage, to: outputBuffer)
-        previewView?.update(outputBuffer)
+        let map = disparity.depthDataMap
+        // Spread disparity across the visible range: desaturate and raise the contrast.
+        let image = CIImage(cvPixelBuffer: map).applyingFilter("CIColorControls", parameters: [
+            kCIInputSaturationKey: 0.0,
+            kCIInputContrastKey: 4.0,
+            kCIInputBrightnessKey: -0.2,
+        ])
+        guard let pool = depthPool(width: CVPixelBufferGetWidth(map), height: CVPixelBufferGetHeight(map)) else { return }
+        var buffer: CVPixelBuffer?
+        CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &buffer)
+        guard let buffer else { return }
+        context.ciContext.render(image, to: buffer)
+        // `update(_:)` is nonisolated and lock-protected.
+        previewView?.update(buffer)
     }
 
-    private var cachedPool: CVPixelBufferPool?
-    private var cachedPoolWidth: Int = 0
-    private var cachedPoolHeight: Int = 0
+    // MARK: - Helpers
 
     private func depthPool(width: Int, height: Int) -> CVPixelBufferPool? {
         if let cachedPool, cachedPoolWidth == width, cachedPoolHeight == height {
             return cachedPool
         }
-        let attrs: [String: Any] = [
+        let attributes: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
             kCVPixelBufferWidthKey as String: width,
             kCVPixelBufferHeightKey as String: height,
             kCVPixelBufferIOSurfacePropertiesKey as String: [:],
         ]
         var pool: CVPixelBufferPool?
-        CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attrs as CFDictionary, &pool)
+        CVPixelBufferPoolCreate(kCFAllocatorDefault, nil, attributes as CFDictionary, &pool)
         cachedPool = pool
         cachedPoolWidth = width
         cachedPoolHeight = height

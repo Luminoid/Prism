@@ -23,12 +23,13 @@
         /// Translucent backdrop dimming the camera preview when open. Tap to dismiss.
         public var dimsBackdrop: Bool = true
 
-        /// Title font. Override to match the host app's type ramp.
+        /// Title font at the default text size; it scales with Dynamic Type. Override to match
+        /// the host app's type ramp.
         public var titleFont: UIFont = .systemFont(ofSize: 16, weight: .bold) {
-            didSet { titleLabel.font = titleFont }
+            didSet { titleLabel.font = UIFontMetrics(forTextStyle: .headline).scaledFont(for: titleFont) }
         }
 
-        /// Section-header font.
+        /// Section-header font at the default text size, scaled with Dynamic Type.
         public var sectionHeaderFont: UIFont = .systemFont(ofSize: 10, weight: .heavy) {
             didSet { restyleSectionHeaders() }
         }
@@ -52,9 +53,10 @@
 
         // MARK: - Init
 
-        public init(title: String = "Camera") {
+        /// - Parameter title: The drawer's heading; "Camera" (localized) when `nil`.
+        public init(title: String? = nil) {
             super.init(frame: .zero)
-            setup(title: title)
+            setup(title: title ?? String(localized: "Camera", bundle: .module))
         }
 
         @available(*, unavailable)
@@ -101,7 +103,9 @@
 
             titleLabel.text = title
             titleLabel.textColor = .white
-            titleLabel.font = titleFont
+            titleLabel.font = UIFontMetrics(forTextStyle: .headline).scaledFont(for: titleFont)
+            titleLabel.adjustsFontForContentSizeCategory = true
+            titleLabel.accessibilityTraits = .header
             titleLabel.translatesAutoresizingMaskIntoConstraints = false
             containerView.addSubview(titleLabel)
             NSLayoutConstraint.activate([
@@ -120,6 +124,7 @@
                 top: inset, leading: inset, bottom: inset, trailing: inset
             )
             closeButton.configuration = config
+            closeButton.accessibilityLabel = String(localized: "Close settings", bundle: .module)
             closeButton.translatesAutoresizingMaskIntoConstraints = false
             containerView.addSubview(closeButton)
             NSLayoutConstraint.activate([
@@ -156,6 +161,7 @@
                 stackView.trailingAnchor.constraint(equalTo: scrollView.trailingAnchor),
                 stackView.widthAnchor.constraint(equalTo: scrollView.widthAnchor),
             ])
+            applyAccessibilityState()
         }
 
         // MARK: - Open / close
@@ -164,6 +170,10 @@
             guard open != isOpen else { return }
             isOpen = open
             isUserInteractionEnabled = open
+            applyAccessibilityState()
+            if open {
+                UIAccessibility.post(notification: .screenChanged, argument: titleLabel)
+            }
             containerTrailingConstraint?.constant = open ? -drawerWidth : 0
             let block: () -> Void = { [self] in
                 superview?.layoutIfNeeded()
@@ -186,6 +196,21 @@
         @objc private func handleBackdropTap() {
             setOpen(false, animated: true)
             onClose?()
+        }
+
+        /// VoiceOver's two-finger scrub closes the open drawer, like the backdrop tap.
+        override public func accessibilityPerformEscape() -> Bool {
+            guard isOpen else { return false }
+            setOpen(false, animated: true)
+            onClose?()
+            return true
+        }
+
+        /// Closed, the drawer is off-screen and hidden from VoiceOver; open, it's modal, so
+        /// VoiceOver doesn't wander into the camera UI behind the backdrop.
+        private func applyAccessibilityState() {
+            accessibilityElementsHidden = !isOpen
+            accessibilityViewIsModal = isOpen
         }
 
         // MARK: - Population
@@ -230,7 +255,10 @@
             super.init(frame: .zero)
             label.text = title.uppercased()
             label.textColor = UIColor.white.withAlphaComponent(0.55)
-            label.font = font
+            label.font = Self.scaled(font)
+            label.adjustsFontForContentSizeCategory = true
+            label.accessibilityTraits = .header
+            label.accessibilityLabel = title
             label.letterSpacing = 1.2
             label.translatesAutoresizingMaskIntoConstraints = false
             addSubview(label)
@@ -248,7 +276,11 @@
         }
 
         func applyFont(_ font: UIFont) {
-            label.font = font
+            label.font = Self.scaled(font)
+        }
+
+        private static func scaled(_ font: UIFont) -> UIFont {
+            UIFontMetrics(forTextStyle: .caption2).scaledFont(for: font)
         }
     }
 

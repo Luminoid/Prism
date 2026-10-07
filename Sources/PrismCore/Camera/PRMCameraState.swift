@@ -68,6 +68,73 @@ public struct PRMCameraState: Sendable, Equatable {
     /// (low light, close subject, etc.), and that override shows up here.
     public var activePrimaryDeviceType: AVCaptureDevice.DeviceType?
 
+    // MARK: iOS 26 / 27 manual controls
+
+    /// Current lens 𝑓-number. Fixed on most hardware; varies with exposure on iOS 27
+    /// variable-aperture cameras.
+    public var lensAperture: Float
+
+    /// The exposure axes the auto-exposure system is currently driving. All three in the
+    /// auto modes, none in full manual, a subset in an iOS 27 priority mode. Before iOS 27
+    /// this is derived from ``exposureMode``.
+    public var autoExposureAxes: PRMExposureAxes
+
+    /// iOS 27: scene characteristics auto exposure is currently reacting to.
+    public var activeExposureSignals: Set<PRMExposureSignal>
+
+    /// iOS 27: whether the virtual device is locked to its ``activePrimaryDeviceType`` lens
+    /// (see ``PRMCamera/lockLens(_:)``).
+    public var isPrimaryConstituentLocked: Bool
+
+    // MARK: Session health
+
+    /// iOS 26: latest lens smudge detection result. `.disabled` unless detection is on.
+    public var lensSmudgeStatus: PRMLensSmudgeStatus
+
+    /// iOS 27: whether low-light video noise reduction is active on the recording (or,
+    /// without a movie output, the preview) connection.
+    public var isLowLightVideoNoiseReductionActive: Bool
+
+    /// Why the session is interrupted, when ``isInterrupted`` is `true`. iOS 26 adds
+    /// `.sensitiveContentMitigationActivated`.
+    public var interruptionReason: AVCaptureSession.InterruptionReason?
+
+    /// Thermal / power pressure on the capture device. iOS 27 adds `.batteryStress`.
+    public var systemPressure: PRMSystemPressure
+
+    // MARK: Subject tracking and Cinematic Video
+
+    /// iOS 27: whether continuous autofocus subject tracking is enabled.
+    public var isContinuousAutoFocusTrackingEnabled: Bool
+
+    /// iOS 27: whether a subject is currently being tracked for focus.
+    public var isContinuousAutoFocusTrackingSubjectAcquired: Bool
+
+    /// iOS 27: lens-position bias within the tracked subject's depth (-1 nearest … 1 farthest).
+    public var continuousAutoFocusTrackingBias: Float
+
+    /// iOS 26: whether Cinematic Video capture is enabled on the video input.
+    public var isCinematicVideoCaptureEnabled: Bool
+
+    /// iOS 26: Cinematic Video simulated aperture (𝑓-number of the depth-of-field effect).
+    /// `0` when Cinematic Video is off.
+    public var cinematicSimulatedAperture: Float
+
+    /// iOS 26: scene conditions degrading Cinematic Video (e.g. not enough light).
+    public var cinematicSceneStatuses: Set<PRMSceneMonitoringStatus>
+
+    /// iOS 27: whether the movie output is recording Cinematic Video metadata.
+    public var isCinematicVideoMetadataCaptureEnabled: Bool
+
+    // MARK: Dynamic aspect ratio
+
+    /// iOS 26: the device's current dynamic aspect ratio, or `nil` when the active format
+    /// doesn't support dynamic aspect ratios.
+    public var dynamicAspectRatio: PRMAspectRatio?
+
+    /// iOS 26: output buffer dimensions for ``dynamicAspectRatio``, or `nil` when unsupported.
+    public var dynamicDimensions: PRMVideoDimensions?
+
     public init(
         isRunning: Bool = false,
         zoomFactor: CGFloat = 1.0,
@@ -87,7 +154,24 @@ public struct PRMCameraState: Sendable, Equatable {
         isVideoHDREnabled: Bool = false,
         isLowLightBoostActive: Bool = false,
         isInterrupted: Bool = false,
-        activePrimaryDeviceType: AVCaptureDevice.DeviceType? = nil
+        activePrimaryDeviceType: AVCaptureDevice.DeviceType? = nil,
+        lensAperture: Float = 0,
+        autoExposureAxes: PRMExposureAxes = .all,
+        activeExposureSignals: Set<PRMExposureSignal> = [],
+        isPrimaryConstituentLocked: Bool = false,
+        lensSmudgeStatus: PRMLensSmudgeStatus = .disabled,
+        isLowLightVideoNoiseReductionActive: Bool = false,
+        interruptionReason: AVCaptureSession.InterruptionReason? = nil,
+        systemPressure: PRMSystemPressure = .nominal,
+        isContinuousAutoFocusTrackingEnabled: Bool = false,
+        isContinuousAutoFocusTrackingSubjectAcquired: Bool = false,
+        continuousAutoFocusTrackingBias: Float = 0,
+        isCinematicVideoCaptureEnabled: Bool = false,
+        cinematicSimulatedAperture: Float = 0,
+        cinematicSceneStatuses: Set<PRMSceneMonitoringStatus> = [],
+        isCinematicVideoMetadataCaptureEnabled: Bool = false,
+        dynamicAspectRatio: PRMAspectRatio? = nil,
+        dynamicDimensions: PRMVideoDimensions? = nil
     ) {
         self.isRunning = isRunning
         self.zoomFactor = zoomFactor
@@ -108,5 +192,22 @@ public struct PRMCameraState: Sendable, Equatable {
         self.isLowLightBoostActive = isLowLightBoostActive
         self.isInterrupted = isInterrupted
         self.activePrimaryDeviceType = activePrimaryDeviceType
+        self.lensAperture = lensAperture
+        self.autoExposureAxes = autoExposureAxes
+        self.activeExposureSignals = activeExposureSignals
+        self.isPrimaryConstituentLocked = isPrimaryConstituentLocked
+        self.lensSmudgeStatus = lensSmudgeStatus
+        self.isLowLightVideoNoiseReductionActive = isLowLightVideoNoiseReductionActive
+        self.interruptionReason = interruptionReason
+        self.systemPressure = systemPressure
+        self.isContinuousAutoFocusTrackingEnabled = isContinuousAutoFocusTrackingEnabled
+        self.isContinuousAutoFocusTrackingSubjectAcquired = isContinuousAutoFocusTrackingSubjectAcquired
+        self.continuousAutoFocusTrackingBias = continuousAutoFocusTrackingBias
+        self.isCinematicVideoCaptureEnabled = isCinematicVideoCaptureEnabled
+        self.cinematicSimulatedAperture = cinematicSimulatedAperture
+        self.cinematicSceneStatuses = cinematicSceneStatuses
+        self.isCinematicVideoMetadataCaptureEnabled = isCinematicVideoMetadataCaptureEnabled
+        self.dynamicAspectRatio = dynamicAspectRatio
+        self.dynamicDimensions = dynamicDimensions
     }
 }

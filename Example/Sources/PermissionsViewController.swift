@@ -8,6 +8,11 @@ import UIKit
 final class PermissionsViewController: UIViewController {
     private let cameraCard = PermissionCard(title: "Camera", symbol: "camera")
     private let micCard = PermissionCard(title: "Microphone", symbol: "microphone")
+    private var requestTask: Task<Void, Never>?
+
+    deinit {
+        requestTask?.cancel()
+    }
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -53,16 +58,16 @@ final class PermissionsViewController: UIViewController {
     // MARK: - Actions
 
     private func requestCamera() {
-        Task {
+        requestTask = Task { [weak self] in
             _ = await PRMPermissions.requestCameraAccess()
-            refresh()
+            self?.refresh()
         }
     }
 
     private func requestMicrophone() {
-        Task {
+        requestTask = Task { [weak self] in
             _ = await PRMPermissions.requestMicrophoneAccess()
-            refresh()
+            self?.refresh()
         }
     }
 

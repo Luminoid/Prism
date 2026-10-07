@@ -25,7 +25,8 @@
 
         // MARK: - Private
 
-        private var fadeOutTask: Task<Void, Never>?
+        /// `nonisolated(unsafe)` so `deinit` can cancel it; written only on the main actor.
+        private nonisolated(unsafe) var fadeOutTask: Task<Void, Never>?
 
         // MARK: - Init
 
@@ -37,6 +38,10 @@
         @available(*, unavailable)
         required init?(coder: NSCoder) {
             fatalError("Use init() instead")
+        }
+
+        deinit {
+            fadeOutTask?.cancel()
         }
 
         private func setup() {

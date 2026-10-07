@@ -35,4 +35,23 @@ struct PRMLensTests {
         #expect(set.contains(77)) // iPhone 15 Pro telephoto
         #expect(set.contains(120)) // iPhone 15 Pro Max 5x telephoto
     }
+
+    @Test
+    func `Field-of-view is the default focal length source`() {
+        let lens = PRMLens(zoomFactor: 1.0, displayZoomFactor: 1.0, focalLength35mm: 26)
+        #expect(lens.focalLengthSource == .fieldOfView)
+    }
+
+    @Test
+    func `Snapping leaves nominal focal lengths unchanged`() {
+        // iOS 26 nominal values already match the photo EXIF; snapping would only move them.
+        let lens = PRMLens(zoomFactor: 1.0, displayZoomFactor: 1.0, focalLength35mm: 28, focalLengthSource: .nominal)
+        #expect(lens.snapping() == lens)
+    }
+
+    @Test
+    func `Snapping keeps the focal length source`() {
+        let lens = PRMLens(zoomFactor: 1.0, displayZoomFactor: 1.0, focalLength35mm: 23.5)
+        #expect(lens.snapping().focalLengthSource == .fieldOfView)
+    }
 }

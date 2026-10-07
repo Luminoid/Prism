@@ -16,12 +16,11 @@ public actor PRMCameraActor {
 }
 
 public extension PRMCameraActor {
-    /// Runs an isolated closure on the actor and returns its result.
-    static func run<T: Sendable>(_ body: @Sendable () async -> T) async -> T {
-        await body()
-    }
-
-    /// Instance-method shim so callers can write `await PRMCameraActor.shared.run { ... }`.
+    /// Runs `body` and returns its result. The body is **not** isolated to the actor: it's a
+    /// `@Sendable` closure, so every `await` on actor state inside it is its own hop and other
+    /// work can run between them. Use it for independent reads. Anything that must check and
+    /// change session state atomically belongs in a synchronous `@PRMCameraActor` method on
+    /// ``PRMCameraSession`` (or a `Task { @PRMCameraActor in … }.value`).
     func run<T: Sendable>(_ body: @Sendable () async -> T) async -> T {
         await body()
     }

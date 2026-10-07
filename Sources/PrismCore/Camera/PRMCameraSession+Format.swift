@@ -47,18 +47,21 @@
         ///
         /// Without this re-apply, frames after a format swap arrive as YUV; our
         /// preview path hardcodes `bgra8Unorm` and the BufferPoolAllocator
-        /// requires `kCVPixelFormatType_32BGRA`, so the preview freezes. Re-writing
+        /// requires `kCVPixelFormatType_32BGRA`, so the preview freezes. The target is the
+        /// configured ``PRMCameraConfiguration/videoPixelFormat`` (BGRA by default), so an
+        /// app that asked for YUV keeps it. Re-writing
         /// `videoSettings` forces AVFoundation to validate against the new format
         /// — it honors the BGRA conversion when available, and we log a loud
         /// `.error` if BGRA isn't even in the list so the silent freeze becomes
         /// a single Console.app grep target.
         func refreshVideoDataOutputPixelFormat() {
             guard let output = videoDataOutput else { return }
-            let target = kCVPixelFormatType_32BGRA
+            let target = configuration?.videoPixelFormat ?? kCVPixelFormatType_32BGRA
             let available = output.availableVideoPixelFormatTypes
             guard available.contains(target) else {
-                PRMLogger.session.error(
-                    "videoDataOutput: BGRA not in availableVideoCVPixelFormatTypes after format swap (\(available, privacy: .public)) — preview may freeze"
+                PRMLog.error(
+                    .session,
+                    "videoDataOutput: \(PRMLog.fourCC(target)) not in availableVideoCVPixelFormatTypes after format swap (\(available.map(PRMLog.fourCC).joined(separator: ","))) — preview may freeze"
                 )
                 return
             }
@@ -86,7 +89,7 @@
             let matte = output.isPortraitEffectsMatteDeliveryEnabled
             let zsl = output.isZeroShutterLagEnabled
             let deferred = output.isAutoDeferredPhotoDeliveryEnabled
-            PRMLogger.trace(
+            PRMLog.debug(
                 .session,
                 """
                 applyAuxiliaryPhotoOutputFlags(highRes=\(highRes)) entry: \
@@ -95,15 +98,15 @@
             )
             if highRes {
                 if output.isLivePhotoCaptureEnabled {
-                    PRMLogger.session.notice("aux-flags(highRes=true): disabling isLivePhotoCaptureEnabled (was true)")
+                    PRMLog.notice(.session, "aux-flags(highRes=true): disabling isLivePhotoCaptureEnabled (was true)")
                     output.isLivePhotoCaptureEnabled = false
                 }
                 if output.isDepthDataDeliverySupported, output.isDepthDataDeliveryEnabled {
-                    PRMLogger.session.notice("aux-flags(highRes=true): disabling isDepthDataDeliveryEnabled (was true)")
+                    PRMLog.notice(.session, "aux-flags(highRes=true): disabling isDepthDataDeliveryEnabled (was true)")
                     output.isDepthDataDeliveryEnabled = false
                 }
                 if output.isPortraitEffectsMatteDeliverySupported, output.isPortraitEffectsMatteDeliveryEnabled {
-                    PRMLogger.session.notice("aux-flags(highRes=true): disabling isPortraitEffectsMatteDeliveryEnabled (was true)")
+                    PRMLog.notice(.session, "aux-flags(highRes=true): disabling isPortraitEffectsMatteDeliveryEnabled (was true)")
                     output.isPortraitEffectsMatteDeliveryEnabled = false
                 }
                 if output.isAutoDeferredPhotoDeliverySupported, output.isAutoDeferredPhotoDeliveryEnabled {
@@ -152,8 +155,62 @@
         /// virtual devices (`triple`, `dual`, `dualWide`) cap at 12MP regardless of the
         /// format chosen, so this helper is a no-op on those.
         func applyPreferredPhotoFormatIfNeeded() {
-            guard configuration?.prefersMaxPhotoDimensionsFormat == true else { return }
+            guard wantsHighResolutionPhotoFormat else { return }
             applyHighResolutionPhotoFormat()
+        }
+
+        /// Whether the session is on the 48MP-class photo format it was asked for: the
+        /// high-resolution format is wanted and the active format has more than 20MP of
+        /// landscape photo dimensions (the ceiling ``applyLivePhotoCompatibleFormat()`` scores
+        /// under). The area alone isn't enough: a Triple Camera's default format offers 24MP
+        /// (5712×4284) and still carries Live Photo and depth.
+        var isOnHighResolutionPhotoFormat: Bool {
+            guard wantsHighResolutionPhotoFormat, let device = videoDevice else { return false }
+            return Self.score(device.activeFormat) > Self.livePhotoCompatibleAreaCeiling
+        }
+
+        /// Largest photo area (pixels) a Live-Photo-compatible format may have.
+        nonisolated static let livePhotoCompatibleAreaCeiling: Int64 = 20_000_000
+
+        /// Switches to the 48MP-class photo format (`true`) or back to the device's baseline
+        /// format (`false`) in one begin/commit, and remembers the choice across camera
+        /// switches. Checked and applied in one actor turn.
+        ///
+        /// - Throws: ``PRMSessionError/unsupportedConfiguration(_:)`` while Cinematic Video is
+        ///   enabled (it owns the format) or while recording.
+        public func setHighResolutionPhotoFormat(_ enabled: Bool) throws {
+            if isCinematicVideoCaptureActive {
+                throw PRMSessionError.unsupportedConfiguration("Changing the photo format isn't available while Cinematic Video is enabled")
+            }
+            try refuseWhileBusy("Changing the photo format")
+            wantsHighResolutionPhotoFormat = enabled
+            if enabled {
+                applyHighResolutionPhotoFormat()
+            } else {
+                applyLivePhotoCompatibleFormat()
+            }
+        }
+
+        /// Re-applies the configured depth and portrait-matte delivery after a format change
+        /// committed. Inside the format change's own commit the photo output still reports
+        /// the outgoing format's support, so a 48MP or Cinematic format on the way out reads
+        /// as "no depth" and the flags stay off. Opens its own begin/commit only when
+        /// something changes; returns whether it did.
+        @discardableResult
+        func reapplyAuxiliaryPhotoDeliveryIfNeeded() -> Bool {
+            guard let output = photoOutput, let configuration, !isOnHighResolutionPhotoFormat,
+                  !isCinematicVideoCaptureActive
+            else { return false }
+            let depthNeeded = configuration.enableDepthDataDelivery && output.isDepthDataDeliverySupported
+                && !output.isDepthDataDeliveryEnabled
+            let matteNeeded = configuration.enablePortraitEffectsMatteDelivery && output.isPortraitEffectsMatteDeliverySupported
+                && !output.isPortraitEffectsMatteDeliveryEnabled
+            guard depthNeeded || matteNeeded else { return false }
+            session.beginConfiguration()
+            defer { session.commitConfiguration() }
+            applyAuxiliaryPhotoOutputFlags(highRes: false)
+            PRMLog.notice(.session, "Re-applied depth / portrait matte delivery after the format change")
+            return true
         }
 
         /// Promotes `activeFormat` to the device format with the largest landscape
@@ -163,15 +220,14 @@
         /// 15 Pro Max. **Incompatible with Live Photo / burst / depth streaming** —
         /// call `applyLivePhotoCompatibleFormat()` before re-enabling those.
         ///
-        /// Per the workspace AVFoundation lesson catalog and Apple dev-forum 715452 /
-        /// 748321, 48MP capture requires the photo output's auxiliary delivery flags
+        /// Per Apple dev-forum 715452 / 748321, 48MP capture requires the photo output's auxiliary delivery flags
         /// (Live Photo, depth, portrait matte) to be OFF — these all substitute 12MP
         /// proxy captures regardless of the active format. This helper turns them off
         /// inside the same session commit as the format swap so AVFoundation never
         /// sees a "48MP format + depth enabled" transient that would either reject
         /// the swap or downgrade captures to a tiny preview frame.
         func applyHighResolutionPhotoFormat() {
-            PRMLogger.trace(.session, "applyHighResolutionPhotoFormat")
+            PRMLog.debug(.session, "applyHighResolutionPhotoFormat")
             // **Do NOT snapshot `baselineActiveFormat` here.** The configure-time
             // and `swapInput` snapshots are the authoritative "known-good" state.
             // A per-toggle snapshot would clobber that with whatever happens to be
@@ -205,14 +261,14 @@
         /// first format-swap call after configure (unusual; the snapshot path
         /// dominates real usage).
         func applyLivePhotoCompatibleFormat() {
-            PRMLogger.trace(
+            PRMLog.debug(
                 .session,
                 "applyLivePhotoCompatibleFormat: baseline=\(baselineActiveFormat == nil ? "nil (will score)" : "captured")"
             )
             if let baseline = baselineActiveFormat {
                 restoreBaselineFormat(baseline)
             } else {
-                applyPhotoFormat(name: "Live-Photo-compatible", maxAreaCeiling: 20_000_000, highRes: false)
+                applyPhotoFormat(name: "Live-Photo-compatible", maxAreaCeiling: Self.livePhotoCompatibleAreaCeiling, highRes: false)
             }
         }
 
@@ -221,10 +277,20 @@
         /// override inside a single session begin/commit. No scoring, no probing —
         /// just put the device back where the user last had a working preview.
         private func restoreBaselineFormat(_ baseline: AVCaptureDevice.Format) {
-            guard let device = videoDevice else { return }
-
             session.beginConfiguration()
             defer { session.commitConfiguration() }
+            restoreBaselineFormatInOpenConfiguration(baseline)
+        }
+
+        /// Body of `restoreBaselineFormat(_:)` for callers that already hold an open
+        /// begin/commit (Cinematic Video disable). Refuses a baseline that belongs to
+        /// another device: assigning a foreign format raises.
+        func restoreBaselineFormatInOpenConfiguration(_ baseline: AVCaptureDevice.Format) {
+            guard let device = videoDevice else { return }
+            guard device.formats.contains(where: { $0 === baseline }) else {
+                PRMLog.warning(.session, "Baseline format belongs to another device; not restoring")
+                return
+            }
 
             // Reconcile aux flags FIRST so AVFoundation never sees a 48MP-format +
             // aux-flags-on transient on the way back. The current state coming in is
@@ -239,22 +305,27 @@
                     defer { device.unlockForConfiguration() }
                     device.activeFormat = baseline
                 } catch {
-                    PRMLogger.session.warning(
-                        "Failed to restore baseline activeFormat: \(error.localizedDescription, privacy: .public)"
-                    )
+                    PRMLog.warning(.session, "Failed to restore baseline activeFormat", error: error)
                     return
                 }
             }
 
+            if !Self.isDepthStreamingFormat(baseline) {
+                device.prm_restoreGeometricDistortionCorrectionIfNeeded()
+            }
             refreshVideoDataOutputPixelFormat()
             refreshOutputMaxPhotoDimensions()
+            // Format-dependent features (smudge detection, tracking, metadata types,
+            // aspect ratio) may have been reset by the swap.
+            applyFeatureIntents()
 
             let dims = baseline.supportedMaxPhotoDimensions
                 .filter { $0.width >= $0.height }
                 .max(by: { Int64($0.width) * Int64($0.height) < Int64($1.width) * Int64($1.height) })
             if let dims {
-                PRMLogger.session.notice(
-                    "applyLivePhotoCompatibleFormat: restored baseline format with maxPhotoDimensions \(dims.width, privacy: .public)×\(dims.height, privacy: .public)"
+                PRMLog.notice(
+                    .session,
+                    "applyLivePhotoCompatibleFormat: restored baseline format with maxPhotoDimensions \(dims.width)×\(dims.height)"
                 )
             }
         }
@@ -319,11 +390,12 @@
                     defer { device.unlockForConfiguration() }
                     device.activeFormat = best
                 } catch {
-                    PRMLogger.session.warning(
-                        "Failed to apply \(name, privacy: .public) format: \(error.localizedDescription, privacy: .public)"
-                    )
+                    PRMLog.warning(.session, "Failed to apply \(name) format", error: error)
                     return
                 }
+            }
+            if !Self.isDepthStreamingFormat(best) {
+                device.prm_restoreGeometricDistortionCorrectionIfNeeded()
             }
 
             // Re-apply videoDataOutput's BGRA pixel-format override and the photo
@@ -332,13 +404,15 @@
             // against the just-installed format before the commit lands.
             refreshVideoDataOutputPixelFormat()
             refreshOutputMaxPhotoDimensions()
+            applyFeatureIntents()
 
             let pickedDims = best.supportedMaxPhotoDimensions
                 .filter { $0.width >= $0.height }
                 .max(by: { Int64($0.width) * Int64($0.height) < Int64($1.width) * Int64($1.height) })
             if let pickedDims {
-                PRMLogger.session.notice(
-                    "applyPhotoFormat(\(name, privacy: .public)) picked format with maxPhotoDimensions \(pickedDims.width, privacy: .public)×\(pickedDims.height, privacy: .public)"
+                PRMLog.notice(
+                    .session,
+                    "applyPhotoFormat(\(name)) picked format with maxPhotoDimensions \(pickedDims.width)×\(pickedDims.height)"
                 )
             }
         }
@@ -376,7 +450,9 @@
         /// Picks the highest-scored format from `candidates` using a compound ordering:
         /// (1) higher max-photo-dim wins; (2) among ties, the pure-photo format wins
         /// over video-streaming formats; (3) further ties broken by non-depth-streaming
-        /// preference.
+        /// preference; (4) then full-range 8-bit (`420f`, what the `.photo` preset runs)
+        /// over its video-range twin (`420v`), which `formats` lists first and which codes
+        /// luma in 16–235, fewer tonal steps.
         nonisolated static func bestFormat(
             from candidates: [AVCaptureDevice.Format]
         ) -> AVCaptureDevice.Format? {
@@ -390,8 +466,13 @@
                 let depthA = isDepthStreamingFormat(a)
                 let depthB = isDepthStreamingFormat(b)
                 if depthA != depthB { return depthA && !depthB }
-                return false
+                return !isFullRange(a) && isFullRange(b)
             })
+        }
+
+        /// Whether the format delivers 8-bit full-range YUV (`420f`).
+        nonisolated static func isFullRange(_ format: AVCaptureDevice.Format) -> Bool {
+            CMFormatDescriptionGetMediaSubType(format.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
         }
 
         /// Landscape max-photo-dimension area, used as the primary format score.

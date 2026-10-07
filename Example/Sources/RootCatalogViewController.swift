@@ -7,11 +7,12 @@ import UIKit
 ///
 /// 1. **Permissions** — camera / mic status, request flow.
 /// 2. **Studio** — DSLR-grade camera app combining preview, lens switching, device controls,
-///    photo capture, and video recording.
+///    photo capture, and video recording, plus the iOS 26 / 27 capture features.
 /// 3. **Filter Chain** — multi-filter pipeline editor with intensity sliders + filtered photo
 ///    capture (Snap button writes the chain-baked still to Photos).
 /// 4. **Depth Inspector** — live depth map · PRMDepthCapture + filtering.
-/// 5. **Configuration Lab** — every PRMCameraConfiguration knob exposed.
+/// 5. **Configuration Lab** — every PRMCameraConfiguration knob exposed, including the
+///    iOS 26 / 27 ones.
 final class RootCatalogViewController: UIViewController {
     private struct Demo {
         let title: String
@@ -29,7 +30,7 @@ final class RootCatalogViewController: UIViewController {
         ),
         Demo(
             title: "Studio",
-            subtitle: "DSLR · all controls + hw shutter + rotation coordinator",
+            subtitle: "DSLR · all controls + iOS 26/27 features + hw shutter",
             symbol: "camera.aperture",
             make: { StudioViewController() }
         ),
@@ -47,7 +48,7 @@ final class RootCatalogViewController: UIViewController {
         ),
         Demo(
             title: "Configuration Lab",
-            subtitle: "Every PRMCameraConfiguration knob · Apply + reconfigure",
+            subtitle: "Every PRMCameraConfiguration knob incl. iOS 26/27 · Apply",
             symbol: "slider.horizontal.3",
             make: { ConfigurationLabViewController() }
         ),

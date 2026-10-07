@@ -12,16 +12,18 @@ import AVFoundation
 /// independent of interface orientation.
 ///
 /// Two angles are exposed as `AsyncStream<CGFloat>`:
-/// - ``previewRotationAngles``: apply to the preview layer/view.
-/// - ``captureRotationAngles``: apply to photo/video output connections.
+/// - ``previewRotationAngles()``: apply to an `AVCaptureVideoPreviewLayer`'s connection.
+/// - ``captureRotationAngles()``: apply to photo/video output connections (for stills,
+///   pass ``currentCaptureRotationAngle`` as ``PRMPhotoSettings/rotationAngle``).
+///
+/// Both are absolute connection angles, measured from the camera's native sensor
+/// orientation. A view that draws video-data frames itself rotates by what the frames'
+/// connection hasn't already applied: ``portraitFrameRotation(connectionAngle:)``.
 ///
 /// ```swift
-/// let coordinator = PRMRotationCoordinator(device: device, previewLayer: nil)
-/// Task {
-///     for await angle in coordinator.previewRotationAngles() {
-///         previewView.rotationAngle = angle
-///     }
-/// }
+/// let coordinator = PRMRotationCoordinator(device: device, previewLayer: previewView.layer)
+/// let connectionAngle = await session.videoDataRotationAngle ?? 0
+/// previewView.rotation = PRMPreviewView.Rotation(angle: coordinator.portraitFrameRotation(connectionAngle: connectionAngle))
 /// ```
 @MainActor
 public final class PRMRotationCoordinator {
@@ -70,6 +72,67 @@ public final class PRMRotationCoordinator {
     /// Current capture rotation angle in degrees.
     public var currentCaptureRotationAngle: CGFloat {
         coordinator.videoRotationAngleForHorizonLevelCapture
+    }
+
+    /// The fixed rotation (degrees) that makes this camera's output upright for a given
+    /// device orientation, regardless of how the device is held right now (iOS 27). Unlike
+    /// the horizon-level angles above, it doesn't follow gravity: use it for UIs locked to
+    /// one orientation. External cameras return 0.
+    @available(iOS 27.0, *)
+    public func videoRotationAngle(relativeTo orientation: AVCaptureVideoOrientation) -> CGFloat {
+        coordinator.videoRotationAngleRelative(toDeviceOrientation: orientation)
+    }
+
+    // MARK: - Drawing frames yourself
+
+    /// Clockwise degrees to rotate frames by so they're upright in a portrait interface,
+    /// when they come from a connection already rotated by `connectionAngle` (its
+    /// `videoRotationAngle`, such as ``PRMCameraSession/videoDataRotationAngle``).
+    ///
+    /// The coordinator's angles are measured from the camera's native sensor orientation,
+    /// but a connection's default isn't always 0: the Center Stage front camera of iPhone 17
+    /// and later defaults to 270°. The rotation left to draw is the difference, which comes
+    /// to 90° for every iPhone camera while its connection keeps its default.
+    ///
+    /// The upright angle is iOS 27's per-camera ``videoRotationAngle(relativeTo:)``. Before
+    /// iOS 27 it's the horizon-level preview angle, which follows the preview layer's
+    /// interface orientation, so create the coordinator with the layer the frames are drawn
+    /// in. While that layer isn't in a window, this assumes the iPhone layout: 90° past the
+    /// connection's default.
+    public func portraitFrameRotation(connectionAngle: CGFloat) -> CGFloat {
+        let upright: CGFloat
+        if #available(iOS 27.0, *) {
+            upright = videoRotationAngle(relativeTo: .portrait)
+        } else if isPreviewLayerInWindow {
+            upright = currentPreviewRotationAngle
+        } else {
+            return 90
+        }
+        return Self.frameRotation(uprightAngle: upright, connectionAngle: connectionAngle)
+    }
+
+    /// `uprightAngle - connectionAngle`, in `0 ..< 360`: the rotation still to apply to frames
+    /// a connection already rotated by `connectionAngle`.
+    public nonisolated static func frameRotation(uprightAngle: CGFloat, connectionAngle: CGFloat) -> CGFloat {
+        let difference = (uprightAngle - connectionAngle).truncatingRemainder(dividingBy: 360)
+        return difference < 0 ? difference + 360 : difference
+    }
+
+    /// Whether the coordinator's preview layer is in a window: before that,
+    /// `videoRotationAngleForHorizonLevelPreview` reads 0.
+    private var isPreviewLayerInWindow: Bool {
+        #if canImport(UIKit)
+            var layer = coordinator.previewLayer
+            while let current = layer {
+                if let view = current.delegate as? UIView {
+                    return view.window != nil
+                }
+                layer = current.superlayer
+            }
+            return false
+        #else
+            return coordinator.previewLayer != nil
+        #endif
     }
 
     // MARK: - Private

@@ -37,20 +37,24 @@ struct PRMDepthCaptureTests {
     }
 
     @Test
-    func `addDepthDataOutput attaches and wires up the delegate`() {
+    @PRMCameraActor
+    func `The session attaches, keeps and detaches a depth stream`() async throws {
         // `canAddOutput` doesn't require a matching video input on the simulator — the
-        // session happily accepts a bare `AVCaptureDepthDataOutput` and only fails to
-        // *produce* depth data when no compatible source is present. So the helper attaches
-        // the output and configures the delegate; real depth delivery is hardware-gated.
-        let session = AVCaptureSession()
-
+        // session accepts a bare `AVCaptureDepthDataOutput` and only fails to *produce*
+        // depth data without a compatible source. Real delivery is hardware-gated.
         final class TestDelegate: NSObject, AVCaptureDepthDataOutputDelegate, @unchecked Sendable {}
+        let session = PRMCameraSession()
         let delegate = TestDelegate()
-        let queue = DispatchQueue(label: "test.depth")
-        let result = PRMDepthCapture.addDepthDataOutput(to: session, delegate: delegate, queue: queue)
-        #expect(result != nil)
-        #expect(session.outputs.count == 1)
-        #expect(session.outputs.first is AVCaptureDepthDataOutput)
-        #expect(result?.delegate === delegate)
+        let output = try await session.attachDepthDataOutput(delegate: delegate, queue: DispatchQueue(label: "test.depth"))
+        #expect(session.depthDataOutput === output)
+        #expect(output.delegate === delegate)
+        #expect(session.session.outputs.contains { $0 === output })
+        // A second attach only updates the delegate.
+        let again = try await session.attachDepthDataOutput(delegate: delegate, queue: DispatchQueue(label: "test.depth"), filteringEnabled: false)
+        #expect(again === output)
+        #expect(!output.isFilteringEnabled)
+        await session.detachDepthDataOutput()
+        #expect(session.depthDataOutput == nil)
+        #expect(session.session.outputs.isEmpty)
     }
 }

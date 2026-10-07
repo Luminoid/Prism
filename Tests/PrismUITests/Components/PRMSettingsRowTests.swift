@@ -57,4 +57,25 @@ struct PRMSettingsRowTests {
         row.valueText = "on"
         #expect(row.valueText == "on")
     }
+
+    @Test
+    func `The header reads as a button with its value and state`() throws {
+        let row = PRMSettingsRow(symbolName: "gear", title: "ISO", valueText: "400", content: UIView())
+        let header = try #require(row.subviews.first { $0.isAccessibilityElement && $0.accessibilityTraits.contains(.button) })
+        #expect(header.accessibilityLabel == "ISO")
+        #expect(header.accessibilityValue == "400, Expanded")
+        row.isExpanded = false
+        row.valueText = "800"
+        #expect(header.accessibilityValue == "800, Collapsed")
+    }
+
+    @Test
+    func `A disabled row explains itself to VoiceOver`() {
+        let content = UIView()
+        let row = PRMSettingsRow(symbolName: "gear", title: "ISO", content: content)
+        row.setDisabled(message: "Needs the wide camera")
+        #expect(content.accessibilityElementsHidden)
+        row.setDisabled(message: nil)
+        #expect(!content.accessibilityElementsHidden)
+    }
 }

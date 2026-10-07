@@ -1,9 +1,10 @@
-// swift-tools-version: 6.2
+// swift-tools-version: 6.4
 
 import PackageDescription
 
 let package = Package(
     name: "Prism",
+    defaultLocalization: "en",
     platforms: [
         .iOS(.v18),
     ],
@@ -16,10 +17,7 @@ let package = Package(
         .target(
             name: "PrismCore",
             dependencies: [],
-            path: "Sources/PrismCore",
-            swiftSettings: [
-                .enableExperimentalFeature("StrictConcurrency"),
-            ]
+            path: "Sources/PrismCore"
         ),
         .target(
             name: "PrismUI",
@@ -29,7 +27,6 @@ let package = Package(
             path: "Sources/PrismUI",
             swiftSettings: [
                 .defaultIsolation(MainActor.self),
-                .enableExperimentalFeature("StrictConcurrency"),
             ]
         ),
         .testTarget(

@@ -82,6 +82,9 @@ public final class PRMFilterChain: PRMFilterRenderer, @unchecked Sendable {
     private var outputColorSpace: CGColorSpace?
     private var outputPixelBufferPool: CVPixelBufferPool?
     private let context: PRMRenderContext
+    /// Per-instance `PRMLog.once` keys, so one failing renderer doesn't silence another.
+    private let prepareLogKey = PRMLog.instanceKey("filter.renderer.prepare")
+    private let outputBufferLogKey = PRMLog.instanceKey("filter.renderer.outputBuffer")
     private let stateLock = NSLock()
 
     // MARK: - Init
@@ -94,6 +97,11 @@ public final class PRMFilterChain: PRMFilterRenderer, @unchecked Sendable {
         self.context = context
         self.description = description
         _entries = entries
+    }
+
+    deinit {
+        PRMLog.resetOnce(prepareLogKey)
+        PRMLog.resetOnce(outputBufferLogKey)
     }
 
     // MARK: - Mutation
@@ -155,9 +163,15 @@ public final class PRMFilterChain: PRMFilterRenderer, @unchecked Sendable {
             with: formatDescription,
             retainedBufferCountHint: outputRetainedBufferCountHint
         ) else {
-            PRMLogger.filter.error("[\(self.description)] Failed to allocate output buffer pool")
+            PRMLog.once(
+                prepareLogKey,
+                .error,
+                .filter,
+                "Renderer '\(description)' could not allocate its output buffer pool; frames pass through unfiltered"
+            )
             return
         }
+        PRMLog.resetOnce(prepareLogKey)
 
         stateLock.lock()
         outputPixelBufferPool = allocation.bufferPool
@@ -197,14 +211,18 @@ public final class PRMFilterChain: PRMFilterRenderer, @unchecked Sendable {
         var output: CVPixelBuffer?
         CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &output)
         guard let outputPixelBuffer = output else {
-            PRMLogger.filter.warning("[\(self.description)] Failed to allocate output pixel buffer")
+            // Pool exhausted (consumers holding every buffer): one line per episode.
+            PRMLog.once(outputBufferLogKey, .warning, .filter, "Renderer '\(description)' output pool exhausted; frames pass through unfiltered")
             return nil
         }
+        PRMLog.resetOnce(outputBufferLogKey)
 
+        // Render the source frame's rect: a filter that moves or grows the extent (a
+        // transform, an unclamped blur) would otherwise land shifted in the buffer.
         context.ciContext.render(
-            currentImage,
+            currentImage.cropped(to: sourceImage.extent),
             to: outputPixelBuffer,
-            bounds: currentImage.extent,
+            bounds: sourceImage.extent,
             colorSpace: colorSpace
         )
         return outputPixelBuffer

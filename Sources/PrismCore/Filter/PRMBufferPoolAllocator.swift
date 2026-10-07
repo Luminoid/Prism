@@ -2,7 +2,13 @@ import CoreMedia
 import CoreVideo
 
 /// Allocates `CVPixelBufferPool` instances for the filter pipeline.
+///
+/// A renderer that can't prepare retries on every frame, so allocation failures are
+/// logged once until an allocation succeeds again.
 public enum PRMBufferPoolAllocator: Sendable {
+    /// `PRMLog.once` keys for the per-frame failure paths, cleared by a successful allocation.
+    static let failureLogKeys = ["filter.pool.pixelFormat", "filter.pool.create", "filter.pool.outputFormat"]
+
     /// Result of a successful pool allocation.
     public struct Allocation: @unchecked Sendable {
         public let bufferPool: CVPixelBufferPool
@@ -16,12 +22,17 @@ public enum PRMBufferPoolAllocator: Sendable {
         retainedBufferCountHint: Int
     ) -> Allocation? {
         let mediaSubType = CMFormatDescriptionGetMediaSubType(inputFormatDescription)
+        let dimensions = CMVideoFormatDescriptionGetDimensions(inputFormatDescription)
         guard mediaSubType == kCVPixelFormatType_32BGRA else {
-            PRMLogger.filter.error("Invalid input pixel buffer type: \(mediaSubType)")
+            PRMLog.once(
+                "filter.pool.pixelFormat",
+                .error,
+                .filter,
+                "Buffer pool needs BGRA input, got \(PRMLog.fourCC(mediaSubType)) \(dimensions.width)x\(dimensions.height); filtering is off until the format changes"
+            )
             return nil
         }
 
-        let dimensions = CMVideoFormatDescriptionGetDimensions(inputFormatDescription)
         var pixelBufferAttributes: [String: Any] = [
             kCVPixelBufferPixelFormatTypeKey as String: UInt(mediaSubType),
             kCVPixelBufferWidthKey as String: Int(dimensions.width),
@@ -38,7 +49,7 @@ public enum PRMBufferPoolAllocator: Sendable {
             kCVPixelBufferPoolMinimumBufferCountKey as String: retainedBufferCountHint,
         ]
         var pool: CVPixelBufferPool?
-        CVPixelBufferPoolCreate(
+        let poolStatus = CVPixelBufferPoolCreate(
             kCFAllocatorDefault,
             poolAttributes as NSDictionary?,
             pixelBufferAttributes as NSDictionary?,
@@ -46,15 +57,23 @@ public enum PRMBufferPoolAllocator: Sendable {
         )
 
         guard let pool else {
-            PRMLogger.filter.error("Failed to create pixel buffer pool")
+            PRMLog.once(
+                "filter.pool.create",
+                .error,
+                .filter,
+                "CVPixelBufferPoolCreate failed (CVReturn \(poolStatus)) for \(dimensions.width)x\(dimensions.height)"
+            )
             return nil
         }
 
         preallocate(pool: pool, threshold: retainedBufferCountHint)
 
         guard let outputFormat = deriveFormat(from: pool, threshold: retainedBufferCountHint) else {
-            PRMLogger.filter.error("Failed to derive output format description")
+            PRMLog.once("filter.pool.outputFormat", .error, .filter, "Failed to derive the output format description from a new buffer pool")
             return nil
+        }
+        for key in failureLogKeys {
+            PRMLog.resetOnce(key)
         }
 
         return Allocation(bufferPool: pool, colorSpace: colorSpace, formatDescription: outputFormat)
@@ -74,9 +93,7 @@ public enum PRMBufferPoolAllocator: Sendable {
             // so this is unusual. Log so a missing color-space mismatch on a P3 / Rec.2020
             // capture (color shifts on encode) doesn't surface only as a "looks wrong"
             // user report.
-            PRMLogger.filter.notice(
-                "CMFormatDescription has no extensions — falling back to deviceRGB color space"
-            )
+            PRMLog.notice(.filter, "CMFormatDescription has no extensions — falling back to deviceRGB color space")
             return colorSpace
         }
 
@@ -104,24 +121,27 @@ public enum PRMBufferPoolAllocator: Sendable {
             if CFGetTypeID(cvColorSpace as CFTypeRef) == CGColorSpace.typeID {
                 colorSpace = cvColorSpace as! CGColorSpace // swiftlint:disable:this force_cast
             } else {
-                PRMLogger.filter.error(
-                    "kCVImageBufferCGColorSpaceKey present but is not a CGColorSpace (typeID mismatch); falling back to deviceRGB"
-                )
+                PRMLog.error(.filter, "kCVImageBufferCGColorSpaceKey present but is not a CGColorSpace (typeID mismatch); falling back to deviceRGB")
             }
+        } else if colorPrimaries != nil,
+                  let attachments = CMFormatDescriptionGetExtensions(formatDescription),
+                  let derived = CVImageBufferCreateColorSpaceFromAttachments(attachments)?.takeRetainedValue() {
+            // Primaries without a payload (the usual case for camera formats): build the color
+            // space from the primaries, transfer function and matrix, as CoreVideo does for a
+            // buffer carrying them.
+            colorSpace = derived
         } else if (colorPrimaries as? String) == (kCVImageBufferColorPrimaries_P3_D65 as String),
                   let displayP3 = CGColorSpace(name: CGColorSpace.displayP3) {
             colorSpace = displayP3
         } else if colorPrimaries != nil {
             // Format description carried color primaries but neither a CGColorSpace
-            // payload nor a recognized primaries match. We propagated the primaries +
+            // payload nor a combination CoreVideo can build one from. We propagated the primaries +
             // YCbCr matrix + transfer function via `kCVBufferPropagatedAttachmentsKey`
             // so CoreVideo can still render the buffer, but the CIContext encode path
             // will use deviceRGB — which on a Rec.2020 / extended-range capture causes
             // visible color shifts. Surface this at .notice so unexpected color drift
             // has a single log line to grep for.
-            PRMLogger.filter.notice(
-                "Camera format has color primaries but no CGColorSpace payload; falling back to deviceRGB (may shift colors on encode)"
-            )
+            PRMLog.notice(.filter, "Camera format has color primaries but no CGColorSpace payload; falling back to deviceRGB (may shift colors on encode)")
         }
 
         return colorSpace

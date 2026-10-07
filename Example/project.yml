@@ -3,7 +3,7 @@ options:
   bundleIdPrefix: com.luminoid
   deploymentTarget:
     iOS: "18.0"
-  xcodeVersion: "17.2"
+  xcodeVersion: "27.0"
   generateEmptyDirectories: true
 
 packages:
@@ -11,7 +11,7 @@ packages:
     path: ..
   SnapKit:
     url: https://github.com/SnapKit/SnapKit.git
-    from: "5.7.0"
+    from: "5.7.1"
 
 targets:
   PrismExample:
@@ -37,6 +37,7 @@ targets:
         SWIFT_VERSION: "6.2"
         CODE_SIGNING_ALLOWED: true
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        TARGETED_DEVICE_FAMILY: "1"
     info:
       path: Resources/Info.plist
       properties:
@@ -54,6 +55,6 @@ targets:
         NSCameraUsageDescription: Camera access is required for the live preview and capture demos.
         NSMicrophoneUsageDescription: Microphone access is required for video recording demos.
         NSPhotoLibraryAddUsageDescription: Photo library access is required to save captured photos and videos.
-        UIRequiresFullScreen: true
+        UIUserInterfaceStyle: Dark
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait

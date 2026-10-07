@@ -1,171 +1,242 @@
 @preconcurrency import AVFoundation
 import CoreImage
 import Foundation
-import Vision
+import ImageIO
+import os
+import QuartzCore
 
-/// Long-exposure photo capture by averaging multiple frames.
+/// Night mode: gathers light from many frames of the live video stream for a few seconds,
+/// aligns and merges them on the GPU, then brightens and tone-maps the result.
 ///
-/// Apple's first-party Night mode is not exposed as a public API — it's a private,
-/// ANE-accelerated pipeline doing bracketed exposures, sub-pixel registration, multi-frame
-/// super-resolution, and tone mapping. This helper approximates the *averaging* portion:
-/// captures a configurable number of frames at fixed exposure, aligns each subsequent
-/// frame to the first via `VNTranslationalImageRegistrationRequest` to compensate for
-/// hand-shake, then averages them with `CIAdditionCompositing` + a brightness scale to
-/// keep the result in `[0, 1]`. Without alignment, handheld stacks show motion blur and
-/// edge ghosting; with it, sharpness on static subjects is preserved at lower noise.
+/// Apple's own Night mode isn't public API. This one works the same way in outline:
 ///
-/// What this does **not** do (and would need a private ANE pipeline to match):
-/// - Bracketed exposures (Apple captures some short + some long, picks the best per region)
-/// - Sub-pixel registration with content-aware warping (we only do whole-pixel translation)
-/// - Multi-frame super-resolution beyond simple averaging
-/// - Per-region tone mapping and chroma denoise
-/// - Scene-aware deferred / additional capture triggered by the still-photo button
+/// 1. **Plan** (``plan(_:)``): from how far auto exposure falls short of its target in the
+///    dark, a per-frame shutter (about 1/8 s handheld on the main lens, up to 1/2 s when
+///    stable) and ISO, and a capture time of 1 to 3 s handheld (up to 10 s stable).
+/// 2. **Capture:** the camera is held at that exposure with white balance and focus locked,
+///    and frames come from the video-data output while the preview keeps running. Other
+///    camera controls are refused meanwhile (``PRMCameraSession/isExclusiveCaptureActive``).
+/// 3. **Merge:** each frame is aligned to the first with Vision (a homography, so hand
+///    rotation is corrected too), frames blurred by shake are dropped, and pixels that differ
+///    from the first frame by more than noise (something moved) are left out. The weighted
+///    average cuts noise by about the square root of the frame count.
+/// 4. **Tone:** the merge is brightened by up to 3 EV toward a dusk-like level, highlights are
+///    rolled off with a shoulder, and the remaining noise is smoothed.
 ///
-/// For best results, capture 4-12 frames at 0.5-2s each on a stable surface or with
-/// the user holding the device steady. Moving subjects will still ghost — the translation
-/// model can't compensate for object motion within the frame.
-///
-/// Designed for the photo-output path: the camera should already be running, and the
-/// caller is responsible for switching the device into `.custom` exposure with the
-/// configured per-frame shutter + ISO before calling
-/// ``capture(frameCount:perFrameDuration:iso:didCaptureFrame:)`` and restoring the prior
-/// exposure mode afterwards. ``PRMCamera/setCustomExposure(duration:iso:)`` paired with
-/// ``PRMCamera/setExposureMode(_:)`` is the recommended path (it stays on the camera
-/// actor and threads through clamping).
+/// The photo has the video-data output's resolution (the format's full size: under the
+/// `.photo` preset the capture moves to `.inputPriority` if the stream comes smaller) and the
+/// photo connection's rotation and mirroring. Manual exposure needs a physical camera: on a
+/// virtual multi-camera device (the Triple or Dual camera Pro iPhones open by default) switch
+/// to `.builtInWideAngleCamera` first, or the capture throws.
 ///
 /// ```swift
-/// let duration = CMTimeMakeWithSeconds(0.5, preferredTimescale: 1_000_000)
-/// await camera.setCustomExposure(duration: duration, iso: 800)
-/// defer { Task { await camera.setExposureMode(.continuousAutoExposure) } }
-/// let photo = try await night.capture(
-///     frameCount: 8,
-///     perFrameDuration: 0.5,
-///     iso: 800,
-///     didCaptureFrame: { index, total in print("frame \(index + 1)/\(total)") }
-/// )
+/// let night = PRMNightModeCapture(session: camera.session, context: renderContext)
+/// let photo = try await night.capture(PRMNightModeOptions(rotationAngle: angle)) { progress in
+///     Task { @MainActor in pill.text = "\(progress.secondsRemaining)s" }
+/// }
 /// ```
 public final class PRMNightModeCapture: @unchecked Sendable {
-    public let capture: PRMPhotoCapture
-    public let context: PRMRenderContext
+    public let session: PRMCameraSession
+    /// The context the merge and encode run on: a separate command queue on the caller's
+    /// device, so the work doesn't stall a preview drawing with the caller's context.
+    private let context: PRMRenderContext
 
-    public init(capture: PRMPhotoCapture, context: PRMRenderContext) {
-        self.capture = capture
-        self.context = context
+    public init(session: PRMCameraSession, context: PRMRenderContext) {
+        self.session = session
+        let queue = context.device.makeCommandQueue() ?? context.commandQueue
+        self.context = PRMRenderContext(device: context.device, commandQueue: queue, name: "PRMNightModeCapture")
     }
 
-    /// Capture `frameCount` frames at `perFrameDuration` seconds each and average them
-    /// into a single still image. Total wall-clock time is roughly
-    /// `frameCount * perFrameDuration`.
+    /// The plan a capture would use right now (for an "AUTO 3s" label), or `nil` without a
+    /// camera.
+    public func plan(_ options: PRMNightModeOptions = PRMNightModeOptions()) async -> PRMNightPlan? {
+        await session.nightPlan(options: options)
+    }
+
+    /// Captures a Night photo.
     ///
-    /// - Parameters:
-    ///   - frameCount: Number of frames to stack. 4-12 is a sensible range. Must be ≥ 1.
-    ///   - perFrameDuration: Per-frame shutter in seconds. Informational — the caller is
-    ///     responsible for putting the device into custom exposure with this duration
-    ///     before invoking. The value is recorded into the returned photo's metadata.
-    ///   - iso: ISO used per frame. Same caller-responsibility note as `perFrameDuration`.
-    ///   - didCaptureFrame: Fires once after each frame finishes capturing. Receives the
-    ///     zero-based frame index and the total `frameCount`, suitable for driving a
-    ///     "frame N/total" progress indicator.
-    /// - Returns: A composited ``PRMPhoto``; underlying photo is the last frame's
-    ///   `AVCapturePhoto`, metadata is the last frame's metadata with the per-frame shutter
-    ///   recorded in `ExposureTime`.
+    /// `progress` is called about 20 times a second while capturing (on no particular
+    /// thread), then once with ``PRMNightProgress/Phase/processing`` when the camera is back
+    /// to normal and merging finishes.
+    ///
+    /// - Throws: Before anything changes:
+    ///   ``PRMSessionError/virtualDeviceManualControlUnsupported(_:)`` on a virtual
+    ///   multi-camera device, ``PRMSessionError/unsupportedConfiguration(_:)`` while recording
+    ///   or with Cinematic Video or Live Photo on. During the capture:
+    ///   ``PRMSessionError/cancelled`` when the task is cancelled, and
+    ///   ``PRMSessionError/photoCaptureFailed(_:)`` when no usable frame arrived or encoding
+    ///   failed. The camera is restored in every case.
     public func capture(
-        frameCount: Int,
-        perFrameDuration _: Double,
-        iso _: Float,
-        didCaptureFrame: (@Sendable (Int, Int) -> Void)? = nil
-    ) async throws -> PRMPhoto {
-        guard frameCount >= 1 else {
-            throw PRMSessionError.photoCaptureFailed("Night mode requires frameCount >= 1")
+        _ options: PRMNightModeOptions = PRMNightModeOptions(),
+        progress: (@Sendable (PRMNightProgress) -> Void)? = nil
+    ) async throws -> PRMNightPhoto {
+        let frameDimensions = await probeFrameDimensions()
+        if let frameDimensions, !Self.hasMemory(forWidth: Int(frameDimensions.width), height: Int(frameDimensions.height)) {
+            throw PRMSessionError.photoCaptureFailed("Not enough memory for a Night capture")
         }
+        let lease = try await session.beginNightCapture(options: options, frameDimensions: frameDimensions)
+        let plan = lease.plan
+        let stacker = PRMNightStacker(plan: plan, context: context)
+        var observer: UUID?
+        do {
+            try await session.applyNightExposure(lease)
+            stacker.setSettleDeadline(CACurrentMediaTime() + 2 * plan.frameDuration + 0.1)
+            observer = session.frameRouter.addObserver { [stacker] sampleBuffer in
+                stacker.offer(sampleBuffer)
+            }
+            try await gather(into: stacker, plan: plan, progress: progress)
+        } catch {
+            await stop(stacker, observer: observer, lease: lease)
+            throw error is CancellationError ? PRMSessionError.cancelled : error
+        }
+        await stop(stacker, observer: observer, lease: lease)
 
-        var frames: [PRMPhoto] = []
-        let settings = PRMPhotoSettings()
-            .qualityPrioritization(.quality)
-            .flashMode(.off)
-        for index in 0 ..< frameCount {
-            let photo = try await capture.capturePhoto(settings: settings)
-            frames.append(photo)
-            didCaptureFrame?(index, frameCount)
-        }
-        guard let composited = Self.average(frames: frames, context: context) else {
-            // If averaging fails (decode error, empty extent), fall back to the last frame.
-            return frames[frames.count - 1]
-        }
-        return composited
-    }
-
-    // MARK: - Compositing
-
-    private static func average(frames: [PRMPhoto], context: PRMRenderContext) -> PRMPhoto? {
-        guard !frames.isEmpty else { return nil }
-        guard let first = CIImage(data: frames[0].data) else { return nil }
-        let weight = CGFloat(1.0 / Double(frames.count))
-        var accumulator = weighted(first, weight: weight)
-        // Reuse a single sequence handler so Vision can amortize feature extraction across
-        // frames. The first frame is the registration anchor; each subsequent frame is
-        // aligned to it before being added to the accumulator.
-        let registrationHandler = VNSequenceRequestHandler()
-        for index in 1 ..< frames.count {
-            guard let frame = CIImage(data: frames[index].data) else { continue }
-            let aligned = align(frame, to: first, handler: registrationHandler) ?? frame
-            accumulator = weighted(aligned, weight: weight).applyingFilter("CIAdditionCompositing", parameters: [
-                kCIInputBackgroundImageKey: accumulator,
-            ])
-        }
-        // Cropping back to the first frame's extent trims the empty edges that translation
-        // alignment exposes — when frame N is shifted +5px right, the leftmost 5px column
-        // of the accumulator is averaged with transparent pixels and reads dim. Keeping
-        // the output exactly the same dimensions as the input also makes EXIF / metadata
-        // sizes line up with the underlying photo we pass through.
-        accumulator = accumulator.cropped(to: first.extent)
-        let lastPhoto = frames[frames.count - 1]
-        let preservedProperties = first.properties.merging(lastPhoto.metadata) { _, new in new }
-        guard let jpegData = PRMImage.jpegDataPreservingMetadata(
-            from: accumulator,
-            sourceExtent: first.extent,
-            originalProperties: preservedProperties,
-            context: context
-        ) else {
-            return nil
-        }
-        return PRMPhoto(
-            data: jpegData,
-            underlyingPhoto: lastPhoto.underlyingPhoto,
-            metadata: lastPhoto.metadata
+        let status = stacker.currentStatus
+        progress?(PRMNightProgress(phase: .processing, elapsed: plan.duration, duration: plan.duration, mergedFrames: status.merged, plannedFrames: plan.frameCount))
+        return try await finish(
+            stacker,
+            plan: plan,
+            rotation: (options.rotationAngle ?? lease.photoRotation) - lease.dataRotation,
+            mirrored: lease.photoMirrored != lease.dataMirrored,
+            codec: options.codec
         )
     }
 
-    /// Aligns `frame` to `reference` using `VNTranslationalImageRegistrationRequest` and
-    /// returns the translated CIImage. Returns `nil` when registration fails (Vision can't
-    /// find enough features — happens on extreme low light, blank scenes, or large motion),
-    /// in which case the caller falls back to the un-aligned frame. Whole-pixel translation
-    /// only — rotation and scale changes between frames are not corrected.
-    private static func align(
-        _ frame: CIImage,
-        to reference: CIImage,
-        handler: VNSequenceRequestHandler
-    ) -> CIImage? {
-        let request = VNTranslationalImageRegistrationRequest(targetedCIImage: frame, options: [:])
-        do {
-            try handler.perform([request], on: reference)
-        } catch {
-            return nil
+    // MARK: - Capture
+
+    /// Waits until the plan's frames are merged or its time is up, reporting progress. Stops
+    /// early when frames stop arriving (an interruption).
+    private func gather(into stacker: PRMNightStacker, plan: PRMNightPlan, progress: (@Sendable (PRMNightProgress) -> Void)?) async throws {
+        let start = CACurrentMediaTime()
+        let stall = 2 * plan.frameDuration + 1.5
+        while true {
+            try Task.checkCancellation()
+            let status = stacker.currentStatus
+            let now = CACurrentMediaTime()
+            let elapsed = now - start
+            progress?(PRMNightProgress(
+                phase: .capturing,
+                elapsed: min(elapsed, plan.duration),
+                duration: plan.duration,
+                mergedFrames: status.merged,
+                plannedFrames: plan.frameCount
+            ))
+            if status.merged >= plan.frameCount { return }
+            if elapsed >= plan.duration, status.merged > 0 { return }
+            if now - (status.lastAcceptedTime ?? start) > stall + (status.merged == 0 ? 1 : 0) {
+                PRMLog.warning(.capture, "Night: frames stopped after \(status.merged) of \(plan.frameCount)")
+                return
+            }
+            try await Task.sleep(for: .milliseconds(50))
         }
-        guard let observation = request.results?.first as? VNImageTranslationAlignmentObservation else {
-            return nil
-        }
-        // The observation's alignmentTransform is the transform that, applied to the
-        // target image (`frame`), aligns it to the reference. Apply it directly.
-        return frame.transformed(by: observation.alignmentTransform)
     }
 
-    private static func weighted(_ image: CIImage, weight: CGFloat) -> CIImage {
-        image.applyingFilter("CIColorMatrix", parameters: [
-            "inputRVector": CIVector(x: weight, y: 0, z: 0, w: 0),
-            "inputGVector": CIVector(x: 0, y: weight, z: 0, w: 0),
-            "inputBVector": CIVector(x: 0, y: 0, z: weight, w: 0),
-            "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 1),
-        ])
+    private func stop(_ stacker: PRMNightStacker, observer: UUID?, lease: PRMNightCaptureLease) async {
+        if let observer {
+            session.frameRouter.removeObserver(observer)
+        }
+        stacker.stopAccepting()
+        await session.endNightCapture(lease)
+    }
+
+    /// The video-data output's frame size, read from the next frame (at most one second).
+    private func probeFrameDimensions() async -> CMVideoDimensions? {
+        let found = OSAllocatedUnfairLock<CMVideoDimensions?>(initialState: nil)
+        let observer = session.frameRouter.addObserver { sampleBuffer in
+            guard let description = CMSampleBufferGetFormatDescription(sampleBuffer) else { return }
+            let dimensions = CMVideoFormatDescriptionGetDimensions(description)
+            found.withLock { value in
+                if value == nil { value = dimensions }
+            }
+        }
+        defer { session.frameRouter.removeObserver(observer) }
+        for _ in 0 ..< 50 {
+            if let dimensions = found.withLock({ $0 }) {
+                return dimensions
+            }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        return nil
+    }
+
+    /// Room for the merge: the accumulator and the result (8 bytes a pixel each) plus about
+    /// three half-float intermediates while tone mapping. `os_proc_available_memory()` reads 0
+    /// where it isn't tracked (the simulator); that passes.
+    static func hasMemory(forWidth width: Int, height: Int) -> Bool {
+        let available = os_proc_available_memory()
+        guard available > 0 else { return true }
+        return available > width * height * 8 * 5
+    }
+
+    // MARK: - Finish
+
+    @concurrent
+    private func finish(
+        _ stacker: PRMNightStacker,
+        plan: PRMNightPlan,
+        rotation: CGFloat,
+        mirrored: Bool,
+        codec: AVVideoCodecType?
+    ) async throws -> PRMNightPhoto {
+        await stacker.drain()
+        let mergedCount = stacker.currentStatus.merged
+        guard let (merged, attachments) = stacker.finish() else {
+            throw PRMSessionError.photoCaptureFailed("Night capture got no usable frames")
+        }
+        let linear = CIImage(cvPixelBuffer: merged, options: [.colorSpace: CGColorSpace(name: CGColorSpace.extendedLinearSRGB) as Any])
+        let stats = PRMNightTone.stats(luminances: PRMNightTone.luminanceSamples(of: linear, context: context.ciContext))
+        let gain = PRMNightTone.gainEV(key: stats.logAverage, frameCount: mergedCount)
+        let toned = PRMNightTone.render(linear, gainEV: gain, highlight: stats.highlight, frameCount: mergedCount)
+        let upright = PRMNightTone.oriented(toned, clockwiseDegrees: rotation, mirrored: mirrored)
+        let date = Date()
+        let metadata = Self.metadata(attachments: attachments, plan: plan, mergedFrames: mergedCount, date: date)
+        guard let data = PRMPhotoCapture.encodeFilteredImage(
+            upright,
+            sourceExtent: upright.extent,
+            preservedProperties: metadata,
+            codec: codec,
+            context: context
+        ) else {
+            throw PRMSessionError.photoCaptureFailed("Night photo couldn't be encoded")
+        }
+        PRMLog.notice(
+            .capture,
+            """
+            Night photo: \(mergedCount) of \(plan.frameCount) frames, key \(String(format: "%.3f", stats.logAverage)), \
+            gain +\(String(format: "%.1f", gain)) EV, \(Int(upright.extent.width))×\(Int(upright.extent.height)), \(data.count) bytes
+            """
+        )
+        return PRMNightPhoto(data: data, metadata: metadata, plan: plan, mergedFrameCount: mergedCount, gainEV: gain, timestamp: date)
+    }
+
+    // MARK: - Metadata
+
+    private static let exifDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy:MM:dd HH:mm:ss"
+        return formatter
+    }()
+
+    /// The EXIF and TIFF dictionaries for the photo: the reference frame's camera metadata
+    /// (lens, aperture, brightness) with the per-frame shutter and ISO, the capture time, and a
+    /// note of how many frames went in. The pixels are upright, so the orientation is 1.
+    static func metadata(attachments: [String: Any]?, plan: PRMNightPlan, mergedFrames: Int, date: Date) -> [String: Any] {
+        var exif = (attachments?[kCGImagePropertyExifDictionary as String] as? [String: Any]) ?? [:]
+        exif[kCGImagePropertyExifExposureTime as String] = plan.frameDuration
+        exif[kCGImagePropertyExifShutterSpeedValue as String] = -log2(plan.frameDuration)
+        exif[kCGImagePropertyExifISOSpeedRatings as String] = [NSNumber(value: Int(plan.iso.rounded()))]
+        exif[kCGImagePropertyExifUserComment as String] = "Night mode: \(mergedFrames) frames over \(String(format: "%.1f", plan.duration)) s"
+        exif[kCGImagePropertyExifDateTimeOriginal as String] = exifDateFormatter.string(from: date)
+        exif[kCGImagePropertyExifDateTimeDigitized as String] = exifDateFormatter.string(from: date)
+        exif.removeValue(forKey: kCGImagePropertyExifPixelXDimension as String)
+        exif.removeValue(forKey: kCGImagePropertyExifPixelYDimension as String)
+        var tiff = (attachments?[kCGImagePropertyTIFFDictionary as String] as? [String: Any]) ?? [:]
+        tiff[kCGImagePropertyTIFFSoftware as String] = "Prism Night mode"
+        tiff[kCGImagePropertyTIFFOrientation as String] = 1
+        return [
+            kCGImagePropertyExifDictionary as String: exif,
+            kCGImagePropertyTIFFDictionary as String: tiff,
+        ]
     }
 }

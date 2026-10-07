@@ -13,17 +13,17 @@ import QuartzCore
 /// let pipeline = PRMFilterPipeline()
 /// pipeline.activeRenderer = sepiaRenderer
 /// pipeline.isEnabled = true
-/// camera.session.setVideoDataOutputDelegate(pipeline)
+/// await camera.session.setVideoDataOutputDelegate(pipeline)
 ///
-/// // Option A: callback
-/// pipeline.onFrame = { frame in
-///     previewView.pixelBuffer = frame.pixelBuffer
+/// // Option A: callback (runs on the data-output queue; `update(_:)` is thread-safe)
+/// pipeline.onFrame = { [weak previewView] frame in
+///     previewView?.update(frame.pixelBuffer)
 /// }
 ///
 /// // Option B: AsyncStream
 /// Task {
 ///     for await frame in pipeline.frameStream() {
-///         await previewView.updateBuffer(frame.pixelBuffer)
+///         previewView.update(frame.pixelBuffer)
 ///     }
 /// }
 /// ```
@@ -31,6 +31,10 @@ public final class PRMFilterPipeline: NSObject, @unchecked Sendable {
     // MARK: - Public state
 
     /// The currently active renderer. Setting `nil` makes the pipeline pass through raw frames.
+    ///
+    /// The renderer it replaces is reset on the data-output queue when the next frame
+    /// arrives, not here: the queue may be inside that renderer's `render` right now, and a
+    /// reset from this thread could race it (or be undone by a re-prepare a moment later).
     public var activeRenderer: (any PRMFilterRenderer)? {
         get {
             stateLock.lock()
@@ -39,10 +43,8 @@ public final class PRMFilterPipeline: NSObject, @unchecked Sendable {
         }
         set {
             stateLock.lock()
-            let old = _activeRenderer
             _activeRenderer = newValue
             stateLock.unlock()
-            if old !== newValue { old?.reset() }
         }
     }
 
@@ -74,7 +76,8 @@ public final class PRMFilterPipeline: NSObject, @unchecked Sendable {
         }
     }
 
-    /// Most recent frame's format description.
+    /// Format description of the most recent frame (dimensions, pixel format, color
+    /// extensions), or `nil` before the first one.
     public var currentFormatDescription: CMFormatDescription? {
         stateLock.lock()
         defer { stateLock.unlock() }
@@ -84,6 +87,8 @@ public final class PRMFilterPipeline: NSObject, @unchecked Sendable {
     // MARK: - Private storage
 
     private var _activeRenderer: (any PRMFilterRenderer)?
+    /// The renderer the previous frame used. Only touched on the data-output queue.
+    private var lastFrameRenderer: (any PRMFilterRenderer)?
     private var _isEnabled: Bool = false
     private var _onFrame: ((PRMVideoFrame) -> Void)?
     private var _currentFormatDescription: CMFormatDescription?
@@ -106,6 +111,12 @@ public final class PRMFilterPipeline: NSObject, @unchecked Sendable {
     private var lastDropLogTime: CFTimeInterval = 0
     private let dropLogInterval: CFTimeInterval = 2.0
 
+    // Capture-to-delivery latency rollup, logged at debug every `latencyLogInterval`
+    // seconds: how far behind the sensor each frame reaches the consumer (stabilization and
+    // effects such as Cinematic Video add to it). Only touched on the data-output queue.
+    private var latencyWindow = LatencyWindow()
+    private let latencyLogInterval: CFTimeInterval = 5.0
+
     /// Async stream of processed frames.
     ///
     /// **Drops frames under backpressure.** Buffering policy is `.bufferingNewest(1)`:
@@ -115,9 +126,9 @@ public final class PRMFilterPipeline: NSObject, @unchecked Sendable {
     /// skipping it), but it is **wrong** for consumers that must see every frame —
     /// recording, ML inference batching, motion-vector estimation. Those should consume
     /// via the synchronous ``onFrame`` callback instead, where the consumer runs on the
-    /// data-output queue and naturally backpressures by holding the queue. Dropped
-    /// frames are also logged via the dedicated `didDrop` delegate path (visible at
-    /// `.debug` level under `com.luminoid.Prism.Filter`).
+    /// data-output queue and naturally backpressures by holding the queue. Frames the
+    /// capture output drops are counted and logged as one notice line every 2 seconds
+    /// (subsystem `dev.luminoid.prism`, category `Filter`).
     public func frameStream() -> AsyncStream<PRMVideoFrame> {
         frames.makeStream()
     }
@@ -139,6 +150,13 @@ extension PRMFilterPipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
         let renderer = _activeRenderer
         let onFrameCallback = _onFrame
         stateLock.unlock()
+
+        // A renderer swapped out since the last frame is released here, on this queue,
+        // where no render of it can be running.
+        if let previous = lastFrameRenderer, previous !== renderer {
+            previous.reset()
+        }
+        lastFrameRenderer = renderer
 
         guard enabled else { return }
         guard let videoBuffer = CMSampleBufferGetImageBuffer(sampleBuffer),
@@ -195,8 +213,9 @@ extension PRMFilterPipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
                     renderer.reset()
                     let newDims = CMVideoFormatDescriptionGetDimensions(formatDescription)
                     let newSubType = CMFormatDescriptionGetMediaSubType(formatDescription)
-                    PRMLogger.filter.notice(
-                        "Reconfiguring renderer for new format (dims=\(newDims.width, privacy: .public)×\(newDims.height, privacy: .public), subType=\(newSubType, privacy: .public))"
+                    PRMLog.notice(
+                        .filter,
+                        "Reconfiguring renderer for new format (dims=\(newDims.width)×\(newDims.height), subType=\(PRMLog.fourCC(newSubType)))"
                     )
                 }
                 renderer.prepare(with: formatDescription, outputRetainedBufferCountHint: 3)
@@ -213,6 +232,22 @@ extension PRMFilterPipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
         )
         onFrameCallback?(frame)
         frames.yield(frame)
+        recordLatency(of: timestamp)
+    }
+
+    /// Adds this frame's presentation-to-now latency to the rollup and logs the window when
+    /// it's due. Presentation times are on the session's clock, the host clock on iOS; a value
+    /// outside 0...10 s means another clock and is skipped.
+    private func recordLatency(of timestamp: CMTime) {
+        guard timestamp.isNumeric else { return }
+        let latency = CMTimeGetSeconds(CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()), timestamp))
+        guard latency >= 0, latency < 10 else { return }
+        let now = CACurrentMediaTime()
+        guard let summary = latencyWindow.add(latency, now: now, interval: latencyLogInterval) else { return }
+        PRMLog.debug(
+            .filter,
+            "Frame latency over \(String(format: "%.1f", summary.span))s: avg \(Int(summary.average * 1000)) ms, max \(Int(summary.maximum * 1000)) ms (\(summary.count) frames)"
+        )
     }
 
     public func captureOutput(
@@ -247,9 +282,45 @@ extension PRMFilterPipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
             // turning on debug logging. Rolled up to one line per `dropLogInterval`s
             // — the previous per-frame `.debug` line flooded the log at 30-60 lines/s
             // under interruption with no useful aggregate signal.
-            PRMLogger.filter.notice(
-                "Dropped \(countToFlush, privacy: .public) video frame(s) in last \(intervalToFlush, format: .fixed(precision: 2), privacy: .public)s"
-            )
+            PRMLog.notice(.filter, "Dropped \(countToFlush) video frame(s) in last \(String(format: "%.2f", intervalToFlush))s")
         }
+    }
+}
+
+// MARK: - Latency window
+
+/// Average and maximum of the latencies added since the last flush.
+struct LatencyWindow {
+    struct Summary: Equatable {
+        let average: Double
+        let maximum: Double
+        let count: Int
+        let span: CFTimeInterval
+    }
+
+    private var sum: Double = 0
+    private var maximum: Double = 0
+    private var count = 0
+    private var start: CFTimeInterval?
+    private var last: CFTimeInterval?
+
+    /// Adds `latency`; returns the window's summary and starts a new one once `interval`
+    /// seconds have passed since its first sample. A gap longer than `interval` (the session
+    /// stopped, or the app was in the background) drops the samples before it, so a summary
+    /// never spans one.
+    mutating func add(_ latency: Double, now: CFTimeInterval, interval: CFTimeInterval) -> Summary? {
+        if let last, now - last > interval {
+            self = Self()
+        }
+        last = now
+        let windowStart = start ?? now
+        start = windowStart
+        sum += latency
+        maximum = max(maximum, latency)
+        count += 1
+        guard now - windowStart >= interval else { return nil }
+        let summary = Summary(average: sum / Double(count), maximum: maximum, count: count, span: now - windowStart)
+        self = Self()
+        return summary
     }
 }

@@ -20,13 +20,21 @@ public enum PRMImage: Sendable {
         return jpegData(from: ciImage, compressionQuality: compressionQuality, context: context)
     }
 
-    /// Encodes a `CIImage` to JPEG data using the provided render context.
+    /// Encodes a `CIImage` to JPEG data using the provided render context. Returns `nil`
+    /// for an empty or infinite extent (crop first), which the encoder can't represent.
+    ///
+    /// Encodes in sRGB: an extended-range color space inherited from a capture makes
+    /// `jpegRepresentation` return `nil` without saying why.
     public static func jpegData(
         from ciImage: CIImage,
         compressionQuality: CGFloat = 0.9,
         context: PRMRenderContext
     ) -> Data? {
-        let colorSpace = ciImage.colorSpace ?? CGColorSpaceCreateDeviceRGB()
+        guard !ciImage.extent.isEmpty, !ciImage.extent.isInfinite else {
+            PRMLog.warning(.general, "PRMImage.jpegData: the image has no finite extent")
+            return nil
+        }
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         return context.ciContext.jpegRepresentation(
             of: ciImage,
             colorSpace: colorSpace,
@@ -68,6 +76,7 @@ public enum PRMImage: Sendable {
             ? filteredImage.extent
             : sourceExtent
         let finite = filteredImage.cropped(to: crop)
+        guard !finite.extent.isEmpty, !finite.extent.isInfinite else { return nil }
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         let options = Self.representationOptions(
             from: originalProperties,
@@ -80,7 +89,7 @@ public enum PRMImage: Sendable {
         )
     }
 
-    /// HEIF/HEIC equivalent of ``jpegDataPreservingMetadata(from:originalProperties:compressionQuality:context:)``.
+    /// HEIF/HEIC equivalent of ``jpegDataPreservingMetadata(from:sourceExtent:originalProperties:compressionQuality:context:)``.
     /// Used by ``PRMPhotoCapture``'s filter-encode path when the user requested an HEIC
     /// `AVVideoCodecType` on `PRMPhotoSettings`. Returns `nil` when the device's CIContext
     /// cannot encode HEIF (older simulators, missing HEVC encoder); callers should fall

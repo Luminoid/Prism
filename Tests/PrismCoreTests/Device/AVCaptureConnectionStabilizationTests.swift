@@ -13,7 +13,6 @@ struct AVCaptureConnectionStabilizationTests {
         let setStab: (AVCaptureConnection) -> (AVCaptureVideoStabilizationMode) -> Void =
             { connection in connection.prm_setStabilization }
         _ = setStab
-        #expect(true)
     }
 
     @Test

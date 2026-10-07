@@ -5,6 +5,89 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+iOS 26 and iOS 27 capture APIs, a rebuilt logging layer, and a round of capture, session and accessibility fixes. Building now requires Xcode 27 (Swift 6.4, iOS 27 SDK); the deployment target stays iOS 18, and every new API is availability-gated. Breaking changes are marked in Changed. On-device validation is tracked in `Example/HARDWARE-CHECKLIST.md`.
+
+### Added
+
+- **Priority modes and variable aperture (iOS 27)**: `PRMExposureValue`, `PRMExposureAxes`, `setExposure(aperture:shutterSeconds:iso:)`, `setShutterPriority(seconds:)`, `setISOPriority(_:)`, `setAperturePriority(_:)`, `setAutoApertureRateLimit(_:)`, `exposurePriorityAxes`; device helpers `prm_setExposure(aperture:shutterSeconds:iso:completion:)`, `prm_supportsExposure(...)`, `prm_lensApertureRange`, `prm_autoExposureAxes`, `prm_setAutoApertureRateLimit(_:)`. State `lensAperture`, `autoExposureAxes`; device `apertureRange`, `recommendedApertureStops`.
+- **Exposure signals (iOS 27)**: `PRMExposureSignal`, `setExposureSignals(_:)`, `prm_setExposureSignals(_:)`, `prm_activeExposureSignals`; state `activeExposureSignals`, device `supportedExposureSignals`.
+- **Lens lock (iOS 27)**: `lockLens(_:)`, `prm_lockPrimaryConstituent(to:)`, `prm_isPrimaryConstituentLocked`; state `isPrimaryConstituentLocked`, device `supportsPrimaryConstituentLock`.
+- **Focus and exposure rects of interest (iOS 26)**: `setFocusAndExposure(focusMode:exposureMode:in:monitorSubjectAreaChange:)`, `defaultFocusRect(for:)`, `prm_setFocusAndExposure(focusMode:exposureMode:in:monitorSubjectAreaChange:)`, `prm_defaultFocusRect(for:)`, `prm_setExposurePointOfInterest(_:mode:)`; device `supportsFocusRectOfInterest`, `supportsExposureRectOfInterest`.
+- **Calibrated white balance presets (iOS 26)**: `PRMWhiteBalancePreset.temperatureAndTint`.
+- **Nominal focal lengths (iOS 26)**: `PRMLens.FocalLengthSource` / `focalLengthSource`, `prm_nominalFocalLength35mm`.
+- **Subject tracking (iOS 27)**: `setContinuousAutoFocusTrackingEnabled(_:)`, `setContinuousAutoFocusTrackingBias(_:)`, `prm_setContinuousAutoFocusTracking(_:)`, `prm_setContinuousAutoFocusTrackingBias(_:retargetingAt:)` and the `prm_isContinuousAutoFocusTracking…` / `prm_continuousAutoFocusTrackingBias` properties; state for enabled, subject acquired and bias; device `supportsContinuousAutoFocusTracking`.
+- **Detected objects**: `PRMDetectedObject`, `PRMMetadataRouter` (with `lastFocusTrackedObject`), `detectedObjectsStream()`, `setMetadataObjectTypes(_:)`, `PRMCameraConfiguration.includesMetadataOutput` and `metadataObjectTypes`.
+- **Cinematic Video (iOS 26)**: `setCinematicVideoEnabled(_:targetPhotoOutputAttached:)`, `PRMCameraConfiguration.enableCinematicVideo`, `PRMCinematicFocusMode`, `PRMCinematicFocusRequest` with `setCinematicFocus(_:)` / `prm_setCinematicFocus(_:)`, `setCinematicSimulatedAperture(_:)`, `PRMSceneMonitoringStatus` / `prm_cinematicSceneStatuses`, format `prm_cinematicFrameRateRange` and `prm_simulatedApertureRange`, and on iOS 27 `PRMCinematicMetadataCapture` with `setCinematicMetadataCapture(_:)`. State `isCinematicVideoCaptureEnabled`, `cinematicSimulatedAperture`, `cinematicSceneStatuses`, `isCinematicVideoMetadataCaptureEnabled`; device `supportsCinematicVideo`, `cinematicVideoDeviceType`, `cinematicZoomRange`, `simulatedApertureRange`, `cinematicFrameRateRange`, and `PRMCameraDevice.cinematicVideoDeviceType(at:)`. Apple supports Cinematic Video on the back Dual Wide and front TrueDepth cameras, not the Triple camera Pro iPhones open by default: enabling switches to the camera that supports it and disabling switches back, `switchCamera(to:)` lands on the new position's Cinematic camera while it's on, and `enableCinematicVideo` opens that camera at configure. Apps driving `PRMCameraSession` directly call `reapplyCinematicVideoCaptureIfNeeded()` after a camera switch (`PRMCamera` does it for you).
+- **Focus safety**: `PRMCamera.setFocusMode(_:)` and `PRMCameraSession.withVideoDevice(_:)`, which checks Cinematic Video and writes to the device in one step (AVFoundation raises on focus-mode changes while Cinematic Video is on).
+- **Session health**: `PRMDeferredStart` / `PRMCameraConfiguration.deferredStart` (iOS 26), `lensSmudgeDetectionInterval`, `setLensSmudgeDetection(interval:)`, `PRMLensSmudgeStatus` and `prm_lensSmudgeStatus` (iOS 26), `PRMLowLightVideoNoiseReduction` with `setLowLightVideoNoiseReduction(_:)` (iOS 27), `enableBluetoothHighQualityRecording` (iOS 26), `PRMSystemPressure`; state `lensSmudgeStatus`, `isLowLightVideoNoiseReductionActive`, `systemPressure`, `interruptionReason`; device `supportsLensSmudgeDetection`, `supportsLowLightVideoNoiseReduction`.
+- **Dynamic aspect ratio and Smart Framing (iOS 26)**: `PRMAspectRatio`, `PRMVideoDimensions`, `PRMFraming`, `setDynamicAspectRatio(_:)`, `supportedFramings()`, `setSmartFraming(enabledFramings:)`, `framingRecommendationStream()` (the current recommendation first, then changes), `applyFraming(_:)`, `prm_dynamicAspectRatio`, `prm_dynamicDimensions`, `prm_setDynamicAspectRatio(_:timeout:)`; state `dynamicAspectRatio`, `dynamicDimensions`; device `supportedDynamicAspectRatios`, `supportsSmartFraming`.
+- **AirPods Camera Control (iOS 26)**: `PRMCaptureSound`, `PRMCaptureEventHelper.primarySound` / `secondarySound` / `usesCustomCaptureSounds`.
+- **Capture orientation**: `PRMPhotoSettings.rotationAngle(_:)` rotates the saved photo; pass `PRMRotationCoordinator.currentCaptureRotationAngle` so landscape shots save upright.
+- **Session controls**: `PRMCameraSession.setZoom(_:)`, `rampZoom(to:rate:)`, `setFrameRate(_:allowFormatChange:)`, `resetFrameRate()`, `enableDepthFormat()`, `setHighResolutionPhotoFormat(_:)` and `setStabilization(_:)`, each checked and applied in one step; `attachDepthDataOutput(delegate:queue:filteringEnabled:)` / `detachDepthDataOutput()` for a live depth stream the session keeps across reconfigures; `wantsRunning` and `restartAfterMediaServicesReset()`.
+- **Errors**: `PRMSessionError.captureFailed(_:)` carries AVFoundation's `AVError` (so its code, such as `-11872`, survives), plus `.exposureCombinationUnsupported` and `.unsupportedConfiguration(_:)`; `PRMBurstInterruptedError`.
+- **Device helpers**: `prm_withConfigurationLock(_:)`, `prm_supportsCustomLensPosition`, `prm_supportsManualExposureCapture`, `prm_setLensPosition(_:completion:)`; the waiting variants of `prm_setLensPosition`, `prm_setCustomExposure` and `prm_lockWhiteBalance` take a `timeout`.
+- **PrismUI accessibility**: VoiceOver labels and states on the settings drawer and rows (the drawer is modal while open and closes with the escape gesture), mode-aware shutter labels with press-and-hold offered as custom actions, a localized level reading, Dynamic Type in the drawer and rows, and opt-in `hapticsEnabled` on `PRMShutterButton` and `PRMLevelIndicatorView`. PrismUI's strings are localizable.
+- **Night mode**: `PRMNightModeOptions`, `PRMNightPlan`, `PRMNightProgress`, `PRMNightPhoto`, `PRMNightModeCapture.plan(_:)` (the plan a capture would use, for an "AUTO 3s" label), and `PRMCameraSession.isExclusiveCaptureActive`.
+- **Portrait readiness**: `PRMPortraitReadiness` and `PRMPortraitReadinessMonitor`, which tell whether a Portrait capture gets its depth effect right now (subject distance from a live depth stream, face and body detections, light) for a "NATURAL LIGHT" style indicator.
+- **Frame orientation**: `PRMRotationCoordinator.portraitFrameRotation(connectionAngle:)` and `frameRotation(uprightAngle:connectionAngle:)` give the rotation a view still has to apply to video-data frames, with `PRMCameraSession.videoDataRotationAngle` and `isVideoDataMirrored`. A connection's default rotation isn't always 0: on the Center Stage front camera of iPhone 17 and later it is 270°, so drawing frames by the coordinator's angle alone leaves that preview sideways.
+- **Other**: `PRMCameraConfiguration.enableCameraSensorOrientationCompensation` (iOS 26), `PRMRotationCoordinator.videoRotationAngle(relativeTo:)` (iOS 27), `PRMCameraSession.defaultVideoDeviceType(at:)`, `.lowLatency` stabilization (iOS 26).
+- **Logging (`PRMLog`)**: six levels (`debug` to `fault`, `PRMLogLevel`) under the subsystem `dev.luminoid.prism`, categories `Session`, `Capture`, `Filter`, `Preview` and `General`. `PRMLog.minimumLevel` sets the threshold at runtime (default `.info`; errors and faults are always written); `PRMLog.handler` forwards every written `PRMLogEntry`. Message text is public; file paths and full error descriptions are private.
+- **Always-on log lines**: a notice summary after configure, start, stop and every device switch; `isRunning` changes; interruptions with their reason; thermal state and system pressure changes; photo and recording outcomes; permission results. Every error sent to `errorStream()` is logged.
+- **Example app**: iOS 26 / 27 drawer sections in Studio with telemetry badges and detection overlays, the iOS 26 / 27 flags in Configuration Lab, and `Example/HARDWARE-CHECKLIST.md`.
+
+### Changed
+
+- **Breaking: building requires Xcode 27** (`swift-tools-version: 6.4`).
+- **Breaking: `PRMLogger` and `PRMLogCategory` are removed**, replaced by `PRMLog`. `PRMLogger.isVerboseTracingEnabled = true` becomes `PRMLog.minimumLevel = .debug`. The subsystem changes from `com.luminoid.Prism` to `dev.luminoid.prism`, so update Console filters and `log` predicates.
+- **Breaking: `PRMSessionError` has three new cases** (`captureFailed`, `exposureCombinationUnsupported`, `unsupportedConfiguration`), which break exhaustive `switch` statements. AVFoundation capture and recording errors now arrive as `captureFailed` instead of `photoCaptureFailed` / `videoRecordingFailed` strings.
+- **Breaking: `PRMPhotoCapture.output` and `PRMVideoRecorder.output` are optional**: `nil` for a session-based wrapper before its first capture, instead of an empty placeholder output.
+- **Breaking: device setters throw when the device lacks the mode** instead of returning silently: `prm_setExposureMode`, `prm_setCustomExposure`, `prm_setWhiteBalanceMode`, `prm_lockWhiteBalance`, `prm_setTorch`, `prm_setFocusMode`, `prm_setLensPosition`, and `prm_setVideoHDR` / `prm_setLowLightBoost` when turning the feature on. The matching `PRMCamera` setters report it on `errorStream()`.
+- **Breaking: `captureBurst` throws `PRMBurstInterruptedError`** (with the photos already captured) when a shot after the first fails.
+- Switching cameras, changing the frame rate or format, entering a depth format, removing the movie output and reconfiguring are refused while recording, with `PRMSessionError.unsupportedConfiguration`.
+- Photo settings are checked against the photo output at capture time: quality prioritization above the output's maximum is lowered to it, and `maxDimensions` the active format doesn't offer falls back to the largest one that fits.
+- **Breaking: `PRMNightModeCapture` is rebuilt for brighter, cleaner Night photos.** `init(session:context:)` and `capture(_:progress:)` returning `PRMNightPhoto` replace `init(capture:context:)` and `capture(frameCount:perFrameDuration:iso:codec:didCaptureFrame:)`. It picks the exposure from how dark the scene is, gathers frames from the live stream for 1 to 3 seconds (up to 10 when the phone is stable), aligns them, leaves out what moved, and brightens the result by up to 3 EV. It needs a physical camera: on a virtual multi-camera device it throws `virtualDeviceManualControlUnsupported`, so switch to `.builtInWideAngleCamera` first. During a capture, camera switches, format and frame-rate changes, zoom, focus, exposure and white-balance changes are refused.
+- The live preview no longer gets the requested stabilization mode, which on video formats could delay it by up to a second (`.auto` picks cinematic stabilization there). The video data output runs unstabilized in photo modes and with iOS 26's low-latency stabilization while a movie output is attached; recordings keep the requested mode, and `PRMCameraState.activeStabilizationMode` reports the recording connection when there is one.
+- The video data output's `sampleBufferDelegate` is Prism's frame router, which forwards every callback to the delegate passed to `setVideoDataOutputDelegate(_:)`.
+- A `PRMPhotoSettings.manualExposureOverride` on a camera that can't take a manual exposure (virtual multi-camera devices) captures at the camera's own exposure and leaves the EXIF alone.
+- `PRMAspectRatioMaskView.cropRect(in:)` orients the ratio to the bounds: 4:3 in a portrait view is a 3:4 crop.
+- `PRMCameraSession.isRunning` reflects the capture session itself, and the session restarts on its own after a media-services reset if the app wanted it running.
+- Video stabilization, the 48MP photo format choice and Live Photo's on/off state carry across camera switches.
+- `stateStream()` emits only when the state changed and delivers the newest state to slow subscribers.
+- `lockWhiteBalance(preset:)` locks to Apple's calibrated values on iOS 26 and later (every preset except `.flash`); `PRMWhiteBalancePreset.temperature` keeps the nominal Kelvin.
+- `PRMLens.focalLength35mm` reports nominal focal lengths on iOS 26 and later; `snapping()` leaves nominal values unchanged.
+- Tap-to-focus no longer turns subject-area monitoring back on while subject tracking is enabled.
+- `setFrameRate`, `resetFrameRate` and `enableDepthFormat` refresh `PRMCamera.device`, since the active format (and with it most capability flags) can change.
+- `PRMPreviewView` stops redrawing while frames aren't arriving and flushes its texture cache on memory warnings.
+- Deprecated: `withConfigurationLock(_:)` (use `prm_withConfigurationLock(_:)`), `prm_setLensPositionAsync` (use `prm_setLensPosition(_:completion:)`), `PRMPhotoSettings.livePhoto` (ignored; use `captureLivePhoto`), `PRMPhotoSettings.makeAVSettings()` (use `makeAVSettings(for:)`), `PRMDepthCapture.addDepthDataOutput(to:delegate:queue:)` (use `PRMCameraSession.attachDepthDataOutput`).
+
+### Fixed
+
+- After AVFoundation stopped the session (a runtime error or media-services reset), `start()` did nothing and the preview stayed black.
+- Switching cameras in video or slow-motion mode with Live Photo configured froze the preview for a full session rebuild and ended any recording.
+- Night captures and manual-exposure stills crashed on iOS 27 when the camera was a virtual multi-camera device (Triple or Dual Camera).
+- Captures could crash the app: a quality prioritization above the output's maximum, a manual exposure outside the active format's ISO or shutter range, `maxDimensions` the output couldn't deliver, and Portrait captures against a replaced photo output.
+- A Portrait capture before any other capture never requested depth, the portrait matte or HEIF.
+- Starting a recording while the previous one was finalizing deleted the previous recording; `cancel()` left the recorder in `.recording`.
+- A capture could hang when a deferred photo came back empty or a Live Photo's movie never arrived.
+- `captureBurst` discarded every photo already captured when a later shot failed.
+- `setLensPosition` never returned without a camera.
+- Shutter speeds at the ends of the range could round outside it and crash; fractional frame rates such as 29.97 fps were truncated.
+- Auto torch crashed on devices without it; manual exposure turned automatic video HDR back on after an explicit `setVideoHDR(_:)`; `enableDepthFormat()` left geometric distortion correction off for good.
+- Lens zoom labels on dual (wide + telephoto) cameras read the wide lens as 0.5×.
+- Video stabilization was lost after a camera switch, and the video output's pixel format was forced back to BGRA after a format change.
+- A refused manual exposure or white-balance lock kept showing the requested values, and a tap-to-focus left manual ISO and shutter pinned.
+- `PRMPortraitBokehFilter`'s depth mode crashed, the blur filters darkened the frame edges, and filters that move the image rendered offset in the live chain.
+- Replacing the active filter renderer could race the frame being rendered.
+- `PRMPreviewView.texturePoint(fromViewPoint:)` and `viewPoint(fromTexturePoint:)` mirrored 90° and 270° rotations and ignored the fill crop and fit letterbox.
+- `PRMLevelIndicatorView` hid the tilt with Reduce Motion on, and took over a shared motion manager's handler.
+- A late subscriber to a stream with a current value could end up with a stale one.
+- `PRMVideoRecorder.start()` could hang forever when recording failed (or was stopped) before it began.
+- `PRMVideoRecorder.stop()` returned a `PRMRecording` with a `duration` of 0.
+- `setHighResolutionPhotoFormat(true)` could pick the video-range (`420v`) twin of the 48MP format, which has fewer tonal steps than the full-range one.
+- Filtered frames and photos from a camera format that carries color primaries but no color space were rendered in device RGB, which could shift colors; the color space is now built from the format's primaries and transfer function.
+
 ## [0.1.0] - 2026-05-22
 
 Initial release. Camera pipeline Swift Package for iOS 18+, built on Swift 6.2 strict concurrency.

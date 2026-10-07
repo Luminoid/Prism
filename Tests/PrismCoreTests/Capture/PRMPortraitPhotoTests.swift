@@ -13,7 +13,6 @@ struct PRMPortraitPhotoTests {
         let depthKP: KeyPath<PRMPortraitPhoto, AVDepthData?> = \PRMPortraitPhoto.depthData
         let matteKP: KeyPath<PRMPortraitPhoto, AVPortraitEffectsMatte?> = \PRMPortraitPhoto.portraitEffectsMatte
         _ = (photoKP, depthKP, matteKP)
-        #expect(true)
     }
 
     @Test

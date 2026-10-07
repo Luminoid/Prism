@@ -13,9 +13,9 @@ final class SceneDelegate: UIResponder, UIWindowSceneDelegate {
         let root = RootCatalogViewController()
         let nav = UINavigationController(rootViewController: root)
         nav.navigationBar.prefersLargeTitles = true
-        nav.overrideUserInterfaceStyle = .dark
+        // The whole app is dark (`UIUserInterfaceStyle` in Info.plist): a camera UI over a
+        // live preview.
         window.rootViewController = nav
-        window.overrideUserInterfaceStyle = .dark
         window.makeKeyAndVisible()
         self.window = window
     }

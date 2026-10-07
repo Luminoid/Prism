@@ -27,7 +27,9 @@ public enum PRMPermissions: Sendable {
 
     /// Requests camera access and returns whether it was granted.
     public static func requestCameraAccess() async -> Bool {
-        await AVCaptureDevice.requestAccess(for: .video)
+        let granted = await AVCaptureDevice.requestAccess(for: .video)
+        PRMLog.notice(.session, "Camera access request: granted=\(granted), status=\(cameraStatus())")
+        return granted
     }
 
     // MARK: - Microphone
@@ -38,7 +40,9 @@ public enum PRMPermissions: Sendable {
 
     /// Requests microphone access and returns whether it was granted.
     public static func requestMicrophoneAccess() async -> Bool {
-        await AVCaptureDevice.requestAccess(for: .audio)
+        let granted = await AVCaptureDevice.requestAccess(for: .audio)
+        PRMLog.notice(.session, "Microphone access request: granted=\(granted), status=\(microphoneStatus())")
+        return granted
     }
 
     // MARK: - Settings

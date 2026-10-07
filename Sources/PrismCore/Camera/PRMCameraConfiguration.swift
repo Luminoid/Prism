@@ -3,7 +3,7 @@ import AVFoundation
 /// Configuration for setting up a camera session.
 ///
 /// Sensible defaults match a photo + filtered-video preview workflow. Customize before passing
-/// to ``PRMCameraSession.configure(_:)``.
+/// to ``PRMCameraSession/configure(_:)``.
 public struct PRMCameraConfiguration: Sendable {
     /// The session preset controlling output quality.
     public var sessionPreset: AVCaptureSession.Preset
@@ -61,8 +61,10 @@ public struct PRMCameraConfiguration: Sendable {
     /// Enable portrait effects matte delivery on the photo output.
     public var enablePortraitEffectsMatteDelivery: Bool
 
-    /// Preferred video stabilization mode for the video-data output connection.
-    /// Applied lazily once the connection is available.
+    /// Preferred video stabilization mode for recordings (the movie output connection).
+    /// Applied lazily once the connection is available. The video-data output behind the
+    /// live preview never gets the latency-heavy cinematic modes: it runs unstabilized in the
+    /// photo modes and with iOS 26's `.lowLatency` while a movie output is attached.
     public var preferredVideoStabilizationMode: AVCaptureVideoStabilizationMode
 
     /// iPad-only (iOS 16+): allow camera capture while the app is multitasking. iPhone returns
@@ -88,6 +90,45 @@ public struct PRMCameraConfiguration: Sendable {
     /// `enableAutoDeferredPhotoDelivery`, `enableLivePhoto` — all substitute 12MP proxy captures.
     public var prefersMaxPhotoDimensionsFormat: Bool
 
+    // MARK: iOS 26 / 27
+
+    /// iOS 26: which outputs start after the first preview frame. `.systemDefault` keeps
+    /// AVFoundation's behavior (apps linked on iOS 26+ defer the photo and movie outputs).
+    public var deferredStart: PRMDeferredStart
+
+    /// iOS 26: run camera-lens smudge detection. `nil` = off, `.invalid` = once per session
+    /// start, `.zero` = continuously, any other time = that interval between runs. Results
+    /// land in ``PRMCameraState/lensSmudgeStatus``. Enabling it rebuilds the capture
+    /// pipeline, which is why it's set here rather than after start.
+    public var lensSmudgeDetectionInterval: CMTime?
+
+    /// iOS 26: let users pick AirPods as a high-quality microphone for recording. Only
+    /// applies when ``includesAudio`` is `true`.
+    public var enableBluetoothHighQualityRecording: Bool
+
+    /// Attach an `AVCaptureMetadataOutput` at configure time. Without it, Prism attaches one
+    /// lazily the first time a feature needs it (subject tracking, Cinematic Video, or
+    /// ``metadataObjectTypes``), at the cost of one extra pipeline rebuild then.
+    public var includesMetadataOutput: Bool
+
+    /// Extra metadata object types (faces, bodies, pets, …) to deliver on
+    /// ``PRMCamera/detectedObjectsStream()``. Types the device can't produce are dropped.
+    /// Ignored while Cinematic Video is enabled, which needs its own fixed set.
+    public var metadataObjectTypes: [AVMetadataObject.ObjectType]
+
+    /// iOS 26: start with Cinematic Video capture enabled (shallow depth of field and focus
+    /// transitions in recorded video). Implies a movie file output. Incompatible with Live
+    /// Photo, 48MP formats and depth delivery; `validate()` warns about those. When the first
+    /// of `deviceTypes` at `cameraPosition` has no Cinematic Video format (the Triple camera
+    /// on Pro iPhones), the session opens the camera that does
+    /// (``PRMCameraDevice/cinematicVideoDeviceType(at:)``).
+    public var enableCinematicVideo: Bool
+
+    /// iOS 26: rotate HEIC / JPEG still buffers to match earlier hardware's sensor
+    /// orientation (for apps that assume it). `nil` leaves the system default. Prism's own
+    /// rotation handling doesn't need it.
+    public var enableCameraSensorOrientationCompensation: Bool?
+
     public init(
         sessionPreset: AVCaptureSession.Preset = .photo,
         cameraPosition: AVCaptureDevice.Position = .back,
@@ -107,7 +148,14 @@ public struct PRMCameraConfiguration: Sendable {
         enablePortraitEffectsMatteDelivery: Bool = false,
         preferredVideoStabilizationMode: AVCaptureVideoStabilizationMode = .auto,
         enableMultitaskingCameraAccess: Bool = false,
-        prefersMaxPhotoDimensionsFormat: Bool = false
+        prefersMaxPhotoDimensionsFormat: Bool = false,
+        deferredStart: PRMDeferredStart = .systemDefault,
+        lensSmudgeDetectionInterval: CMTime? = nil,
+        enableBluetoothHighQualityRecording: Bool = false,
+        includesMetadataOutput: Bool = false,
+        metadataObjectTypes: [AVMetadataObject.ObjectType] = [],
+        enableCinematicVideo: Bool = false,
+        enableCameraSensorOrientationCompensation: Bool? = nil
     ) {
         self.sessionPreset = sessionPreset
         self.cameraPosition = cameraPosition
@@ -128,6 +176,13 @@ public struct PRMCameraConfiguration: Sendable {
         self.preferredVideoStabilizationMode = preferredVideoStabilizationMode
         self.enableMultitaskingCameraAccess = enableMultitaskingCameraAccess
         self.prefersMaxPhotoDimensionsFormat = prefersMaxPhotoDimensionsFormat
+        self.deferredStart = deferredStart
+        self.lensSmudgeDetectionInterval = lensSmudgeDetectionInterval
+        self.enableBluetoothHighQualityRecording = enableBluetoothHighQualityRecording
+        self.includesMetadataOutput = includesMetadataOutput
+        self.metadataObjectTypes = metadataObjectTypes
+        self.enableCinematicVideo = enableCinematicVideo
+        self.enableCameraSensorOrientationCompensation = enableCameraSensorOrientationCompensation
     }
 
     /// Default device type preference order: triple → dual → dual-wide → wide-angle.
@@ -167,9 +222,11 @@ public struct PRMCameraConfiguration: Sendable {
     ///   of the format chosen, so the promotion is a silent no-op until the consumer
     ///   `switchDevice(type: .builtInWideAngleCamera)` themselves.
     func validate() {
+        validateCinematicVideo()
         guard prefersMaxPhotoDimensionsFormat else { return }
         if enableLivePhoto {
-            PRMLogger.session.warning(
+            PRMLog.warning(
+                .session,
                 """
                 PRMCameraConfiguration: prefersMaxPhotoDimensionsFormat=true is incompatible \
                 with enableLivePhoto=true — the 48MP photo format does not stream the parallel \
@@ -181,7 +238,8 @@ public struct PRMCameraConfiguration: Sendable {
             assertionFailure("prefersMaxPhotoDimensionsFormat + enableLivePhoto are mutually exclusive")
         }
         if enableZeroShutterLag {
-            PRMLogger.session.warning(
+            PRMLog.warning(
+                .session,
                 """
                 PRMCameraConfiguration: prefersMaxPhotoDimensionsFormat=true substitutes 12MP proxy captures \
                 when combined with enableZeroShutterLag=true; the 48MP capture you toggled on never actually fires.
@@ -189,7 +247,8 @@ public struct PRMCameraConfiguration: Sendable {
             )
         }
         if enableAutoDeferredPhotoDelivery {
-            PRMLogger.session.warning(
+            PRMLog.warning(
+                .session,
                 """
                 PRMCameraConfiguration: prefersMaxPhotoDimensionsFormat=true substitutes 12MP proxy captures \
                 when combined with enableAutoDeferredPhotoDelivery=true; the 48MP capture you toggled on \
@@ -205,7 +264,8 @@ public struct PRMCameraConfiguration: Sendable {
             ]
             if deviceTypes.first.map({ virtualTypes.contains($0) }) == true,
                !deviceTypes.contains(.builtInWideAngleCamera) {
-                PRMLogger.session.warning(
+                PRMLog.warning(
+                    .session,
                     """
                     PRMCameraConfiguration: prefersMaxPhotoDimensionsFormat=true but deviceTypes \
                     starts with a virtual multi-camera and does not list .builtInWideAngleCamera. \
@@ -216,5 +276,30 @@ public struct PRMCameraConfiguration: Sendable {
                 )
             }
         #endif
+    }
+
+    /// Cinematic Video runs its own depth pipeline and movie path; Live Photo, the 48MP
+    /// formats and photo depth delivery all compete with it. AVFoundation turns the losers
+    /// off silently (or refuses the format), so say so up front.
+    private func validateCinematicVideo() {
+        guard enableCinematicVideo else { return }
+        if enableLivePhoto {
+            PRMLog.warning(
+                .session,
+                "PRMCameraConfiguration: enableCinematicVideo=true attaches a movie output, which disables Live Photo (enableLivePhoto=true will have no effect)."
+            )
+        }
+        if prefersMaxPhotoDimensionsFormat {
+            PRMLog.warning(
+                .session,
+                "PRMCameraConfiguration: enableCinematicVideo=true switches to a Cinematic Video format, overriding prefersMaxPhotoDimensionsFormat."
+            )
+        }
+        if enableDepthDataDelivery || enablePortraitEffectsMatteDelivery {
+            PRMLog.warning(
+                .session,
+                "PRMCameraConfiguration: enableCinematicVideo=true is incompatible with photo depth / portrait matte delivery; expect them to be unavailable."
+            )
+        }
     }
 }

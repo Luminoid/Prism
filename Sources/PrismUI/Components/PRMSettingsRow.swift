@@ -11,11 +11,17 @@
         // MARK: - Configuration
 
         public var title: String {
-            didSet { titleLabel.text = title }
+            didSet {
+                titleLabel.text = title
+                updateHeaderAccessibility()
+            }
         }
 
         public var valueText: String? {
-            didSet { valueLabel.text = valueText }
+            didSet {
+                valueLabel.text = valueText
+                updateHeaderAccessibility()
+            }
         }
 
         public var symbolName: String {
@@ -23,17 +29,22 @@
         }
 
         public var isExpanded: Bool {
-            didSet { applyExpansion(animated: true) }
+            didSet {
+                applyExpansion(animated: true)
+                updateHeaderAccessibility()
+            }
         }
 
-        /// Title font. Override to match the host app's type ramp.
+        /// Title font at the default text size; it scales with Dynamic Type. Override to match
+        /// the host app's type ramp.
         public var titleFont: UIFont = .systemFont(ofSize: 13, weight: .semibold) {
-            didSet { titleLabel.font = titleFont }
+            didSet { titleLabel.font = UIFontMetrics(forTextStyle: .subheadline).scaledFont(for: titleFont) }
         }
 
-        /// Value-label font. Defaults to a monospaced digit font for tabular numerics.
+        /// Value-label font at the default text size, scaled with Dynamic Type. Defaults to a
+        /// monospaced digit font for tabular numerics.
         public var valueFont: UIFont = .monospacedSystemFont(ofSize: 11, weight: .medium) {
-            didSet { valueLabel.font = valueFont }
+            didSet { valueLabel.font = UIFontMetrics(forTextStyle: .caption1).scaledFont(for: valueFont) }
         }
 
         public var onToggle: ((Bool) -> Void)?
@@ -56,7 +67,10 @@
             isContentDisabled = message != nil
             contentView.isUserInteractionEnabled = !isContentDisabled
             contentView.alpha = isContentDisabled ? 0.35 : 1.0
+            // VoiceOver reads the explanation instead of controls that can't be used.
+            contentView.accessibilityElementsHidden = isContentDisabled
             disabledOverlay.isHidden = !isContentDisabled
+            disabledOverlay.accessibilityLabel = message
         }
 
         // MARK: - Subviews
@@ -100,12 +114,18 @@
 
             headerButton.translatesAutoresizingMaskIntoConstraints = false
             addSubview(headerButton)
+            // At least 44pt (the HIG minimum target), taller when Dynamic Type grows the title.
+            let preferredHeight = headerButton.heightAnchor.constraint(equalToConstant: 44)
+            preferredHeight.priority = .defaultLow
             NSLayoutConstraint.activate([
                 headerButton.topAnchor.constraint(equalTo: topAnchor),
                 headerButton.leadingAnchor.constraint(equalTo: leadingAnchor),
                 headerButton.trailingAnchor.constraint(equalTo: trailingAnchor),
-                headerButton.heightAnchor.constraint(equalToConstant: 44),
+                headerButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
+                preferredHeight,
             ])
+            headerButton.isAccessibilityElement = true
+            headerButton.accessibilityTraits = .button
             headerButton.addAction(UIAction { [weak self] _ in
                 guard let self else { return }
                 self.isExpanded.toggle()
@@ -126,17 +146,21 @@
 
             titleLabel.text = title
             titleLabel.textColor = .white
-            titleLabel.font = titleFont
+            titleLabel.font = UIFontMetrics(forTextStyle: .subheadline).scaledFont(for: titleFont)
+            titleLabel.adjustsFontForContentSizeCategory = true
             titleLabel.translatesAutoresizingMaskIntoConstraints = false
             headerButton.addSubview(titleLabel)
             NSLayoutConstraint.activate([
                 titleLabel.leadingAnchor.constraint(equalTo: symbolView.trailingAnchor, constant: 10),
                 titleLabel.centerYAnchor.constraint(equalTo: headerButton.centerYAnchor),
+                titleLabel.topAnchor.constraint(greaterThanOrEqualTo: headerButton.topAnchor, constant: 8),
+                titleLabel.bottomAnchor.constraint(lessThanOrEqualTo: headerButton.bottomAnchor, constant: -8),
             ])
 
             valueLabel.text = valueText
             valueLabel.textColor = UIColor.white.withAlphaComponent(0.7)
-            valueLabel.font = valueFont
+            valueLabel.font = UIFontMetrics(forTextStyle: .caption1).scaledFont(for: valueFont)
+            valueLabel.adjustsFontForContentSizeCategory = true
             valueLabel.textAlignment = .right
             valueLabel.translatesAutoresizingMaskIntoConstraints = false
             headerButton.addSubview(valueLabel)
@@ -189,12 +213,27 @@
             ])
             disabledOverlay.isHidden = true
             disabledOverlay.backgroundColor = .clear
+            disabledOverlay.isAccessibilityElement = true
+            disabledOverlay.accessibilityTraits = .staticText
             disabledOverlay.addAction(UIAction { [weak self] _ in
                 guard let self, let disabledMessage else { return }
                 onDisabledTap?(disabledMessage)
             }, for: .touchUpInside)
 
             applyExpansion(animated: false)
+            updateHeaderAccessibility()
+        }
+
+        /// The header reads as a button: the title, then the value and whether the row is
+        /// expanded.
+        private func updateHeaderAccessibility() {
+            headerButton.accessibilityLabel = title
+            let state = isExpanded
+                ? String(localized: "Expanded", bundle: .module)
+                : String(localized: "Collapsed", bundle: .module)
+            headerButton.accessibilityValue = [valueText, state]
+                .compactMap { $0?.isEmpty == false ? $0 : nil }
+                .joined(separator: ", ")
         }
 
         private func applyExpansion(animated: Bool) {

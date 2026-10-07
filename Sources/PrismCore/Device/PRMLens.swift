@@ -41,23 +41,38 @@ public struct PRMLens: Sendable, Equatable {
     /// Whether this entry is a physical lens or a sensor-crop.
     public let kind: Kind
 
+    /// Where ``focalLength35mm`` came from.
+    public enum FocalLengthSource: Sendable, Equatable {
+        /// iOS 26 `AVCaptureDevice.nominalFocalLengthIn35mmFilm`: Apple's own figure, which
+        /// matches the photo EXIF `FocalLengthIn35mmFormat` and needs no snapping.
+        case nominal
+        /// Derived from the active format's video field of view. Runs ~10 % long (video
+        /// FOV is cropped), so ``snapping(to:tolerance:)`` is usually wanted for display.
+        case fieldOfView
+    }
+
+    /// Where ``focalLength35mm`` came from.
+    public let focalLengthSource: FocalLengthSource
+
     public init(
         zoomFactor: CGFloat,
         displayZoomFactor: CGFloat,
         focalLength35mm: Double,
         deviceType: AVCaptureDevice.DeviceType? = nil,
-        kind: Kind = .physical
+        kind: Kind = .physical,
+        focalLengthSource: FocalLengthSource = .fieldOfView
     ) {
         self.zoomFactor = zoomFactor
         self.displayZoomFactor = displayZoomFactor
         self.focalLength35mm = focalLength35mm
         self.deviceType = deviceType
         self.kind = kind
+        self.focalLengthSource = focalLengthSource
     }
 
     /// Returns a new lens with `focalLength35mm` snapped to the lowest standard value within
     /// `tolerance` (default 20%). Helpful for displaying marketing-friendly values
-    /// (e.g., 13 mm, 24 mm, 77 mm).
+    /// (e.g., 13 mm, 24 mm, 77 mm). Nominal (iOS 26) focal lengths are returned unchanged.
     ///
     /// `videoFieldOfView` on virtual devices consistently overestimates focal length, so
     /// among all candidates within tolerance, the lowest is the closest physical match.
@@ -65,6 +80,7 @@ public struct PRMLens: Sendable, Equatable {
         to standards: [Int] = Self.standardFocalLengths,
         tolerance: Double = 0.2
     ) -> Self {
+        guard focalLengthSource == .fieldOfView else { return self }
         let candidates = standards.filter { abs(Double($0) - focalLength35mm) <= Double($0) * tolerance }
         let snapped = candidates.min().map(Double.init) ?? focalLength35mm
         return Self(
@@ -72,7 +88,8 @@ public struct PRMLens: Sendable, Equatable {
             displayZoomFactor: displayZoomFactor,
             focalLength35mm: snapped,
             deviceType: deviceType,
-            kind: kind
+            kind: kind,
+            focalLengthSource: focalLengthSource
         )
     }
 

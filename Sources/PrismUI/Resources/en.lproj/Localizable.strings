@@ -1,0 +1,35 @@
+/* PRMShutterButton: VoiceOver label in photo mode. */
+"Capture" = "Capture";
+
+/* PRMShutterButton: VoiceOver label in video mode, ready to record. */
+"Start recording" = "Start recording";
+
+/* PRMShutterButton: VoiceOver label while recording. */
+"Stop recording" = "Stop recording";
+
+/* PRMShutterButton: VoiceOver custom action standing in for press-and-hold. */
+"Start video recording" = "Start video recording";
+
+/* PRMShutterButton: VoiceOver custom action ending a press-and-hold recording. */
+"Stop video recording" = "Stop video recording";
+
+/* PRMSettingsRow: VoiceOver state of an expanded row. */
+"Expanded" = "Expanded";
+
+/* PRMSettingsRow: VoiceOver state of a collapsed row. */
+"Collapsed" = "Collapsed";
+
+/* PRMSettingsDrawerView: default drawer title. */
+"Camera" = "Camera";
+
+/* PRMSettingsDrawerView: VoiceOver label of the close button. */
+"Close settings" = "Close settings";
+
+/* PRMLevelIndicatorView: VoiceOver label. */
+"Level indicator" = "Level indicator";
+
+/* PRMLevelIndicatorView: VoiceOver value when the device is level. */
+"Level" = "Level";
+
+/* PRMLevelIndicatorView: VoiceOver value while tilted; the number is whole degrees. */
+"Tilted %lld degrees" = "Tilted %lld degrees";

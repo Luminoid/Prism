@@ -9,7 +9,8 @@ import Testing
 /// - Initialization with a bare `AVCapturePhotoOutput` (legacy `init(output:)`).
 /// - Initialization with a `PRMCameraSession` (session-based `init(session:)`).
 /// - Output property is the same instance that was injected (fixed resolver).
-/// - Output property returns a non-nil placeholder before any capture has resolved a session-bound output.
+/// - Output property is `nil` for a session-based wrapper before any capture.
+/// - Capturing without a photo output throws a typed error; AVFoundation errors keep their code.
 /// - Type is `Sendable` across actor hops.
 /// - Public API key paths exist (schema lock).
 struct PRMPhotoCaptureTests {
@@ -31,22 +32,75 @@ struct PRMPhotoCaptureTests {
     }
 
     @Test
-    func `Session-based init produces a placeholder output before any capture`() {
-        // The session-based `init(session:)` doesn't eagerly resolve — the
-        // first resolution happens at the entry of the first capture call. The
-        // public `output` property still has to be non-nil for back-compat
-        // (e.g. `PRMNightModeCapture` reads it through its `.capture.output`
-        // identity), so the wrapper returns a placeholder `AVCapturePhotoOutput`
-        // instance instead of trapping. The placeholder's identity is stable
-        // across reads — but it is NOT the same instance as the session's
-        // current photoOutput (the simulator session has no inputs, so no
-        // photoOutput has been attached either).
-        let session = PRMCameraSession()
-        let capture = PRMPhotoCapture(session: session)
-        let first = capture.output
-        let second = capture.output
-        #expect(type(of: first) == AVCapturePhotoOutput.self)
-        #expect(type(of: second) == AVCapturePhotoOutput.self)
+    func `Session-based init has no output before any capture`() {
+        // The session-based init resolves at each capture, so there's nothing to report
+        // until the first one (a placeholder would hand out an output that delivers nothing).
+        let capture = PRMPhotoCapture(session: PRMCameraSession())
+        #expect(capture.output == nil)
+    }
+
+    @Test
+    func `Capturing without a photo output throws instead of raising`() async {
+        let capture = PRMPhotoCapture(session: PRMCameraSession())
+        do {
+            _ = try await capture.capturePhoto()
+            Issue.record("Expected the capture to throw")
+        } catch let error as PRMSessionError {
+            guard case .photoCaptureFailed = error else {
+                Issue.record("Unexpected PRMSessionError case: \(error)")
+                return
+            }
+        } catch {
+            Issue.record("Unexpected error type: \(type(of: error))")
+        }
+    }
+
+    @Test
+    func `An empty burst returns no photos`() async throws {
+        let capture = PRMPhotoCapture(session: PRMCameraSession())
+        #expect(try await capture.captureBurst(count: 0).isEmpty)
+    }
+
+    @Test
+    func `AVFoundation errors keep their code`() {
+        let hardware = NSError(domain: AVFoundationErrorDomain, code: -11872)
+        guard case let .captureFailed(avError) = PRMPhotoCapture.sessionError(for: hardware) else {
+            Issue.record("Expected captureFailed")
+            return
+        }
+        #expect(avError.code.rawValue == -11872)
+        let other = NSError(domain: NSCocoaErrorDomain, code: 4)
+        guard case .photoCaptureFailed = PRMPhotoCapture.sessionError(for: other) else {
+            Issue.record("Expected photoCaptureFailed for a non-AVFoundation error")
+            return
+        }
+    }
+
+    @Test
+    func `Portrait requests follow what the output delivers`() {
+        // A bare output delivers no depth or matte, so a Portrait capture must not request
+        // them (AVFoundation raises when the output has delivery off).
+        let output = AVCapturePhotoOutput()
+        let portrait = PRMPhotoCapture.portraitSettings(from: PRMPhotoSettings(), output: output)
+        #expect(portrait.depthDataDelivery == nil)
+        #expect(portrait.portraitEffectsMatte == nil)
+        #expect(portrait.embedsDepthDataInPhoto == nil)
+    }
+
+    @Test
+    func `No manual bracket fires on an output or camera that can't take one`() {
+        // Firing one anyway raises NSInvalidArgumentException (iOS 27 checks the active format),
+        // so manual exposure falls back to regular settings. A bare output allows no bracket.
+        let output = AVCapturePhotoOutput()
+        #expect(PRMPhotoCapture.manualBracketBlocker(device: nil, output: output) != nil)
+    }
+
+    @Test
+    func `A burst error carries the photos already captured`() {
+        let error = PRMBurstInterruptedError(capturedPhotos: [], underlyingError: PRMSessionError.cancelled)
+        #expect(error.capturedPhotos.isEmpty)
+        #expect(error.underlyingError as? PRMSessionError == .cancelled)
+        #expect(error.localizedDescription.contains("0 photos"))
     }
 
     @Test

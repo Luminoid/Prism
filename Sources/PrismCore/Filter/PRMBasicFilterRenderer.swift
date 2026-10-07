@@ -15,15 +15,24 @@ import CoreVideo
 /// ```
 public final class PRMBasicFilterRenderer: PRMFilterRenderer, @unchecked Sendable {
     public let description: String
-    public private(set) var isPrepared = false
-    public private(set) var outputFormatDescription: CMFormatDescription?
-    public private(set) var inputFormatDescription: CMFormatDescription?
 
-    private let context: PRMRenderContext
+    public var isPrepared: Bool {
+        chain.isPrepared
+    }
+
+    public var outputFormatDescription: CMFormatDescription? {
+        chain.outputFormatDescription
+    }
+
+    public var inputFormatDescription: CMFormatDescription? {
+        chain.inputFormatDescription
+    }
+
+    /// A one-entry chain does the pooling, locking and rendering, so both renderers share
+    /// one implementation (and one thread-safety story: state is snapshotted under a lock,
+    /// so `reset()` from another thread can't tear a render).
+    private let chain: PRMFilterChain
     private let filterFactory: @Sendable () -> any PRMFilter
-    private var filter: (any PRMFilter)?
-    private var outputColorSpace: CGColorSpace?
-    private var outputPixelBufferPool: CVPixelBufferPool?
 
     /// - Parameters:
     ///   - context: Shared Metal-backed CIContext.
@@ -34,58 +43,23 @@ public final class PRMBasicFilterRenderer: PRMFilterRenderer, @unchecked Sendabl
         description: String,
         filterFactory: @escaping @Sendable () -> any PRMFilter
     ) {
-        self.context = context
         self.description = description
         self.filterFactory = filterFactory
+        chain = PRMFilterChain(context: context, description: description)
     }
 
     public func prepare(with formatDescription: CMFormatDescription, outputRetainedBufferCountHint: Int) {
-        reset()
-
-        guard let allocation = PRMBufferPoolAllocator.allocate(
-            with: formatDescription,
-            retainedBufferCountHint: outputRetainedBufferCountHint
-        ) else {
-            PRMLogger.filter.error("[\(self.description)] Failed to allocate output buffer pool")
-            return
-        }
-
-        outputPixelBufferPool = allocation.bufferPool
-        outputColorSpace = allocation.colorSpace
-        outputFormatDescription = allocation.formatDescription
-        inputFormatDescription = formatDescription
-        filter = filterFactory()
-        isPrepared = true
+        chain.replace([PRMFilterChain.Entry(filter: filterFactory())])
+        chain.prepare(with: formatDescription, outputRetainedBufferCountHint: outputRetainedBufferCountHint)
     }
 
     public func reset() {
-        filter = nil
-        outputColorSpace = nil
-        outputPixelBufferPool = nil
-        outputFormatDescription = nil
-        inputFormatDescription = nil
-        isPrepared = false
+        chain.reset()
+        chain.removeAll()
     }
 
     public func render(pixelBuffer: CVPixelBuffer) -> CVPixelBuffer? {
-        guard isPrepared, let filter, let pool = outputPixelBufferPool else { return nil }
-
-        let sourceImage = CIImage(cvImageBuffer: pixelBuffer)
-        let filtered = filter.render(sourceImage)
-
-        var output: CVPixelBuffer?
-        CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &output)
-        guard let outputPixelBuffer = output else {
-            PRMLogger.filter.warning("[\(self.description)] Failed to allocate output pixel buffer")
-            return nil
-        }
-
-        context.ciContext.render(
-            filtered,
-            to: outputPixelBuffer,
-            bounds: filtered.extent,
-            colorSpace: outputColorSpace
-        )
-        return outputPixelBuffer
+        guard chain.isPrepared, !chain.isEmpty else { return nil }
+        return chain.render(pixelBuffer: pixelBuffer)
     }
 }

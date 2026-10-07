@@ -14,6 +14,5 @@ struct AVCaptureDeviceHDRTests {
         let isLowLight: (AVCaptureDevice) -> Bool =
             { device in device.prm_isLowLightBoostActive }
         _ = (setHDR, setLowLight, isLowLight)
-        #expect(true)
     }
 }

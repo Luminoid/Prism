@@ -36,10 +36,14 @@ public struct PRMPhotoSettings: Sendable {
     /// `NSInvalidArgumentException` at capture time. Pair with `embedsDepthDataInPhoto`
     /// (both true together for embed, both false for property-only delivery).
     public var embedsPortraitEffectsMatteInPhoto: Bool?
-    /// When true, request a paired Live Photo movie alongside the still image.
-    /// Requires `enableLivePhoto` on ``PRMCameraConfiguration``. The movie sidecar URL is
-    /// supplied automatically by ``PRMPhotoCapture/captureLivePhoto(settings:willCapture:)``.
-    public var livePhoto: Bool = false
+    /// Ignored: a Live Photo is whatever ``PRMPhotoCapture/captureLivePhoto(settings:willCapture:)``
+    /// captures, which supplies the movie URL itself.
+    @available(*, deprecated, message: "Ignored; call PRMPhotoCapture.captureLivePhoto(settings:willCapture:) for a Live Photo")
+    public var livePhoto: Bool {
+        get { false }
+        set { _ = newValue }
+    }
+
     /// When true and the photo output supports it, request a portrait effects matte
     /// alongside the still image (used by depth-based bokeh).
     public var portraitEffectsMatte: Bool?
@@ -56,7 +60,19 @@ public struct PRMPhotoSettings: Sendable {
     /// which reflects the user's intent rather than the device's lagging
     /// reads, so even when the AVF commit hasn't fully landed yet the saved
     /// photo's EXIF still shows the slider values.
+    ///
+    /// The override fires as a manual-exposure bracket, which needs a camera
+    /// that takes manual exposure (`AVCaptureDevice.prm_supportsManualExposureCapture`;
+    /// virtual multi-camera devices don't). Without one the photo is captured
+    /// at the device's own exposure, and the EXIF is patched only if the device
+    /// is in `.custom`.
     public var manualExposureOverride: (iso: Float, duration: CMTime)?
+
+    /// Rotation for the saved photo, in degrees (`videoRotationAngle` on the photo output's
+    /// connection, applied just before the shutter fires). Pass
+    /// ``PRMRotationCoordinator/currentCaptureRotationAngle`` so landscape shots save
+    /// upright. `nil` leaves the connection as it is.
+    public var rotationAngle: CGFloat?
 
     public init() {}
 
@@ -110,10 +126,10 @@ public struct PRMPhotoSettings: Sendable {
         return copy
     }
 
-    public func livePhoto(_ enabled: Bool) -> Self {
-        var copy = self
-        copy.livePhoto = enabled
-        return copy
+    /// Ignored; see ``livePhoto``.
+    @available(*, deprecated, message: "Ignored; call PRMPhotoCapture.captureLivePhoto(settings:willCapture:) for a Live Photo")
+    public func livePhoto(_: Bool) -> Self {
+        self
     }
 
     public func portraitEffectsMatte(_ enabled: Bool) -> Self {
@@ -129,42 +145,65 @@ public struct PRMPhotoSettings: Sendable {
         return copy
     }
 
+    /// See ``rotationAngle``.
+    public func rotationAngle(_ degrees: CGFloat) -> Self {
+        var copy = self
+        copy.rotationAngle = degrees
+        return copy
+    }
+
     // MARK: - Materialize
 
-    /// Builds an `AVCapturePhotoSettings` instance from this configuration. Use the
-    /// `output`-taking overload below whenever a `PRMPhotoCapture` is available — it
-    /// validates the codec against the output's `availablePhotoCodecTypes` so HEVC
-    /// requests on devices without an HEVC encoder fall back to JPEG instead of
-    /// throwing `NSInvalidArgumentException`.
+    /// Builds an `AVCapturePhotoSettings` with no output to check against: unsupported
+    /// codecs, quality above the output's maximum and invalid dimensions all raise at
+    /// capture time.
+    @available(*, deprecated, message: "Use makeAVSettings(for:), which validates against the output")
     public func makeAVSettings() -> AVCapturePhotoSettings {
-        makeAVSettings(supportedCodecs: nil)
+        makeUncheckedAVSettings(codec: codec, quality: qualityPrioritization, maxDimensions: maxDimensions)
     }
 
-    /// Codec-validated variant. Pass the photo output the settings will run against;
-    /// the codec is validated against `output.availablePhotoCodecTypes` and dropped
-    /// (falls back to JPEG) when unsupported. AVFoundation otherwise throws
-    /// `NSInvalidArgumentException` from `capturePhotoWithSettings:` for unsupported
-    /// codecs — the simulator has no HEVC encoder, and some older devices return
-    /// `[.jpeg]` only.
+    /// Builds `AVCapturePhotoSettings` that the given output accepts. AVFoundation raises
+    /// `NSInvalidArgumentException` from `capturePhoto(with:delegate:)` for each of these, so
+    /// they're corrected here instead:
+    ///
+    /// - A codec the output doesn't offer (the simulator has no HEVC encoder; some older
+    ///   devices list `[.jpeg]` only) falls back to the default (JPEG).
+    /// - Quality prioritization above the output's `maxPhotoQualityPrioritization` is lowered
+    ///   to it.
+    /// - `maxDimensions` must be one of the active format's `supportedMaxPhotoDimensions` and
+    ///   no larger than the output's ceiling; otherwise the largest valid entry that fits is
+    ///   used (or none). A notice is logged when it changes.
     public func makeAVSettings(for output: AVCapturePhotoOutput) -> AVCapturePhotoSettings {
-        makeAVSettings(supportedCodecs: output.availablePhotoCodecTypes)
+        let effectiveCodec = codec.flatMap { output.availablePhotoCodecTypes.contains($0) ? $0 : nil }
+        let quality = Self.clampedQuality(qualityPrioritization, max: output.maxPhotoQualityPrioritization)
+        let dimensions = maxDimensions.flatMap { requested in
+            Self.validatedMaxDimensions(
+                requested,
+                supported: output.prm_sourceDevice?.activeFormat.supportedMaxPhotoDimensions ?? [],
+                ceiling: output.maxPhotoDimensions
+            )
+        }
+        if let requested = maxDimensions, dimensions?.width != requested.width || dimensions?.height != requested.height {
+            let applied = dimensions.map { "\($0.width)×\($0.height)" } ?? "the output default"
+            PRMLog.notice(.capture, "Photo maxDimensions \(requested.width)×\(requested.height) isn't available; using \(applied)")
+        }
+        return makeUncheckedAVSettings(codec: effectiveCodec, quality: quality, maxDimensions: dimensions)
     }
 
-    private func makeAVSettings(supportedCodecs: [AVVideoCodecType]?) -> AVCapturePhotoSettings {
-        let effectiveCodec: AVVideoCodecType? = {
-            guard let codec else { return nil }
-            if let supportedCodecs, !supportedCodecs.contains(codec) { return nil }
-            return codec
-        }()
+    private func makeUncheckedAVSettings(
+        codec effectiveCodec: AVVideoCodecType?,
+        quality: AVCapturePhotoOutput.QualityPrioritization,
+        maxDimensions dimensions: CMVideoDimensions?
+    ) -> AVCapturePhotoSettings {
         let settings = if let effectiveCodec {
             AVCapturePhotoSettings(format: [AVVideoCodecKey: effectiveCodec])
         } else {
             AVCapturePhotoSettings()
         }
         settings.flashMode = flashMode
-        settings.photoQualityPrioritization = qualityPrioritization
-        if let maxDimensions {
-            settings.maxPhotoDimensions = maxDimensions
+        settings.photoQualityPrioritization = quality
+        if let dimensions {
+            settings.maxPhotoDimensions = dimensions
         }
         if let autoRedEyeReduction {
             settings.isAutoRedEyeReductionEnabled = autoRedEyeReduction
@@ -182,5 +221,37 @@ public struct PRMPhotoSettings: Sendable {
             settings.embedsPortraitEffectsMatteInPhoto = embedsPortraitEffectsMatteInPhoto
         }
         return settings
+    }
+
+    // MARK: - Validation helpers
+
+    /// `requested`, lowered to `maximum` when it's higher.
+    static func clampedQuality(
+        _ requested: AVCapturePhotoOutput.QualityPrioritization,
+        max maximum: AVCapturePhotoOutput.QualityPrioritization
+    ) -> AVCapturePhotoOutput.QualityPrioritization {
+        requested.rawValue > maximum.rawValue ? maximum : requested
+    }
+
+    /// The dimensions to request: `requested` when it's one of `supported` and fits the
+    /// output's `ceiling`; otherwise the largest supported entry that fits both (by area), or
+    /// `nil` when none does. A zero `ceiling` (output still rebuilding) only checks
+    /// `supported`. Pure, so it's unit-testable.
+    static func validatedMaxDimensions(
+        _ requested: CMVideoDimensions,
+        supported: [CMVideoDimensions],
+        ceiling: CMVideoDimensions
+    ) -> CMVideoDimensions? {
+        let hasCeiling = ceiling.width > 0 && ceiling.height > 0
+        func fits(_ dims: CMVideoDimensions, within bound: CMVideoDimensions) -> Bool {
+            dims.width <= bound.width && dims.height <= bound.height
+        }
+        let candidates = supported.filter { !hasCeiling || fits($0, within: ceiling) }
+        if candidates.contains(where: { $0.width == requested.width && $0.height == requested.height }) {
+            return requested
+        }
+        return candidates
+            .filter { fits($0, within: requested) }
+            .max { Int64($0.width) * Int64($0.height) < Int64($1.width) * Int64($1.height) }
     }
 }

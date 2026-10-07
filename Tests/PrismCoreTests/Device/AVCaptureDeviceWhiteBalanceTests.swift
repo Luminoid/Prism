@@ -48,4 +48,28 @@ struct AVCaptureDeviceWhiteBalanceTests {
         let result = await Task.detached { TempTint(temperature: 5500, tint: 10) }.value
         #expect(result == TempTint(temperature: 5500, tint: 10))
     }
+
+    @Test
+    func `Preset values are Apple's calibrated ones on iOS 26, nominal before`() {
+        for preset in Preset.allCases {
+            let values = preset.temperatureAndTint
+            #expect(values.temperature > 0)
+            if #available(iOS 26.0, *), preset != .flash {
+                continue
+            }
+            #expect(values == TempTint(temperature: preset.temperature, tint: 0))
+        }
+    }
+
+    @Test
+    func `Flash has no system constant and keeps its nominal Kelvin`() {
+        #expect(Preset.flash.temperatureAndTint == TempTint(temperature: 5400, tint: 0))
+    }
+
+    @Test
+    func `Calibrated presets stay warm-to-cool ordered`() {
+        let order: [Preset] = [.tungsten, .fluorescent, .daylight, .cloudy, .shade]
+        let temps = order.map(\.temperatureAndTint.temperature)
+        #expect(temps == temps.sorted())
+    }
 }

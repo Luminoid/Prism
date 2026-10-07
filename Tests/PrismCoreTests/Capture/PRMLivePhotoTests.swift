@@ -12,7 +12,6 @@ struct PRMLivePhotoTests {
         let photoKP: KeyPath<PRMLivePhoto, PRMPhoto> = \PRMLivePhoto.photo
         let movieKP: KeyPath<PRMLivePhoto, URL> = \PRMLivePhoto.movieURL
         _ = (photoKP, movieKP)
-        #expect(true)
     }
 
     @Test
