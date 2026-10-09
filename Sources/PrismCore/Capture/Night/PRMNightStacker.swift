@@ -21,6 +21,38 @@ final class PRMNightStacker: @unchecked Sendable {
         /// At the planned exposure but arrived while the previous frame was still merging.
         var skipped = 0
         var lastAcceptedTime: CFTimeInterval?
+        var timing = Timing()
+    }
+
+    /// Where the stacker's time goes for each frame it processed (merged or rejected):
+    /// preparing it (BGRA, the quarter-size copy, sharpness), aligning it (Vision and the
+    /// identity check) and the GPU merge. Frames that take longer than the frame interval are
+    /// why later ones arrive while it's busy (``Status/skipped``).
+    struct Timing: Equatable {
+        private(set) var frames = 0
+        private(set) var prepare: CFTimeInterval = 0
+        private(set) var align: CFTimeInterval = 0
+        private(set) var merge: CFTimeInterval = 0
+
+        /// Adds one frame from the times its stages ended. A stage the frame never reached
+        /// (rejected before it) counts as zero.
+        mutating func add(start: CFTimeInterval, prepared: CFTimeInterval?, aligned: CFTimeInterval?, end: CFTimeInterval) {
+            frames += 1
+            prepare += (prepared ?? end) - start
+            guard let prepared else { return }
+            align += (aligned ?? end) - prepared
+            guard let aligned else { return }
+            merge += end - aligned
+        }
+
+        /// "95 ms a frame: 9 prepare, 58 align, 28 merge", or empty before the first frame.
+        var summary: String {
+            guard frames > 0 else { return "" }
+            func milliseconds(_ seconds: CFTimeInterval) -> Int {
+                Int((seconds / Double(frames) * 1000).rounded())
+            }
+            return "\(milliseconds(prepare + align + merge)) ms a frame: \(milliseconds(prepare)) prepare, \(milliseconds(align)) align, \(milliseconds(merge)) merge"
+        }
     }
 
     /// What ``offer(_:)`` does with a frame.
@@ -163,6 +195,15 @@ final class PRMNightStacker: @unchecked Sendable {
     // MARK: - Merging (stacker queue)
 
     private func process(_ frame: CVPixelBuffer, attachments: [String: Any]?) {
+        let start = CACurrentMediaTime()
+        var prepared: CFTimeInterval?
+        var aligned: CFTimeInterval?
+        defer {
+            let end = CACurrentMediaTime()
+            lock.lock()
+            status.timing.add(start: start, prepared: prepared, aligned: aligned, end: end)
+            lock.unlock()
+        }
         guard let bgra = bgraFrame(frame) else { return reject("not convertible to BGRA") }
         let width = CVPixelBufferGetWidth(bgra)
         let height = CVPixelBufferGetHeight(bgra)
@@ -177,8 +218,10 @@ final class PRMNightStacker: @unchecked Sendable {
         let sharpness = PRMNightRegistration.sharpness(small)
         let typicalSharpness = sharpnessGate.typical
         let isSharpEnough = sharpnessGate.admits(sharpness)
+        prepared = CACurrentMediaTime()
 
         guard let referenceSmall else {
+            aligned = prepared
             guard merger.add(frame: bgra, frameSmall: small, referenceSmall: small, warp: matrix_identity_float3x3, isReference: true, ghost: ghost) else {
                 return reject("GPU merge failed")
             }
@@ -193,6 +236,7 @@ final class PRMNightStacker: @unchecked Sendable {
         guard let warp = registration.warp(floatingSmall: small, referenceSmall: referenceSmall) else {
             return reject("couldn't align")
         }
+        aligned = CACurrentMediaTime()
         guard merger.add(frame: bgra, frameSmall: small, referenceSmall: referenceSmall, warp: warp, isReference: false, ghost: ghost) else {
             return reject("GPU merge failed")
         }

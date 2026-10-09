@@ -203,7 +203,8 @@ public final class PRMNightModeCapture: @unchecked Sendable {
         PRMLog.notice(
             .capture,
             """
-            Night photo: \(mergedCount) of \(plan.frameCount) frames (\(status.rejected) rejected, \(status.skipped) skipped while merging), \
+            Night photo: \(mergedCount) of \(plan.frameCount) frames (\(status.rejected) rejected, \(status.skipped) skipped while merging; \
+            \(status.timing.summary)), \
             key \(String(format: "%.3f", stats.logAverage)), \
             gain +\(String(format: "%.1f", gain)) EV, \(Int(upright.extent.width))×\(Int(upright.extent.height)), \(data.count) bytes
             """

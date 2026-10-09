@@ -62,6 +62,17 @@ struct PRMCameraDeviceTests {
     }
 
     @Test
+    func `The depth camera lookup answers the same each time, off the main actor too`() async {
+        let first = await Task.detached { PRMCameraDevice.depthDeviceType(at: .back) }.value
+        #expect(PRMCameraDevice.depthDeviceType(at: .back) == first)
+        #if targetEnvironment(simulator)
+            // No cameras, so nothing streams depth.
+            #expect(first == nil)
+            #expect(PRMCameraDevice.depthDeviceType(at: .front) == nil)
+        #endif
+    }
+
+    @Test
     func `Photo dimensions round-trip and take part in equality`() {
         let fortyEight = makeDevice(maxSupportedPhotoDimensions: CMVideoDimensions(width: 8064, height: 6048))
         #expect(fortyEight.maxSupportedPhotoDimensions?.width == 8064)

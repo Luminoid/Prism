@@ -91,9 +91,8 @@ extension StudioViewController {
     /// The outputs, camera and format a mode change to `target` needs, in order. Returns
     /// `false` when newer work superseded it part-way.
     private func setUpSession(for target: Mode, generation: Int) async -> Bool {
-        // Only PORTRAIT streams depth; the stream costs bandwidth the other modes need.
         if target != .portrait {
-            await stopPortraitReadiness()
+            guard await leavePortrait(generation: generation) else { return false }
         }
 
         // Pro iPhones have their 120 / 240 fps formats only on the physical wide camera.
@@ -158,21 +157,104 @@ extension StudioViewController {
             guard isCurrent(generation) else { return false }
         }
 
-        // Portrait needs a format that streams depth; the `.photo` preset's default on Pro
-        // iPhones doesn't, and its depth would arrive empty. The depth format stays for the
-        // session (turning it off would raise while depth delivery is on), so later entries
-        // are cheap.
         if target == .portrait {
-            if await !camera.enableDepthFormat() {
-                ExampleLog.session.info("Portrait: no depth-capable format on this camera")
-            }
-            // The depth format can limit the constituent lenses.
-            rebuildLensStrip()
-            guard isCurrent(generation) else { return false }
-            await startPortraitReadiness()
-            guard isCurrent(generation) else { return false }
+            return await setUpPortrait(generation: generation)
         }
         return true
+    }
+
+    // MARK: - Portrait camera
+
+    /// Portrait needs a format that streams depth; the `.photo` preset's default on Pro
+    /// iPhones doesn't, and its depth would arrive empty. The depth format stays for the
+    /// session (turning it off would raise while depth delivery is on), so later entries are
+    /// cheap. A camera with no depth format at all moves to one that has it.
+    private func setUpPortrait(generation: Int) async -> Bool {
+        if await !camera.enableDepthFormat() {
+            await hopToDepthCamera()
+            guard isCurrent(generation) else { return false }
+        }
+        // The depth format can limit the constituent lenses.
+        rebuildLensStrip()
+        guard isCurrent(generation) else { return false }
+        await startPortraitReadiness()
+        return isCurrent(generation)
+    }
+
+    /// Only PORTRAIT streams depth; the stream costs bandwidth the other modes need. The
+    /// camera PORTRAIT moved to for depth goes back first, so the rest of the setup (slow
+    /// motion's and NIGHT's hops, the movie output) starts from the usual camera.
+    private func leavePortrait(generation: Int) async -> Bool {
+        await stopPortraitReadiness()
+        guard prePortraitDeviceType != nil else { return true }
+        await restorePrePortraitCamera()
+        return isCurrent(generation)
+    }
+
+    /// Moves PORTRAIT to the camera at this position that streams depth, when the current one
+    /// has no depth format: the wide camera manual controls run on, or an iPhone 14 Pro's
+    /// Triple camera on iOS 18 (its Dual Wide camera has them). Leaving PORTRAIT comes back.
+    /// A locked white balance or focus doesn't survive the switch, so the toast says so.
+    private func hopToDepthCamera() async {
+        guard let current = camera.device,
+              let depthType = PRMCameraDevice.depthDeviceType(at: current.position),
+              depthType != current.deviceType
+        else {
+            ExampleLog.session.notice("Portrait: no camera here streams depth")
+            return
+        }
+        ExampleLog.session.notice(
+            "Studio: to \(Self.typeName(depthType), privacy: .public) for PORTRAIT, \(Self.typeName(current.deviceType), privacy: .public) has no depth format"
+        )
+        let state = camera.state
+        // Back to the camera a manual control left, not the wide camera it moved to.
+        let priorManualType = preManualDeviceType
+        prePortraitDeviceType = priorManualType ?? current.deviceType
+        preManualDeviceType = nil
+        pipeline.isEnabled = false
+        defer { pipeline.isEnabled = true }
+        do {
+            try await camera.switchDevice(type: depthType, position: current.position)
+        } catch {
+            prePortraitDeviceType = nil
+            preManualDeviceType = priorManualType
+            toaster.report(error, context: "Switch to the depth camera")
+            return
+        }
+        var change = SettingChange("PORTRAIT")
+        let reason = "Portrait runs on the \(camera.device?.localizedName ?? "depth camera")"
+        if state.whiteBalanceMode == .locked {
+            change.turnedOff("locked white balance", because: reason)
+        }
+        if state.focusMode == .locked {
+            change.turnedOff("locked focus", because: reason)
+        }
+        toaster.gaveWay(change)
+        await deviceDidChange()
+        if await !camera.enableDepthFormat() {
+            ExampleLog.session.notice("Portrait: no depth-capable format on \(Self.typeName(depthType), privacy: .public)")
+        }
+    }
+
+    /// The return from ``hopToDepthCamera()`` when a mode change leaves PORTRAIT.
+    private func restorePrePortraitCamera() async {
+        guard let priorType = prePortraitDeviceType else { return }
+        prePortraitDeviceType = nil
+        ExampleLog.session.notice("Studio: back to \(Self.typeName(priorType), privacy: .public) after PORTRAIT")
+        pipeline.isEnabled = false
+        defer { pipeline.isEnabled = true }
+        do {
+            try await camera.switchDevice(type: priorType, position: camera.device?.position ?? .back)
+        } catch {
+            toaster.report(error, context: "Restore the camera")
+            return
+        }
+        await deviceDidChange()
+    }
+
+    /// "BuiltInTripleCamera", the device type as the session's own log lines name it.
+    private static func typeName(_ type: AVCaptureDevice.DeviceType) -> String {
+        type.rawValue.replacingOccurrences(of: "AVCaptureDeviceType", with: "")
     }
 
     // MARK: - Portrait readiness
@@ -381,8 +463,7 @@ extension StudioViewController {
         guard exposureIsAuto, whiteBalanceIsAuto, state.focusMode != .locked, !drawerControls.capMaxDimensions,
               !state.isCinematicVideoCaptureEnabled
         else { return }
-        let name = priorType.rawValue.replacingOccurrences(of: "AVCaptureDeviceType", with: "")
-        ExampleLog.session.notice("Studio: back to \(name, privacy: .public), nothing needs the wide camera now")
+        ExampleLog.session.notice("Studio: back to \(Self.typeName(priorType), privacy: .public), nothing needs the wide camera now")
         preManualDeviceType = nil
         pipeline.isEnabled = false
         defer { pipeline.isEnabled = true }
@@ -433,6 +514,7 @@ extension StudioViewController {
         // camera it runs on (no second switch from the virtual camera), remembering the default
         // to return to.
         preManualDeviceType = nil
+        prePortraitDeviceType = nil
         let usualType = await camera.session.defaultVideoDeviceType(at: next)
         pipeline.isEnabled = false
         do {

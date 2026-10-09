@@ -372,39 +372,76 @@ public struct PRMCameraDevice: Sendable, Equatable {
     /// Cinematic Video format. The answer is cached per position: a camera's formats don't
     /// change at runtime.
     public static func cinematicVideoDeviceType(at position: AVCaptureDevice.Position) -> AVCaptureDevice.DeviceType? {
-        CinematicVideoDeviceCache.deviceType(at: position)
+        DeviceTypeCache.deviceType(for: .cinematicVideo, at: position)
+    }
+
+    /// The camera at `position` that streams depth, or `nil` when none has a depth format.
+    ///
+    /// For a depth capture when the current camera has no depth format (``PRMCamera/enableDepthFormat()``
+    /// returns `false`): an iPhone 14 Pro's Triple camera lists none on iOS 18, while its Dual
+    /// Wide camera has them. This checks, in order, the Dual Wide, Dual, Triple, TrueDepth and
+    /// LiDAR depth cameras. The answer is cached per position.
+    public static func depthDeviceType(at position: AVCaptureDevice.Position) -> AVCaptureDevice.DeviceType? {
+        DeviceTypeCache.deviceType(for: .depth, at: position)
     }
 }
 
-/// Per-position cache for ``PRMCameraDevice/cinematicVideoDeviceType(at:)``: the discovery
-/// walks every format of several cameras.
-private enum CinematicVideoDeviceCache {
-    private static let lock = NSLock()
-    private nonisolated(unsafe) static var values: [AVCaptureDevice.Position: AVCaptureDevice.DeviceType?] = [:]
+/// Per-capability, per-position cache for ``PRMCameraDevice/cinematicVideoDeviceType(at:)``
+/// and ``PRMCameraDevice/depthDeviceType(at:)``: each discovery walks every format of several
+/// cameras.
+private enum DeviceTypeCache {
+    enum Capability: Hashable {
+        case cinematicVideo
+        case depth
+    }
 
-    static func deviceType(at position: AVCaptureDevice.Position) -> AVCaptureDevice.DeviceType? {
-        if let cached = lock.withLock({ values[position] }) {
+    private struct Key: Hashable {
+        let capability: Capability
+        let position: AVCaptureDevice.Position
+    }
+
+    private static let lock = NSLock()
+    private nonisolated(unsafe) static var values: [Key: AVCaptureDevice.DeviceType?] = [:]
+
+    static func deviceType(for capability: Capability, at position: AVCaptureDevice.Position) -> AVCaptureDevice.DeviceType? {
+        let key = Key(capability: capability, position: position)
+        if let cached = lock.withLock({ values[key] }) {
             return cached
         }
-        let result = discover(at: position)
-        lock.withLock { values[position] = result }
+        let result = discover(capability, at: position)
+        lock.withLock { values[key] = result }
         return result
     }
 
-    private static func discover(at position: AVCaptureDevice.Position) -> AVCaptureDevice.DeviceType? {
-        guard #available(iOS 26.0, *) else { return nil }
-        let preference: [AVCaptureDevice.DeviceType] = [
-            .builtInDualWideCamera,
-            .builtInTrueDepthCamera,
-            .builtInTripleCamera,
-            .builtInDualCamera,
-            .builtInWideAngleCamera,
-            .builtInUltraWideCamera,
-            .builtInTelephotoCamera,
-        ]
+    private static func discover(_ capability: Capability, at position: AVCaptureDevice.Position) -> AVCaptureDevice.DeviceType? {
+        let preference: [AVCaptureDevice.DeviceType]
+        let hasFormat: (AVCaptureDevice.Format) -> Bool
+        switch capability {
+        case .cinematicVideo:
+            guard #available(iOS 26.0, *) else { return nil }
+            preference = [
+                .builtInDualWideCamera,
+                .builtInTrueDepthCamera,
+                .builtInTripleCamera,
+                .builtInDualCamera,
+                .builtInWideAngleCamera,
+                .builtInUltraWideCamera,
+                .builtInTelephotoCamera,
+            ]
+            hasFormat = { $0.isCinematicVideoCaptureSupported }
+        case .depth:
+            preference = [
+                .builtInDualWideCamera,
+                .builtInDualCamera,
+                .builtInTripleCamera,
+                .builtInTrueDepthCamera,
+                .builtInLiDARDepthCamera,
+            ]
+            hasFormat = { !$0.supportedDepthDataFormats.isEmpty }
+        }
         let devices = AVCaptureDevice.DiscoverySession(deviceTypes: preference, mediaType: .video, position: position).devices
         return preference.first { type in
-            devices.contains { $0.deviceType == type && $0.formats.contains(where: \.isCinematicVideoCaptureSupported) }
+            devices.contains { $0.deviceType == type && $0.formats.contains(where: hasFormat) }
         }
     }
 }

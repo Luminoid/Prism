@@ -223,8 +223,12 @@ final class DepthInspectorViewController: UIViewController {
 extension DepthInspectorViewController: CameraPreviewHostDelegate {
     func cameraHostConfigure(_ host: CameraPreviewHost) async throws {
         var configuration = PRMCameraConfiguration()
-        // Cameras without dual / triple / TrueDepth hardware can't deliver depth. Ask anyway
-        // and let the support check decide.
+        // Open on the camera that streams depth: the default Triple camera may have no depth
+        // format (an iPhone 14 Pro's on iOS 18). Cameras without dual / triple / TrueDepth
+        // hardware can't deliver depth; ask anyway and let the support check decide.
+        if let depthType = PRMCameraDevice.depthDeviceType(at: configuration.cameraPosition) {
+            configuration.deviceTypes = [depthType]
+        }
         configuration.enableDepthDataDelivery = true
         try await host.camera.configure(configuration)
     }

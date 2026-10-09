@@ -136,6 +136,25 @@ The 2026-10-09 log (iPhone 18 Pro Max, iOS 27.0) confirmed HEIC from PHOTO, LIVE
 - [ ] **Max Dimensions in VIDEO.** Tapping the dimmed row toasts "Max Dimensions is for photos. Switch to PHOTO to use it." when it's off, and "… It stays on for when you go back to PHOTO." when it's on. It used to say it was kept even when off.
 - [ ] **Focus Mode is traced.** A *Focus Mode* change logs `PRMCamera.setFocusMode(…)` at debug, before any `Studio: back to …` it causes.
 
+## iPhone 14 Pro on iOS 18 (2026-10-09)
+
+The 2026-10-09 log (iPhone 14 Pro, iOS 18) confirmed PHOTO, LIVE, VIDEO at 30 fps, NIGHT's hop to the wide camera and back, a locked white balance and lens position on the wide camera, an 8064x6048 JPEG with *Max Dimensions* on, and the ISO refusal in NIGHT. Fixes from it to check:
+
+- [ ] **PORTRAIT gets depth.** The 14 Pro's Triple camera lists no depth format on iOS 18: the log said `Portrait: no depth-capable format on this camera`, the pill read unavailable, and the photo had no depth. PORTRAIT now logs `Studio: to BuiltInDualWideCamera for PORTRAIT, BuiltInTripleCamera has no depth format`, the pill tracks the subject, and the photo opens as Portrait in Photos. Leaving PORTRAIT logs `Studio: back to BuiltInTripleCamera after PORTRAIT` before the next mode's setup. A camera that has a depth format doesn't switch.
+  - Result 2026-10-09, second 14 Pro log: the switch and return lines as above, the pill went `moveCloser` → `ready (2.29 m)` and tracked distance, and the capture asked for `depth=true, portrait=true`. Still to check: the photo opens as Portrait in Photos.
+  - Result 2026-10-09 (iPhone 18 Pro Max, iOS 27.0): its Triple camera has a depth format, so PORTRAIT stayed on it (no switch line), the pill read `ready`, and the capture asked for depth.
+- [ ] **Depth Inspector.** It opens on the Dual Wide camera (`Configured: device=BuiltInDualWideCamera`, no `Depth data delivery requested but not supported` line) and the depth tile fills in. It used to say the phone had no dual camera.
+- [ ] **WB and Focus rows on the Triple camera.** That camera can't lock white balance to a temperature or focus at a lens position, so both rows were disabled (`Refused: WB (This camera can't lock white balance to a temperature)`) while *WB Mode → Locked* moved to the wide camera fine. The Kelvin slider, a WB preset and the Focus slider now log `Studio: to the wide camera for …` and apply.
+  - Result 2026-10-09, second 14 Pro log: the Kelvin slider logged `Studio: to the wide camera for White balance` and locked. The Focus slider and the presets weren't tried.
+- [ ] **WB or focus in PORTRAIT.** On the back camera, locking white balance or dragging *Focus* in PORTRAIT toasts "… turned off PORTRAIT: manual controls run on the wide camera, which has no depth." and lands in PHOTO on the wide camera. On the front TrueDepth camera PORTRAIT stays on.
+  - Result 2026-10-09 (iPhone 18 Pro Max, iOS 27.0): the Kelvin slider in PORTRAIT logged `Conflict: White balance turned off PORTRAIT (…)`, moved to PHOTO and then to the wide camera. The front camera wasn't tried. The picker line it wrote read like a tap (`Studio picker: PHOTO / STANDARD`, before the `Conflict:` line); see the next item.
+- [ ] **A conflict's mode change names its cause.** The same drag now logs `Studio picker: PHOTO / STANDARD (for White balance)`; a tap on the picker logs no `(for …)`.
+- [ ] **Mode segments offer only what the camera runs.** *WB Mode → Auto* is greyed out on every iPhone camera (none has one-shot auto white balance). The 2026-10-09 iOS 27 log shows it refused twice in a row (`Refused: auto (one-shot) white balance (…)`). *Exposure Mode* and *Focus Mode* segments stay enabled where the camera has the mode; after a switch to the wide camera and back the greyed segments still match.
+- [x] **Opaque HEIC.** A Night photo (or a filtered HEIC) logs no `writeImageAtIndex … opaque image … 'AlphaLast'` error, and the file is smaller than before for the same scene.
+  - Result 2026-10-09, second 14 Pro log: no AlphaLast line after the Night HEIC.
+- Night on the 14 Pro merged 14 of 30 frames at 1/48 s (17 skipped while merging), then 10 of 22 at 1/22 s (13 skipped): an A16 takes two frame intervals or more per 12 MP frame, so a bright 1 s scene keeps about half its frames.
+- [ ] **Night stage timing.** The Night photo line now ends its counts with `N ms a frame: P prepare, A align, M merge` (the BGRA frame, quarter-size copy and sharpness; Vision's alignment and the identity check; the GPU merge). Send the line from a 14 Pro run in a dim room and a bright one: it says which stage to speed up.
+
 ## iOS 26
 
 - [ ] **Deferred start.** Apps linked on iOS 26 defer the photo and movie outputs by default (Prism also defers its metadata output). Cold boot, then capture immediately: no `awaitPhotoOutputReady: timeout` warning in the log. Repeat right after a camera switch, and once with *Subject Tracking* on before boot.

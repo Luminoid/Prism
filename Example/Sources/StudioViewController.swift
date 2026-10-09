@@ -187,6 +187,8 @@ final class StudioViewController: UIViewController {
     /// The virtual device Studio left for manual controls or NIGHT, restored once exposure and
     /// white balance are both automatic again (and NIGHT is left).
     var preManualDeviceType: AVCaptureDevice.DeviceType?
+    /// The camera PORTRAIT left for one that streams depth, restored when PORTRAIT ends.
+    var prePortraitDeviceType: AVCaptureDevice.DeviceType?
     /// The hop to the wide camera for manual controls. Slider ticks that arrive during the hop
     /// wait for it instead of starting another.
     var manualHopTask: Task<Void, Never>?
@@ -794,8 +796,11 @@ extension StudioViewController {
     /// `.video`, the Night durations into `.night`. Changes that keep the mode (STANDARD to
     /// BURST, 30 to 24 fps) skip the full mode setup, so BURST makes its own room for itself
     /// (the mode setup does it for the others; see ``resolveConflicts(entering:)``).
-    func applyPickerSelection(primary: ModePicker.Primary, variant: ModePicker.Variant) {
-        ExampleLog.session.notice("Studio picker: \(primary.label, privacy: .public) / \(variant.label, privacy: .public)")
+    /// `setting` names what made a selection that wasn't a tap (a conflict), so the log
+    /// doesn't read as one.
+    func applyPickerSelection(primary: ModePicker.Primary, variant: ModePicker.Variant, for setting: String? = nil) {
+        let cause = setting.map { " (for \($0))" } ?? ""
+        ExampleLog.session.notice("Studio picker: \(primary.label, privacy: .public) / \(variant.label, privacy: .public)\(cause, privacy: .public)")
         burstEnabled = primary == .photo && variant == .burst
         if burstEnabled, mode == .photo, drawerControls.capMaxDimensions {
             enqueueSessionWork(supersedes: false) { [weak self] _ in await self?.resolveBurstConflict() }

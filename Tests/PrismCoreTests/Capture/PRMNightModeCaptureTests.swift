@@ -94,6 +94,23 @@ struct PRMNightModeCaptureTests {
     }
 
     @Test
+    func `Stage timing averages each frame's prepare, align and merge`() {
+        var timing = PRMNightStacker.Timing()
+        #expect(timing.summary.isEmpty)
+        // A merged frame: 10 ms preparing, 60 aligning, 30 merging.
+        timing.add(start: 1.0, prepared: 1.01, aligned: 1.07, end: 1.1)
+        // A blurred frame, rejected after preparing (10 ms): no align or merge time.
+        timing.add(start: 2.0, prepared: 2.01, aligned: nil, end: 2.01)
+        // A frame rejected before its sharpness was read: all preparing.
+        timing.add(start: 3.0, prepared: nil, aligned: nil, end: 3.01)
+        #expect(timing.frames == 3)
+        #expect(abs(timing.prepare - 0.03) < 1e-9)
+        #expect(abs(timing.align - 0.06) < 1e-9)
+        #expect(abs(timing.merge - 0.03) < 1e-9)
+        #expect(timing.summary == "40 ms a frame: 10 prepare, 20 align, 10 merge")
+    }
+
+    @Test
     func `The photo's metadata keeps the camera's and records the stack`() throws {
         let plan = PRMNightPlan(duration: 3, frameDuration: 0.125, iso: 2016.4, frameCount: 24)
         let attachments: [String: Any] = [

@@ -50,8 +50,9 @@ enum StudioSetting {
 /// | Turned on | Turns off |
 /// |---|---|
 /// | Max Dimensions | LIVE, PORTRAIT, BURST (to PHOTO); Cinematic Video; manual exposure and locked white balance |
-/// | Manual exposure or white balance | Max Dimensions; Cinematic Video; LIVE (to PHOTO); PORTRAIT for exposure (to PHOTO) |
-/// | Manual focus, Focus Mode, Subject Tracking | Cinematic Video |
+/// | Manual exposure or white balance | Max Dimensions; Cinematic Video; LIVE (to PHOTO); PORTRAIT (to PHOTO) for exposure, or for white balance on a virtual camera |
+/// | Manual focus | Cinematic Video; PORTRAIT (to PHOTO) on a virtual camera |
+/// | Focus Mode, Subject Tracking | Cinematic Video |
 /// | Cinematic Video | Max Dimensions; Subject Tracking; manual exposure and white balance; PHOTO, LIVE, PORTRAIT, NIGHT, SLO-MO (to VIDEO) |
 /// | LIVE, PORTRAIT, BURST | Max Dimensions |
 /// | PHOTO, LIVE, PORTRAIT, NIGHT, SLO-MO | Cinematic Video |
@@ -115,7 +116,7 @@ extension StudioViewController {
         case .maxDimensions:
             if mode == .live || mode == .portrait || burstEnabled {
                 change.turnedOff(burstEnabled ? "BURST" : mode.label, because: "the 48 MP format has no Live Photo movie or depth")
-                await select(.photo, .standard)
+                await select(.photo, .standard, for: change.setting)
             }
             await turnOffCinematicVideo(recording: &change, because: "Cinematic Video uses its own video format")
             await returnToAutoExposure(recording: &change, because: "manual photos are 12 MP")
@@ -125,12 +126,17 @@ extension StudioViewController {
             await turnOffCinematicVideo(recording: &change, because: Self.cinematicKeepsAuto)
             if mode == .live {
                 change.turnedOff("LIVE", because: "Live Photo keeps exposure automatic")
-                await select(.photo, .standard)
+                await select(.photo, .standard, for: change.setting)
             } else if isExposure, mode == .portrait {
                 change.turnedOff("PORTRAIT", because: "a manual capture carries no depth")
-                await select(.photo, .standard)
+                await select(.photo, .standard, for: change.setting)
+            } else {
+                await leavePortraitForWideCamera(recording: &change)
             }
-        case .manualFocus, .focusMode, .subjectTracking:
+        case .manualFocus:
+            await turnOffCinematicVideo(recording: &change, because: "Cinematic Video controls focus")
+            await leavePortraitForWideCamera(recording: &change)
+        case .focusMode, .subjectTracking:
             await turnOffCinematicVideo(recording: &change, because: "Cinematic Video controls focus")
         case .cinematicVideo:
             await turnOffMaxDimensions(recording: &change, because: "Cinematic Video uses its own video format")
@@ -142,7 +148,7 @@ extension StudioViewController {
             // wide camera a manual control moved to.
             if Self.cinematicConflict(with: mode) != nil {
                 change.turnedOff(mode.label, because: "Cinematic Video records in VIDEO")
-                await select(.video, .video30)
+                await select(.video, .video30, for: change.setting)
             }
             await returnToAutoExposure(recording: &change, because: Self.cinematicKeepsAuto)
             // Cinematic Video moves to the camera that runs it and back when it's turned off,
@@ -160,6 +166,15 @@ extension StudioViewController {
     }
 
     // MARK: - Turning things off
+
+    /// PORTRAIT off before a white balance or focus change moves a virtual camera (the one
+    /// PORTRAIT streams depth from) to the wide camera, which has no depth. A physical camera
+    /// with depth (TrueDepth) takes the change in place and keeps PORTRAIT.
+    private func leavePortraitForWideCamera(recording change: inout SettingChange) async {
+        guard mode == .portrait, needsWideCameraForManual else { return }
+        change.turnedOff("PORTRAIT", because: "manual controls run on the wide camera, which has no depth")
+        await select(.photo, .standard, for: change.setting)
+    }
 
     private func turnOffMaxDimensions(recording change: inout SettingChange, because reason: String) async {
         guard drawerControls.capMaxDimensions else { return }
@@ -190,10 +205,11 @@ extension StudioViewController {
         state.exposureMode == .custom || state.exposureMode == .locked
     }
 
-    /// Selects a mode the way a picker tap does and waits for its session setup.
-    private func select(_ primary: ModePicker.Primary, _ variant: ModePicker.Variant) async {
+    /// Selects a mode the way a picker tap does, for `setting`, and waits for its session
+    /// setup.
+    private func select(_ primary: ModePicker.Primary, _ variant: ModePicker.Variant, for setting: String) async {
         modePicker.select(primary: primary, variant: variant)
-        applyPickerSelection(primary: primary, variant: variant)
+        applyPickerSelection(primary: primary, variant: variant, for: setting)
         await sessionTask?.value
     }
 

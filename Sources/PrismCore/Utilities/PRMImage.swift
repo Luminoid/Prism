@@ -65,6 +65,8 @@ public enum PRMImage: Sendable {
     /// Twirl / Vortex / Edges produce infinite extents that JPEG encode silently rejects
     /// for the same finite-extent reason HEIF does. Cropping back to the source frame
     /// produces the expected output.
+    ///
+    /// The output is opaque, like the photo it came from (see the HEIF variant).
     public static func jpegDataPreservingMetadata(
         from filteredImage: CIImage,
         sourceExtent: CGRect,
@@ -83,7 +85,7 @@ public enum PRMImage: Sendable {
             compressionQuality: compressionQuality
         )
         return context.ciContext.jpegRepresentation(
-            of: finite,
+            of: finite.settingAlphaOne(in: finite.extent),
             colorSpace: colorSpace,
             options: options
         )
@@ -110,6 +112,11 @@ public enum PRMImage: Sendable {
     /// (which Apple guarantees matches `.RGBA8` on iPhone). `sourceExtent` is the
     /// pre-filter `CIImage(data: original).extent` — pass it explicitly so distortion
     /// filters' infinite extents collapse to the original frame.
+    ///
+    /// The output is opaque, like the photo it came from. Core Image can't tell that a
+    /// filtered image is, so an `.RGBA8` encode would store an alpha channel: iOS 18's
+    /// ImageIO then logs "trying to save an opaque image with 'AlphaLast'", and a reader
+    /// decodes twice the memory.
     public static func heifDataPreservingMetadata(
         from filteredImage: CIImage,
         sourceExtent: CGRect,
@@ -128,7 +135,7 @@ public enum PRMImage: Sendable {
             compressionQuality: compressionQuality
         )
         return context.ciContext.heifRepresentation(
-            of: finite,
+            of: finite.settingAlphaOne(in: finite.extent),
             format: .RGBA8,
             colorSpace: colorSpace,
             options: options

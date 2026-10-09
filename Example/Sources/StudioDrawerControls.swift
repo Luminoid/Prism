@@ -138,6 +138,26 @@ final class StudioDrawerControls {
     func deviceDidChange(_ device: PRMCameraDevice?) {
         supportsHighResPhoto = device.map(highResPhotoReachable) ?? false
         syncMaxDimensionsRow()
+        if let device {
+            syncModeSegments(for: device)
+        }
+    }
+
+    /// Greys out the mode segments the camera doesn't run, so only what works can be picked
+    /// (iPhone cameras have no one-shot auto white balance). A tap that lands before a camera
+    /// change reaches the segments is still refused with the modes the camera offers.
+    private func syncModeSegments(for device: PRMCameraDevice) {
+        Self.enableSegments(of: exposureModeSegmented, for: [.locked, .autoExpose, .continuousAutoExposure], supported: device.supportedExposureModes)
+        Self.enableSegments(of: wbModeSegmented, for: [.locked, .autoWhiteBalance, .continuousAutoWhiteBalance], supported: device.supportedWhiteBalanceModes)
+        Self.enableSegments(of: focusModeSegmented, for: [.locked, .autoFocus, .continuousAutoFocus], supported: device.supportedFocusModes)
+    }
+
+    /// Enables segment `i` when `modes[i]` is supported; segments past `modes` stay as they are.
+    private static func enableSegments<Mode: Equatable>(of segmented: UISegmentedControl?, for modes: [Mode], supported: [Mode]) {
+        guard let segmented else { return }
+        for (index, mode) in modes.enumerated() where index < segmented.numberOfSegments {
+            segmented.setEnabled(supported.contains(mode), forSegmentAt: index)
+        }
     }
 
     // MARK: - Drawer sections
@@ -175,6 +195,7 @@ final class StudioDrawerControls {
             ]),
         ]
         syncMaxDimensionsRow()
+        syncModeSegments(for: device)
         return sections
     }
 
@@ -841,13 +862,15 @@ final class StudioDrawerControls {
         lowLightRow?.setDisabled(message: camera.device?.supportsLowLightBoost == false ? "This camera has no low-light boost" : nil)
 
         let recordingMessage = context.isRecording ? "Setting locked while recording" : nil
-        let customWhiteBalanceMessage = camera.device?.supportsCustomWhiteBalance == false
+        // A virtual camera that can't lock white balance or a lens position (an iPhone 14 Pro's
+        // Triple camera on iOS 18) still takes the change: the row moves to the wide camera
+        // first. Only a camera with nowhere to move can't.
+        let customWhiteBalanceMessage = camera.device?.supportsCustomWhiteBalance == false && !context.manualNeedsCameraSwitch
             ? "This camera can't lock white balance to a temperature"
             : nil
         wbRow?.setDisabled(message: recordingMessage ?? customWhiteBalanceMessage)
-        // Virtual devices report locked focus as supported but throw on a custom lens position.
-        let lensPositionMessage = camera.device?.supportsCustomLensPosition == false
-            ? "Manual focus needs the wide camera. Drag ISO or Shutter to switch."
+        let lensPositionMessage = camera.device?.supportsCustomLensPosition == false && !context.manualNeedsCameraSwitch
+            ? "This camera can't lock focus at a distance"
             : nil
         focusRow?.setDisabled(message: recordingMessage ?? lensPositionMessage)
     }
