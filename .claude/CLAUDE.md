@@ -33,9 +33,9 @@
 - **iOS 17/18 photo features** — `enableResponsiveCapture`, `enableAutoDeferredPhotoDelivery`, `enableZeroShutterLag` on `PRMCameraConfiguration`.
 - **iOS 26/27 features are availability-gated, never required** — see the section below.
 
-## iOS 26 / 27 adoption (unreleased, toward 0.2.0)
+## iOS 26 / 27 adoption (0.2.0)
 
-Built against the iOS 27 SDK (Xcode 27). Hardware validation pending: `Example/HARDWARE-CHECKLIST.md` lists what only a device can show.
+Built against the iOS 27 SDK (Xcode 27).
 
 - **Stored properties can't hold iOS 26/27 types** on an iOS 18 target, so state and snapshots use Prism value types with gated bridging inits (`PRMExposureSignal`, `PRMAspectRatio`, `PRMLensSmudgeStatus`, `PRMSystemPressure`, `PRMSceneMonitoringStatus`, `PRMDetectedObject`, …). Never store `AVCaptureSmartFramingMonitor` / `AVCaptureDevice.AspectRatio`; read them from `videoDevice` each time.
 - **Swift spellings differ from the ObjC names**: `AVCaptureDeviceExposureSignal` is top-level (not `AVCaptureDevice.ExposureSignal`), `setPrimaryConstituentDeviceSwitchingBehaviorLockedWith(_:)`, `defaultRectForFocusPoint(ofInterest:)`, `AVCaptureCameraLensSmudgeDetectionStatus`, `AVCaptureEvent.play(_:)`, `AVCaptureEventSound(url:)`. Typecheck a one-liner against the SDK (`printf … | xcrun --sdk iphoneos swiftc -typecheck -target arm64-apple-ios27.0 -`) before guessing.
@@ -130,10 +130,10 @@ make build / make test / make test-27 / make build-example   # xcodebuild wrappe
 
 ## Test Structure
 
-- **142 tests / 44 suites at v0.1.0 (release figure)** — Swift Testing (`@Test`, `#expect`, `@Suite`)
+- **362 tests / 69 suites at v0.2.0 (release figure)** — Swift Testing (`@Test`, `#expect`, `@Suite`)
 - Tests mirror the source folders; `+Extension` files are covered by their type's suite or a grouped `…FeaturesTests` / `…ControlsTests` suite. Shared helpers live in `Tests/*/TestSupport/`.
 - The intensity-blend correctness fix is verified with golden pixel-comparison tests in `PRMFilterChainTests`
-- Device-touching paths (`AVCaptureDevice` extensions, `PRMPhotoCapture`/`PRMVideoRecorder`/`PRMDepthCapture` start/stop) can't run on simulator — `AVCaptureDevice.default(for:)` returns `nil`. Those modules are covered via **value-type tests** (enums, structs, presets), **API surface locks** (`KeyPath` lookups that fail to compile on signature drift), and **Sendable conformance checks** (`Task.detached` round-trips). Full hardware paths are exercised via the example app + `Example/HARDWARE-CHECKLIST.md`. iOS 26/27 tests use `@Test(.enabled(if: OSAvailability.isIOS27))` (so they report as skipped, not passed, on an older simulator) plus `guard #available(...)` in the body for the compiler (Swift Testing forbids `@available` on `@Test` functions).
+- Device-touching paths (`AVCaptureDevice` extensions, `PRMPhotoCapture`/`PRMVideoRecorder`/`PRMDepthCapture` start/stop) can't run on simulator — `AVCaptureDevice.default(for:)` returns `nil`. Those modules are covered via **value-type tests** (enums, structs, presets), **API surface locks** (`KeyPath` lookups that fail to compile on signature drift), and **Sendable conformance checks** (`Task.detached` round-trips). Full hardware paths are exercised via the Example app. iOS 26/27 tests use `@Test(.enabled(if: OSAvailability.isIOS27))` (so they report as skipped, not passed, on an older simulator) plus `guard #available(...)` in the body for the compiler (Swift Testing forbids `@available` on `@Test` functions).
 
 ## Logging
 
@@ -171,4 +171,4 @@ make build / make test / make test-27 / make build-example   # xcodebuild wrappe
 
 ---
 
-*Last updated 2026-10-04 — iOS 26/27 capture APIs plus the codebase-audit fix pass (capture pre-flight and crash fixes, atomic session controls, recorder state machine, preview mapping, PrismUI accessibility, Xcode 27 / tools 6.4), unreleased toward 0.2.0 and pending the hardware checklist. 142 tests / 44 suites at v0.1.0 (release figure).*
+*Last updated 2026-10-09 — 0.2.0: iOS 26/27 capture APIs, PRMLog, the rebuilt Night mode and Portrait readiness, the capture and session fixes, Xcode 27 / tools 6.4. 362 tests / 69 suites at v0.2.0 (release figure).*

@@ -21,7 +21,7 @@ Swift Package Manager: add Prism in Xcode (File → Add Package Dependencies…)
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/luminoid/Prism.git", from: "0.1.0"),
+    .package(url: "https://github.com/luminoid/Prism.git", from: "0.2.0"),
 ],
 targets: [
     .target(
@@ -126,7 +126,7 @@ await camera.setCinematicSimulatedAperture(2.8)
 - **Dynamic aspect ratio and Smart Framing (iOS 26)**: `setDynamicAspectRatio(_:)`, `setSmartFraming(enabledFramings:)`, `framingRecommendationStream()` and `applyFraming(_:)` for the iPhone 17 square-sensor front camera.
 - **AirPods Camera Control (iOS 26)**: a stem click reaches `PRMCaptureEventHelper` like the Camera Control button; set `primarySound` and `usesCustomCaptureSounds` to play your own shutter sound.
 
-These features are covered on the simulator at the API level (value types, pure helpers, signature locks). On-device behavior is tracked in [Example/HARDWARE-CHECKLIST.md](Example/HARDWARE-CHECKLIST.md).
+These features are covered on the simulator at the API level (value types, pure helpers, signature locks); the Example app exercises them on a device.
 
 ### Filter pipeline
 
@@ -252,13 +252,13 @@ make check   # SwiftLint + SwiftFormat
 
 iOS 27-only tests report as skipped on the 26.2 destination.
 
-Device-touching paths (AVCaptureDevice extensions, photo / video / depth capture start-stop) can't run on simulator because `AVCaptureDevice.default(for: .video)` returns `nil`. Those modules are covered via value-type tests, API-surface KeyPath locks, and Sendable round-trip checks. Hardware paths exercise via the Example app and [Example/HARDWARE-CHECKLIST.md](Example/HARDWARE-CHECKLIST.md).
+Device-touching paths (AVCaptureDevice extensions, photo / video / depth capture start-stop) can't run on simulator because `AVCaptureDevice.default(for: .video)` returns `nil`. Those modules are covered via value-type tests, API-surface KeyPath locks, and Sendable round-trip checks. Hardware paths are exercised through the Example app.
 
 ## Stats
 
 | Metric | Count |
 |--------|-------|
-| Tests at v0.1.0 | 142 across 44 suites |
+| Tests at v0.2.0 | 362 across 69 suites |
 | Built-in filters | 20 |
 | Example screens | 5 |
 
