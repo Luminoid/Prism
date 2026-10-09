@@ -68,6 +68,32 @@ struct PRMNightModeCaptureTests {
     }
 
     @Test
+    func `One sharp frame doesn't make the rest look blurred`() {
+        // The 2026-10-08 device run: the first frame measured 10, every later one 4 to 5.
+        var gate = PRMNightStacker.SharpnessGate()
+        let admitted: [Bool] = [10, 5, 5, 4.6, 4, 4.4, 5, 4].map { gate.admits(Float($0)) }
+        #expect(!admitted.contains(false))
+    }
+
+    @Test
+    func `A shaken frame in a sharp burst is rejected`() {
+        var gate = PRMNightStacker.SharpnessGate()
+        let admitted: [Bool] = [100, 95, 105, 30, 98].map { gate.admits(Float($0)) }
+        #expect(admitted == [true, true, true, false, true])
+        #expect(gate.typical == 98)
+    }
+
+    @Test
+    func `Frames that arrive mid-merge count as skipped, not rejected`() {
+        #expect(PRMNightStacker.intake(isAccepting: true, isBusy: false, merged: 3, planned: 30, atPlannedExposure: true) == .merge)
+        #expect(PRMNightStacker.intake(isAccepting: true, isBusy: true, merged: 3, planned: 30, atPlannedExposure: true) == .skip)
+        // Not wanted at all: before the exposure lands, once the plan is full, after the capture.
+        #expect(PRMNightStacker.intake(isAccepting: true, isBusy: true, merged: 3, planned: 30, atPlannedExposure: false) == .ignore)
+        #expect(PRMNightStacker.intake(isAccepting: true, isBusy: false, merged: 30, planned: 30, atPlannedExposure: true) == .ignore)
+        #expect(PRMNightStacker.intake(isAccepting: false, isBusy: false, merged: 3, planned: 30, atPlannedExposure: true) == .ignore)
+    }
+
+    @Test
     func `The photo's metadata keeps the camera's and records the stack`() throws {
         let plan = PRMNightPlan(duration: 3, frameDuration: 0.125, iso: 2016.4, frameCount: 24)
         let attachments: [String: Any] = [

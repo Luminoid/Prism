@@ -111,9 +111,10 @@ public final class PRMFilterPipeline: NSObject, @unchecked Sendable {
     private var lastDropLogTime: CFTimeInterval = 0
     private let dropLogInterval: CFTimeInterval = 2.0
 
-    // Capture-to-delivery latency rollup, logged at debug every `latencyLogInterval`
-    // seconds: how far behind the sensor each frame reaches the consumer (stabilization and
-    // effects such as Cinematic Video add to it). Only touched on the data-output queue.
+    // Capture-to-delivery latency rollup over `latencyLogInterval` seconds, logged at debug
+    // when the window was slow: how far behind the sensor each frame reaches the consumer
+    // (stabilization and effects such as Cinematic Video add to it). Only touched on the
+    // data-output queue.
     private var latencyWindow = LatencyWindow()
     private let latencyLogInterval: CFTimeInterval = 5.0
 
@@ -235,18 +236,19 @@ extension PRMFilterPipeline: AVCaptureVideoDataOutputSampleBufferDelegate {
         recordLatency(of: timestamp)
     }
 
-    /// Adds this frame's presentation-to-now latency to the rollup and logs the window when
-    /// it's due. Presentation times are on the session's clock, the host clock on iOS; a value
-    /// outside 0...10 s means another clock and is skipped.
+    /// Adds this frame's presentation-to-now latency to the rollup and logs a slow window
+    /// (see ``LatencyWindow/Summary/isSlow``) when it closes. Presentation times are on the
+    /// session's clock, the host clock on iOS; a value outside 0...10 s means another clock
+    /// and is skipped.
     private func recordLatency(of timestamp: CMTime) {
         guard timestamp.isNumeric else { return }
         let latency = CMTimeGetSeconds(CMTimeSubtract(CMClockGetTime(CMClockGetHostTimeClock()), timestamp))
         guard latency >= 0, latency < 10 else { return }
         let now = CACurrentMediaTime()
-        guard let summary = latencyWindow.add(latency, now: now, interval: latencyLogInterval) else { return }
+        guard let summary = latencyWindow.add(latency, now: now, interval: latencyLogInterval), summary.isSlow else { return }
         PRMLog.debug(
             .filter,
-            "Frame latency over \(String(format: "%.1f", summary.span))s: avg \(Int(summary.average * 1000)) ms, max \(Int(summary.maximum * 1000)) ms (\(summary.count) frames)"
+            "Slow frame latency over \(String(format: "%.1f", summary.span))s: avg \(Int(summary.average * 1000)) ms, max \(Int(summary.maximum * 1000)) ms (\(summary.count) frames)"
         )
     }
 
@@ -296,6 +298,13 @@ struct LatencyWindow {
         let maximum: Double
         let count: Int
         let span: CFTimeInterval
+
+        /// Whether the window lagged enough to log: an average of 100 ms or more (about three
+        /// frames at 30 fps; a healthy preview runs one to two), or a single frame 250 ms or
+        /// more behind (a visible stall).
+        var isSlow: Bool {
+            average >= 0.1 || maximum >= 0.25
+        }
     }
 
     private var sum: Double = 0

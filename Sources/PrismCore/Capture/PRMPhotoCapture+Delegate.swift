@@ -228,7 +228,7 @@ enum PhotoOutcome {
         case .single:
             guard let continuation = pending.singleContinuation else { return }
             pending.singleContinuation = nil
-            PRMPhotoCapture.logOutcome(result, isLivePhoto: false)
+            PRMPhotoCapture.logOutcome(result, isLivePhoto: false, requested: pending.requestedDimensions, sizeLimit: pending.sizeLimit)
             continuation.resume(with: result)
         case let .live(movieURL):
             if case .failure = result {

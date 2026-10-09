@@ -75,7 +75,9 @@ public extension AVCaptureDevice {
     ///   support `mode`, or AVFoundation's lock error.
     func prm_setWhiteBalanceMode(_ mode: AVCaptureDevice.WhiteBalanceMode) throws {
         guard isWhiteBalanceModeSupported(mode) else {
-            throw PRMSessionError.unsupportedConfiguration("White balance mode \(mode.rawValue) isn't supported by \(localizedName)")
+            throw PRMSessionError.unsupportedConfiguration(
+                "White balance mode \(mode.prm_name) isn't supported; \(prm_supportedModesText(prm_supportedWhiteBalanceModes.map(\.prm_name)))"
+            )
         }
         try prm_withConfigurationLock {
             whiteBalanceMode = mode

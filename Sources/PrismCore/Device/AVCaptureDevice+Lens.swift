@@ -8,7 +8,9 @@ public extension AVCaptureDevice {
     ///   support `mode`, or AVFoundation's lock error.
     func prm_setFocusMode(_ mode: AVCaptureDevice.FocusMode) throws {
         guard isFocusModeSupported(mode) else {
-            throw PRMSessionError.unsupportedConfiguration("Focus mode \(mode.rawValue) isn't supported by \(localizedName)")
+            throw PRMSessionError.unsupportedConfiguration(
+                "Focus mode \(mode.prm_name) isn't supported; \(prm_supportedModesText(prm_supportedFocusModes.map(\.prm_name)))"
+            )
         }
         try prm_withConfigurationLock {
             focusMode = mode

@@ -135,6 +135,24 @@ public struct PRMCameraDevice: Sendable, Equatable {
     /// iOS 26: whether the Smart Framing monitor can recommend framings.
     public let supportsSmartFraming: Bool
 
+    /// Whether ``PRMCamera/setLowLightBoost(_:)`` can turn low-light boost on for this camera.
+    public let supportsLowLightBoost: Bool
+
+    /// Whether the active format supports video HDR (``PRMCamera/setVideoHDR(_:)``).
+    public let supportsVideoHDR: Bool
+
+    /// The exposure modes ``PRMCamera/setExposureMode(_:)`` accepts on this camera, in
+    /// control order (locked, auto, continuous auto, custom).
+    public let supportedExposureModes: [AVCaptureDevice.ExposureMode]
+
+    /// The white balance modes ``PRMCamera/setWhiteBalanceMode(_:)`` accepts on this camera,
+    /// in control order. iPhone cameras have no one-shot `.autoWhiteBalance`.
+    public let supportedWhiteBalanceModes: [AVCaptureDevice.WhiteBalanceMode]
+
+    /// The focus modes ``PRMCamera/setFocusMode(_:)`` accepts on this camera, in control
+    /// order. Fixed-focus cameras list `.locked` only.
+    public let supportedFocusModes: [AVCaptureDevice.FocusMode]
+
     public init(
         uniqueID: String,
         deviceType: AVCaptureDevice.DeviceType,
@@ -169,7 +187,12 @@ public struct PRMCameraDevice: Sendable, Equatable {
         simulatedApertureRange: ClosedRange<Float>? = nil,
         cinematicFrameRateRange: ClosedRange<Float64>? = nil,
         supportedDynamicAspectRatios: [PRMAspectRatio] = [],
-        supportsSmartFraming: Bool = false
+        supportsSmartFraming: Bool = false,
+        supportsLowLightBoost: Bool = false,
+        supportsVideoHDR: Bool = false,
+        supportedExposureModes: [AVCaptureDevice.ExposureMode] = AVCaptureDevice.ExposureMode.prm_allCases,
+        supportedWhiteBalanceModes: [AVCaptureDevice.WhiteBalanceMode] = AVCaptureDevice.WhiteBalanceMode.prm_allCases,
+        supportedFocusModes: [AVCaptureDevice.FocusMode] = AVCaptureDevice.FocusMode.prm_allCases
     ) {
         self.uniqueID = uniqueID
         self.deviceType = deviceType
@@ -205,6 +228,11 @@ public struct PRMCameraDevice: Sendable, Equatable {
         self.cinematicFrameRateRange = cinematicFrameRateRange
         self.supportedDynamicAspectRatios = supportedDynamicAspectRatios
         self.supportsSmartFraming = supportsSmartFraming
+        self.supportsLowLightBoost = supportsLowLightBoost
+        self.supportsVideoHDR = supportsVideoHDR
+        self.supportedExposureModes = supportedExposureModes
+        self.supportedWhiteBalanceModes = supportedWhiteBalanceModes
+        self.supportedFocusModes = supportedFocusModes
     }
 
     /// Constructs a snapshot from an `AVCaptureDevice`. Call from session-actor context where
@@ -251,6 +279,11 @@ public struct PRMCameraDevice: Sendable, Equatable {
         maxPhotoDimensions = bestPhotoDims.map(PRMVideoDimensions.init)
         supportsCustomLensPosition = device.isFocusModeSupported(.locked)
             && device.isLockingFocusWithCustomLensPositionSupported
+        supportedExposureModes = device.prm_supportedExposureModes
+        supportedWhiteBalanceModes = device.prm_supportedWhiteBalanceModes
+        supportedFocusModes = device.prm_supportedFocusModes
+        supportsLowLightBoost = device.isLowLightBoostSupported
+        supportsVideoHDR = device.activeFormat.isVideoHDRSupported
 
         let format = device.activeFormat
         if #available(iOS 27.0, *) {
@@ -331,8 +364,10 @@ public struct PRMCameraDevice: Sendable, Equatable {
     /// The camera at `position` that Cinematic Video runs on (iOS 26), or `nil` when none has
     /// a Cinematic Video format (or before iOS 26).
     ///
-    /// Apple supports Cinematic Video on the back Dual Wide camera and the front TrueDepth
-    /// camera, not the Triple camera Pro iPhones open by default. This checks, in order, the
+    /// Which cameras have Cinematic Video formats depends on the iPhone: Apple documents the
+    /// back Dual Wide and front TrueDepth cameras, an iPhone 18 Pro Max has them on the back
+    /// wide camera and its front camera, and the Triple camera Pro iPhones open by default
+    /// has none. This checks, in order, the
     /// Dual Wide, TrueDepth, Triple, Dual, wide-angle, ultra-wide and telephoto cameras for a
     /// Cinematic Video format. The answer is cached per position: a camera's formats don't
     /// change at runtime.

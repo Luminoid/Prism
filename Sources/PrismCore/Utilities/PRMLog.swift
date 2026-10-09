@@ -2,9 +2,8 @@
 //  PRMLog.swift
 //  PrismCore
 //
-//  Shared logging core. This file is identical across Luminoid packages apart
-//  from the type prefix, subsystem, and module name; regenerate it rather than
-//  editing it by hand. Categories live in a separate file.
+//  Logging core: levels, entries, and the write functions over os.Logger.
+//  Categories live in PRMLog+Categories.swift.
 //
 
 import Foundation

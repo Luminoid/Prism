@@ -72,6 +72,11 @@ final class ConfigurationLabViewController: UIViewController {
     private var captureTask: Task<Void, Never>?
     /// The configuration's toggles, so mutual-exclusion rules can flip their peers.
     private var toggles: [ToggleKey: UISwitch] = [:]
+    /// The toggles' titles, for the toast that says what a change flipped.
+    private var toggleTitles: [ToggleKey: String] = [:]
+    /// What the user's change flipped so far, collected through the rules' cascade and
+    /// toasted once it ends.
+    private var pendingChange: SettingChange?
     private lazy var toaster = ToastPresenter(hostView: view, below: host.previewView.snp.top)
 
     // MARK: - Views
@@ -319,9 +324,19 @@ final class ConfigurationLabViewController: UIViewController {
         toggle.addAction(UIAction { [weak self] action in
             guard let self, let toggle = action.sender as? UISwitch else { return }
             configuration[keyPath: setting] = toggle.isOn
+            // A peer flipped by a rule runs this too; only the user's own change toasts.
+            let isUserChange = pendingChange == nil
+            if isUserChange {
+                pendingChange = SettingChange(toggle.isOn ? title : "Turning off \(title)")
+            }
             enforceMutualExclusion(changed: key, isOn: toggle.isOn)
+            if isUserChange, let change = pendingChange {
+                pendingChange = nil
+                toaster.gaveWay(change)
+            }
         }, for: .valueChanged)
         toggles[key] = toggle
+        toggleTitles[key] = title
         let row = UIStackView(arrangedSubviews: [label, toggle])
         row.axis = .horizontal
         row.alignment = .center
@@ -342,57 +357,66 @@ final class ConfigurationLabViewController: UIViewController {
     }
 
     /// Turns AVFoundation-incompatible peers off (and required ones on) so the user sees the
-    /// conflict now instead of a silent drop at Apply. The pairs are listed in the type's
-    /// documentation.
+    /// conflict now instead of a silent drop at Apply: the newest change wins, and the toast
+    /// says what it flipped and why.
     private func enforceMutualExclusion(changed: ToggleKey, isOn: Bool) {
+        let noDepth = "Cinematic Video can't run with depth or the matte"
+        let deferredDropsDepth = "auto-deferred delivery drops depth and the matte"
+        let movieExcludesLive = "Live Photo can't run beside a movie output"
         guard isOn else {
             switch changed {
             case .photo:
                 for key in ToggleKey.photoScoped {
-                    setToggle(key, to: false)
+                    setToggle(key, to: false, because: "photo features need the photo output")
                 }
             case .depth:
-                setToggle(.portraitMatte, to: false)
+                setToggle(.portraitMatte, to: false, because: "the portrait matte comes with depth")
             case .audio:
-                setToggle(.bluetoothHighQuality, to: false)
+                setToggle(.bluetoothHighQuality, to: false, because: "the AirPods mic records audio")
             default:
                 break
             }
             return
         }
         if ToggleKey.photoScoped.contains(changed) {
-            setToggle(.photo, to: true)
+            setToggle(.photo, to: true, because: "photo features need the photo output")
         }
         switch changed {
         case .movie:
-            setToggle(.livePhoto, to: false)
+            setToggle(.livePhoto, to: false, because: movieExcludesLive)
         case .livePhoto:
-            setToggle(.movie, to: false)
-            setToggle(.cinematic, to: false)
+            setToggle(.movie, to: false, because: movieExcludesLive)
+            setToggle(.cinematic, to: false, because: "Cinematic Video attaches a movie output")
         case .depth:
-            setToggle(.autoDeferred, to: false)
-            setToggle(.cinematic, to: false)
+            setToggle(.autoDeferred, to: false, because: deferredDropsDepth)
+            setToggle(.cinematic, to: false, because: noDepth)
         case .portraitMatte:
-            setToggle(.depth, to: true)
-            setToggle(.autoDeferred, to: false)
-            setToggle(.cinematic, to: false)
+            setToggle(.depth, to: true, because: "the portrait matte comes with depth")
+            setToggle(.autoDeferred, to: false, because: deferredDropsDepth)
+            setToggle(.cinematic, to: false, because: noDepth)
         case .autoDeferred:
-            setToggle(.depth, to: false)
-            setToggle(.portraitMatte, to: false)
+            setToggle(.depth, to: false, because: deferredDropsDepth)
+            setToggle(.portraitMatte, to: false, because: deferredDropsDepth)
         case .cinematic:
-            setToggle(.livePhoto, to: false)
-            setToggle(.depth, to: false)
-            setToggle(.portraitMatte, to: false)
+            setToggle(.livePhoto, to: false, because: "Cinematic Video attaches a movie output")
+            setToggle(.depth, to: false, because: noDepth)
+            setToggle(.portraitMatte, to: false, because: noDepth)
         case .bluetoothHighQuality:
-            setToggle(.audio, to: true)
+            setToggle(.audio, to: true, because: "the AirPods mic records audio")
         default:
             break
         }
     }
 
-    /// Flips a peer and runs its action, so its own rules apply too.
-    private func setToggle(_ key: ToggleKey, to isOn: Bool) {
+    /// Flips a peer, records it for the toast, and runs its action, so its own rules apply too.
+    private func setToggle(_ key: ToggleKey, to isOn: Bool, because reason: String) {
         guard let toggle = toggles[key], toggle.isOn != isOn else { return }
+        let title = toggleTitles[key] ?? "\(key)"
+        if isOn {
+            pendingChange?.turnedOn(title, because: reason)
+        } else {
+            pendingChange?.turnedOff(title, because: reason)
+        }
         toggle.setOn(isOn, animated: true)
         toggle.sendActions(for: .valueChanged)
     }

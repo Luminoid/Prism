@@ -25,13 +25,26 @@ extension StudioViewController {
             sessionGeneration += 1
         }
         let generation = sessionGeneration
-        let task = Task { [previous = sessionTask] in
+        pendingSessionWork += 1
+        let task = Task { [weak self, previous = sessionTask] in
+            defer { self?.pendingSessionWork -= 1 }
             await previous?.value
             guard !Task.isCancelled else { return }
             await work(generation)
         }
         sessionTask = task
         return task
+    }
+
+    /// Waits until the session work queued so far, and any queued meanwhile, has finished.
+    /// Returns whether there was any.
+    @discardableResult
+    func awaitSessionWork() async -> Bool {
+        guard pendingSessionWork > 0 else { return false }
+        while pendingSessionWork > 0, let pending = sessionTask {
+            await pending.value
+        }
+        return true
     }
 
     func isCurrent(_ generation: Int) -> Bool {
@@ -45,7 +58,9 @@ extension StudioViewController {
     func applyMode(_ target: Mode, generation: Int) async {
         let isChange = appliedMode != target
         if isChange {
-            guard await setUpSession(for: target, generation: generation) else { return }
+            // Newest wins: the mode turns off the settings it can't run with first.
+            await resolveConflicts(entering: target)
+            guard isCurrent(generation), await setUpSession(for: target, generation: generation) else { return }
         }
 
         switch target {
@@ -91,7 +106,7 @@ extension StudioViewController {
             // when NIGHT ends.
             let staysOnWideCamera = target == .night
             let priorType = preSlowMoDeviceType
-            await exitSlowMoSetup(restoringDevice: !staysOnWideCamera)
+            await exitSlowMoSetup(restoringDevice: !staysOnWideCamera, keepsMovieOutput: target.isVideo)
             if staysOnWideCamera, preManualDeviceType == nil, let priorType, Self.virtualDeviceTypes.contains(priorType) {
                 preManualDeviceType = priorType
             }
@@ -102,6 +117,17 @@ extension StudioViewController {
         // controls still need the wide one. Also before slow motion's setup, which only
         // hops and detaches the photo output when it starts on a camera without 120 fps.
         if target != .night, !slowMoSetupActive {
+            // From VIDEO, drop the movie output first: swapped in with it attached, the
+            // virtual camera builds a movie pipeline only to tear it down, and reports Live
+            // Photo unsupported meanwhile. Live Photo comes on in the step below.
+            if preManualDeviceType != nil, appliedMode?.isVideo == true, !target.isVideo {
+                do {
+                    try await camera.setMovieFileOutputAttached(false, targetLivePhoto: false)
+                } catch {
+                    toaster.report(error, context: "Mode switch")
+                }
+                guard isCurrent(generation) else { return false }
+            }
             await restorePreManualCamera()
             guard isCurrent(generation) else { return false }
         }
@@ -128,7 +154,7 @@ extension StudioViewController {
         // (iOS 27 raises on a manual-exposure bracket from one), so NIGHT runs on the
         // physical wide camera, the same hop manual controls make.
         if target == .night {
-            await hopToWideCamera()
+            await hopToWideCamera(for: "NIGHT")
             guard isCurrent(generation) else { return false }
         }
 
@@ -244,12 +270,24 @@ extension StudioViewController {
     /// Restores the camera slow motion left and re-attaches the photo output. The output comes
     /// back as a new instance; the session-based capture wrappers resolve it at their next
     /// capture.
-    func exitSlowMoSetup(restoringDevice: Bool = true) async {
+    ///
+    /// Leaving for a photo mode (`keepsMovieOutput` false) first detaches the movie output and
+    /// goes back to the photo format: a photo output attached beside them can't turn on Live
+    /// Photo, depth or the portrait matte.
+    func exitSlowMoSetup(restoringDevice: Bool = true, keepsMovieOutput: Bool) async {
         slowMoSetupActive = false
         let priorType = preSlowMoDeviceType
         preSlowMoDeviceType = nil
         pipeline.isEnabled = false
         defer { pipeline.isEnabled = true }
+        if !keepsMovieOutput {
+            do {
+                try await camera.setMovieFileOutputAttached(false, targetLivePhoto: false)
+            } catch {
+                toaster.report(error, context: "Exit slo-mo")
+            }
+            await camera.resetFrameRate()
+        }
         if restoringDevice, let priorType {
             do {
                 try await camera.switchDevice(type: priorType, position: camera.device?.position ?? .back)
@@ -278,26 +316,27 @@ extension StudioViewController {
     ///
     /// The hop queues behind any mode setup or flip in flight; slider ticks that arrive
     /// meanwhile wait for it instead of starting another.
-    func prepareForManualExposure() async {
+    func prepareForManualExposure(for reason: String) async {
         if let manualHopTask {
             await manualHopTask.value
             return
         }
         guard needsWideCameraForManual else { return }
-        let hop = enqueueSessionWork(supersedes: false) { [weak self] _ in await self?.hopToWideCamera() }
+        let hop = enqueueSessionWork(supersedes: false) { [weak self] _ in await self?.hopToWideCamera(for: reason) }
         manualHopTask = hop
         await hop.value
         manualHopTask = nil
     }
 
-    private var needsWideCameraForManual: Bool {
+    var needsWideCameraForManual: Bool {
         guard let device = camera.device else { return false }
         return Self.virtualDeviceTypes.contains(device.deviceType) && !slowMoSetupActive
     }
 
-    private func hopToWideCamera() async {
+    private func hopToWideCamera(for reason: String) async {
         // Checked again: a flip or mode setup queued ahead may have changed the camera.
         guard needsWideCameraForManual, let current = camera.device else { return }
+        ExampleLog.session.notice("Studio: to the wide camera for \(reason, privacy: .public)")
         preManualDeviceType = current.deviceType
         // Each camera meters on its own, and the wide camera's narrower view lands on a
         // different exposure: carry the user's EV offset across.
@@ -314,6 +353,7 @@ extension StudioViewController {
         if abs(priorBias) > 0.01 {
             await camera.setExposureBias(priorBias)
         }
+        await reapplyVideoFrameRate()
         await deviceDidChange()
     }
 
@@ -330,12 +370,19 @@ extension StudioViewController {
         await restorePreManualCamera()
     }
 
+    /// Stays on the wide camera while anything still needs it: manual exposure or white
+    /// balance, a locked focus (the usual camera would start in continuous autofocus and drop
+    /// it), Max Dimensions, or Cinematic Video running there (turning it off restores).
     private func restorePreManualCamera() async {
         guard let priorType = preManualDeviceType else { return }
         let state = camera.state
         let exposureIsAuto = state.exposureMode == .continuousAutoExposure || state.exposureMode == .autoExpose
         let whiteBalanceIsAuto = state.whiteBalanceMode == .continuousAutoWhiteBalance || state.whiteBalanceMode == .autoWhiteBalance
-        guard exposureIsAuto, whiteBalanceIsAuto, !drawerControls.capMaxDimensions else { return }
+        guard exposureIsAuto, whiteBalanceIsAuto, state.focusMode != .locked, !drawerControls.capMaxDimensions,
+              !state.isCinematicVideoCaptureEnabled
+        else { return }
+        let name = priorType.rawValue.replacingOccurrences(of: "AVCaptureDeviceType", with: "")
+        ExampleLog.session.notice("Studio: back to \(name, privacy: .public), nothing needs the wide camera now")
         preManualDeviceType = nil
         pipeline.isEnabled = false
         defer { pipeline.isEnabled = true }
@@ -345,7 +392,17 @@ extension StudioViewController {
             toaster.report(error, context: "Restore the virtual camera")
             return
         }
+        await reapplyVideoFrameRate()
         await deviceDidChange()
+    }
+
+    /// A camera switch starts the new camera on the configured preset (Photo) at its default
+    /// frame rate. In VIDEO, a switch a control made (an aperture or ISO change, or the
+    /// return to auto) sets VIDEO's frame rate, and the video format it picks, again; a mode
+    /// change sets the rate itself once its setup is done.
+    private func reapplyVideoFrameRate() async {
+        guard mode == .video, appliedMode == .video else { return }
+        await camera.setFrameRate(videoFPS.value)
     }
 
     // MARK: - Camera flip
@@ -370,7 +427,7 @@ extension StudioViewController {
         let next: AVCaptureDevice.Position = current == .back ? .front : .back
         ExampleLog.session.notice("Studio flip: \(current.rawValue) → \(next.rawValue)")
         if slowMoSetupActive {
-            await exitSlowMoSetup(restoringDevice: false)
+            await exitSlowMoSetup(restoringDevice: false, keepsMovieOutput: true)
         }
         // The flip lands on the position's default camera, or for NIGHT straight on the wide
         // camera it runs on (no second switch from the virtual camera), remembering the default
@@ -409,7 +466,8 @@ extension StudioViewController {
 
     // MARK: - Device changes and rotation
 
-    /// Cinematic Video switched cameras (to the Dual Wide camera on a Pro iPhone, or back).
+    /// Cinematic Video switched cameras (from a Pro iPhone's Triple camera to one that runs
+    /// it, or back).
     /// The camera it left was the one to return to, so a manual hop's memory no longer
     /// applies.
     func cinematicVideoDidChangeCamera() async {

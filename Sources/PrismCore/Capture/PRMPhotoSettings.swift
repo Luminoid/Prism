@@ -174,7 +174,7 @@ public struct PRMPhotoSettings: Sendable {
     ///   no larger than the output's ceiling; otherwise the largest valid entry that fits is
     ///   used (or none). A notice is logged when it changes.
     public func makeAVSettings(for output: AVCapturePhotoOutput) -> AVCapturePhotoSettings {
-        let effectiveCodec = codec.flatMap { output.availablePhotoCodecTypes.contains($0) ? $0 : nil }
+        let effectiveCodec = Self.availableCodec(codec, on: output)
         let quality = Self.clampedQuality(qualityPrioritization, max: output.maxPhotoQualityPrioritization)
         let dimensions = maxDimensions.flatMap { requested in
             Self.validatedMaxDimensions(
@@ -188,6 +188,18 @@ public struct PRMPhotoSettings: Sendable {
             PRMLog.notice(.capture, "Photo maxDimensions \(requested.width)×\(requested.height) isn't available; using \(applied)")
         }
         return makeUncheckedAVSettings(codec: effectiveCodec, quality: quality, maxDimensions: dimensions)
+    }
+
+    /// `codec` when `output` offers it. Otherwise `nil` (AVFoundation's default, JPEG where
+    /// HEVC isn't offered), with a notice naming what the output offers: the photo comes back
+    /// in another format without an error.
+    static func availableCodec(_ codec: AVVideoCodecType?, on output: AVCapturePhotoOutput) -> AVVideoCodecType? {
+        guard let codec else { return nil }
+        let offered = output.availablePhotoCodecTypes
+        guard !offered.contains(codec) else { return codec }
+        let offeredText = offered.isEmpty ? "none" : offered.map(\.rawValue).joined(separator: ", ")
+        PRMLog.notice(.capture, "Photo codec \(codec.rawValue) isn't offered by the output now (it offers \(offeredText)); using the default")
+        return nil
     }
 
     private func makeUncheckedAVSettings(

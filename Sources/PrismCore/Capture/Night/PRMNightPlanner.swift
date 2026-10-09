@@ -11,6 +11,9 @@ struct PRMNightPlanInput: Sendable, Equatable {
     var maxISO: Float
     var minExposureDuration: Double
     var maxExposureDuration: Double
+    /// The shortest frame duration the format runs at (1/30 s at 30 fps); `0` for no limit.
+    /// A shutter shorter than this still takes a whole frame.
+    var minFrameDuration: Double = 0
     /// 35mm-equivalent focal length of the active lens.
     var focalLength35mm: Double
     var isStable: Bool
@@ -26,7 +29,8 @@ struct PRMNightPlanInput: Sendable, Equatable {
 ///   stabilization holds sharp), 1/2 s when stable, never past the format's maximum. ISO fills
 ///   in the rest within the format's range.
 /// - **Length:** automatic picks 1, 2 or 3 s handheld (3, 6 or 10 s stable) from how much light
-///   the target exposure needs; frames are the length over the shutter, 3 to 64.
+///   the target exposure needs; frames are the length over the frame interval (the shutter, or
+///   the format's frame duration when a bright scene's shutter is shorter), 3 to 64.
 enum PRMNightPlanner {
     static let highlightHeadroomEV: Double = 0.3
     static let maxFrames = 64
@@ -55,7 +59,9 @@ enum PRMNightPlanner {
         case let .seconds(value): min(max(value, 0.5), 30)
         case .automatic: automaticDuration(targetExposure: target, isStable: input.isStable)
         }
-        let frames = min(max(Int((seconds / shutter).rounded()), minFrames), maxFrames)
+        // A 1/40 s shutter on a 30 fps format still delivers 30 frames a second, not 40.
+        let interval = max(shutter, input.minFrameDuration)
+        let frames = min(max(Int((seconds / interval).rounded()), minFrames), maxFrames)
         return PRMNightPlan(duration: seconds, frameDuration: shutter, iso: Float(iso), frameCount: frames)
     }
 

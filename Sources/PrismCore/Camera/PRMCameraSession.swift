@@ -461,7 +461,6 @@ public final class PRMCameraSession {
     public func start() {
         wantsRunning = true
         guard !isRunning else { return }
-        PRMLog.debug(.session, "start")
         session.startRunning()
         if isRunning {
             PRMLog.notice(.session, "Started: \(configurationSummary())")
@@ -476,7 +475,6 @@ public final class PRMCameraSession {
     public func stop() {
         wantsRunning = false
         guard isRunning else { return }
-        PRMLog.debug(.session, "stop")
         stopSmartFramingMonitoring()
         session.stopRunning()
         PRMLog.notice(.session, "Stopped")
@@ -583,13 +581,11 @@ public final class PRMCameraSession {
             // (e.g. slo-mo workflow that dropped it for the ISP budget). No
             // photo output means nothing to wait for — return `true` so callers
             // can proceed without a 3 s timeout warning.
-            guard photoOutput != nil else {
-                PRMLog.debug(.session, "awaitPhotoOutputReady: photo output detached, skipping wait")
-                return true
-            }
+            guard photoOutput != nil else { return true }
             let pollStep: UInt64 = pollIntervalMS * 1_000_000
             let startedAt = Date()
             let deadline = startedAt.addingTimeInterval(timeout)
+            var waited = false
             while Date() < deadline {
                 if let output = photoOutput {
                     let connection = output.connection(with: .video)
@@ -606,11 +602,14 @@ public final class PRMCameraSession {
                     let dims = output.maxPhotoDimensions
                     let dimsReady = dims.width > 0 && dims.height > 0
                     if connectionReady, dimsReady, output.captureReadiness == .ready {
-                        let elapsedMS = Int(Date().timeIntervalSince(startedAt) * 1000)
-                        PRMLog.debug(
-                            .session,
-                            "awaitPhotoOutputReady: ready after \(elapsedMS) ms (maxDim=\(dims.width)×\(dims.height))"
-                        )
+                        // Ready on the first check is the common case and not worth a line.
+                        if waited {
+                            let elapsedMS = Int(Date().timeIntervalSince(startedAt) * 1000)
+                            PRMLog.debug(
+                                .session,
+                                "awaitPhotoOutputReady: ready after \(elapsedMS) ms (maxDim=\(dims.width)×\(dims.height))"
+                            )
+                        }
                         return true
                     }
                     // If the connection is back but maxDim is stuck at 0×0, try to heal
@@ -628,6 +627,7 @@ public final class PRMCameraSession {
                     }
                 }
                 try? await Task.sleep(nanoseconds: pollStep)
+                waited = true
             }
             let readinessText = photoOutput?.captureReadiness.rawValue.description ?? "nil"
             let connectionText = photoOutput?.connection(with: .video) != nil ? "present" : "nil"
@@ -1319,13 +1319,7 @@ public final class PRMCameraSession {
                 )
                 return
             }
-            guard photoOutput.isLivePhotoCaptureEnabled != enabled else {
-                PRMLog.debug(
-                    .session,
-                    "setLivePhotoCaptureEnabled(\(enabled)): already \(enabled), no-op"
-                )
-                return
-            }
+            guard photoOutput.isLivePhotoCaptureEnabled != enabled else { return }
             session.beginConfiguration()
             defer { session.commitConfiguration() }
             photoOutput.isLivePhotoCaptureEnabled = enabled
@@ -1375,7 +1369,8 @@ public final class PRMCameraSession {
     /// fails (e.g. the session refuses `canAddOutput` — usually a sign of
     /// hardware budget overrun in the opposite direction).
     public func setPhotoOutputAttached(_ attached: Bool) throws {
-        PRMLog.debug(.session, "setPhotoOutputAttached(\(attached)): current=\(photoOutput != nil)")
+        guard attached != (photoOutput != nil) else { return }
+        PRMLog.debug(.session, "setPhotoOutputAttached(\(attached))")
         session.beginConfiguration()
         defer { session.commitConfiguration() }
         try applyPhotoOutputAttached(attached)
@@ -1437,13 +1432,15 @@ public final class PRMCameraSession {
         if !attached {
             try refuseWhileBusy("Removing the movie output")
         }
-        PRMLog.debug(
-            .session,
-            "setMovieFileOutputAttached(\(attached), targetLivePhoto=\(targetLivePhoto.map(String.init(describing:)) ?? "nil")): current=\(movieFileOutput != nil)"
-        )
+        let wasAttached = movieFileOutput != nil
+        let wasLive = photoOutput?.isLivePhotoCaptureEnabled ?? false
         session.beginConfiguration()
         defer { session.commitConfiguration() }
         try applyMovieFileOutputAttached(attached, targetLivePhoto: targetLivePhoto)
+        let isLive = photoOutput?.isLivePhotoCaptureEnabled ?? false
+        if wasAttached != attached || wasLive != isLive {
+            PRMLog.debug(.session, "Movie output \(attached ? "attached" : "detached"), Live Photo \(isLive ? "on" : "off")")
+        }
     }
 
     /// Body of ``setMovieFileOutputAttached(_:targetLivePhoto:)`` for callers that already

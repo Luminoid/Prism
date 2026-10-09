@@ -176,6 +176,8 @@ final class StudioViewController: UIViewController {
     /// ``sessionGeneration`` tells a running one that a newer one superseded it.
     var sessionTask: Task<Void, Never>?
     var sessionGeneration = 0
+    /// Session work queued and not finished yet; captures wait while it's above zero.
+    var pendingSessionWork = 0
     /// The mode whose session setup last completed; `nil` forces a full setup (boot, flip).
     var appliedMode: Mode?
     /// Set while slow motion runs on the wide camera with the photo output detached.
@@ -236,11 +238,10 @@ final class StudioViewController: UIViewController {
 
     lazy var drawerControls = StudioDrawerControls(
         camera: camera,
-        toast: { [weak self] message in self?.toaster.show(message) },
-        prepareForManualExposure: { [weak self] in await self?.prepareForManualExposure() },
+        toaster: toaster,
+        prepare: { [weak self] setting in await self?.prepare(for: setting) ?? false },
         didReturnToAutoExposure: { [weak self] in await self?.restoreVirtualCameraIfFullyAuto() },
-        focalLength: { [weak self] zoom in self?.focalLength35mm(forZoom: zoom) ?? 0 },
-        maxDimensionsDidChange: { [weak self] isOn in self?.maxDimensionsDidChange(isOn) }
+        focalLength: { [weak self] zoom in self?.focalLength35mm(forZoom: zoom) ?? 0 }
     )
 
     /// Drawer rows, telemetry badges and overlays for the iOS 26 / 27 capture features.
@@ -248,7 +249,7 @@ final class StudioViewController: UIViewController {
         camera: camera,
         captureEventHelper: captureEventHelper,
         toast: { [weak self] message in self?.toaster.show(message) },
-        prepareForManualExposure: { [weak self] in await self?.prepareForManualExposure() },
+        prepare: { [weak self] setting in await self?.prepare(for: setting) ?? false },
         didReturnToAutoExposure: { [weak self] in await self?.restoreVirtualCameraIfFullyAuto() },
         cameraDidChange: { [weak self] in await self?.cinematicVideoDidChangeCamera() }
     )
@@ -787,17 +788,18 @@ extension StudioViewController {
         if !supportsSlowMo {
             ExampleLog.session.info("Slo-mo hidden: no camera at this position has a 120 fps format")
         }
-        syncModePickerAvailability()
     }
 
     /// Maps a picker selection onto ``mode``: Burst folds into `.photo`, the frame rates into
     /// `.video`, the Night durations into `.night`. Changes that keep the mode (STANDARD to
-    /// BURST, 30 to 24 fps) skip the full mode setup.
+    /// BURST, 30 to 24 fps) skip the full mode setup, so BURST makes its own room for itself
+    /// (the mode setup does it for the others; see ``resolveConflicts(entering:)``).
     func applyPickerSelection(primary: ModePicker.Primary, variant: ModePicker.Variant) {
         ExampleLog.session.notice("Studio picker: \(primary.label, privacy: .public) / \(variant.label, privacy: .public)")
-        // The variant row was rebuilt for the new style, which drops per-pill state.
-        syncModePickerAvailability()
         burstEnabled = primary == .photo && variant == .burst
+        if burstEnabled, mode == .photo, drawerControls.capMaxDimensions {
+            enqueueSessionWork(supersedes: false) { [weak self] _ in await self?.resolveBurstConflict() }
+        }
         switch primary {
         case .photo:
             setMode(variant == .live ? .live : variant == .portrait ? .portrait : .photo)
@@ -828,26 +830,6 @@ extension StudioViewController {
     private func setMode(_ target: Mode) {
         guard mode != target else { return }
         mode = target
-    }
-
-    /// Dims the variants the configuration excludes. Max Dimensions' 48MP format carries no
-    /// movie pipeline, so it rules out Live Photo, Burst and Portrait.
-    func syncModePickerAvailability() {
-        let message = drawerControls.capMaxDimensions ? "Turn off Max Dimensions to use this mode." : nil
-        for variant in [ModePicker.Variant.live, .burst, .portrait] {
-            modePicker.setVariantDisabled(variant, message: message)
-        }
-    }
-
-    /// After a Max Dimensions change lands: gate the excluded modes, and leave one of them
-    /// for STANDARD (as the system Camera does), since only a mode change turns the photo
-    /// output's Live Photo off.
-    func maxDimensionsDidChange(_ isOn: Bool) {
-        syncModePickerAvailability()
-        guard isOn, mode == .live || mode == .portrait || burstEnabled else { return }
-        ExampleLog.session.notice("Studio: Max Dimensions moves \(self.mode.label, privacy: .public) to PHOTO")
-        modePicker.select(primary: .photo, variant: .standard)
-        applyPickerSelection(primary: .photo, variant: .standard)
     }
 
     /// Shows the planned capture time on the Night AUTO pill ("AUTO 3s"), from the same plan
@@ -886,7 +868,7 @@ extension StudioViewController {
         telemetryLabel.text = (readings + modernControls.telemetryBadges(from: state))
             .filter { !$0.isEmpty }
             .joined(separator: "  ")
-        modernControls.sync(from: state)
+        modernControls.sync(from: state, isRecording: recordingStartedAt != nil)
         refreshActiveLens(from: state)
         if mode == .night, nightDuration == .auto {
             refreshNightAutoLabel()
@@ -894,7 +876,9 @@ extension StudioViewController {
         drawerControls.sync(from: state, context: StudioDrawerControls.CaptureContext(
             isRecording: recordingStartedAt != nil,
             isNightMode: mode == .night,
-            nightFixesExposure: mode == .night
+            nightFixesExposure: mode == .night,
+            isPhotoMode: !mode.isVideo && mode != .night,
+            manualNeedsCameraSwitch: needsWideCameraForManual
         ))
     }
 
@@ -904,7 +888,6 @@ extension StudioViewController {
         for section in drawerControls.makeSections(device: device) + modernControls.makeSections(device: device) {
             drawer.appendSection(title: section.title, rows: section.rows)
         }
-        syncModePickerAvailability()
     }
 }
 
@@ -997,7 +980,13 @@ extension StudioViewController {
         switch gesture.state {
         case .began:
             panStartBias = camera.state.exposureBias
+            // A vertical drag is easy to start by accident, so it never undoes a manual
+            // exposure: say why it does nothing instead.
+            if camera.state.exposureMode == .custom {
+                toaster.refused("EV", because: "EV does nothing under manual exposure. Set exposure to Auto first.")
+            }
         case .changed:
+            guard camera.state.exposureMode != .custom else { return }
             let travel = gesture.translation(in: view).y / max(view.bounds.height / 2, 1)
             var bias = panStartBias - Float(travel * 2)
             if let range = camera.device?.exposureBiasRange {

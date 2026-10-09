@@ -38,7 +38,7 @@ public extension PRMCamera {
         shutterSeconds: PRMExposureValue<Double> = .current,
         iso: PRMExposureValue<Float> = .current
     ) async {
-        PRMLog.debug(.session, "PRMCamera.setExposure(aperture=\(aperture), shutter=\(shutterSeconds), iso=\(iso))")
+        burstLog.record("setExposure", "PRMCamera.setExposure(aperture=\(aperture), shutter=\(shutterSeconds), iso=\(iso))")
         let previous = (
             mode: intendedExposureMode,
             axes: intendedAutoExposureAxes,
@@ -129,11 +129,12 @@ public extension PRMCamera {
 
     /// Focuses and meters on a rectangle (device space, `0...1`) instead of a point
     /// (iOS 26). Falls back to the rect's center on older systems or devices without rect
-    /// support. While Cinematic Video is enabled this only sets exposure and asks Cinematic
-    /// Video to track the subject at the rect's center.
+    /// support. A `nil` `exposureMode` focuses only and keeps the exposure. While Cinematic
+    /// Video is enabled this only sets exposure and asks Cinematic Video to track the
+    /// subject at the rect's center.
     func setFocusAndExposure(
         focusMode: AVCaptureDevice.FocusMode,
-        exposureMode: AVCaptureDevice.ExposureMode,
+        exposureMode: AVCaptureDevice.ExposureMode?,
         in rect: CGRect,
         monitorSubjectAreaChange: Bool = false
     ) async {
@@ -178,9 +179,11 @@ extension PRMCamera {
         }
     }
 
-    /// Records an exposure mode chosen by a tap-to-focus. Leaving custom exposure drops the
-    /// pinned manual values and the iOS 27 priority intents, as ``setExposureMode(_:)`` does.
-    func noteExposureModeIntent(_ mode: AVCaptureDevice.ExposureMode) {
+    /// Records an exposure mode chosen by a tap-to-focus (`nil`: the tap kept the exposure).
+    /// Leaving custom exposure drops the pinned manual values and the iOS 27 priority
+    /// intents, as ``setExposureMode(_:)`` does.
+    func noteExposureModeIntent(_ mode: AVCaptureDevice.ExposureMode?) {
+        guard let mode else { return }
         intendedExposureMode = mode
         if mode != .custom {
             intendedISO = nil

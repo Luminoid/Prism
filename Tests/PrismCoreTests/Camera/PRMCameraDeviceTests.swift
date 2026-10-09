@@ -8,7 +8,8 @@ struct PRMCameraDeviceTests {
     private func makeDevice(
         maxSupportedPhotoDimensions: CMVideoDimensions? = nil,
         supportsCinematicVideo: Bool = false,
-        cinematicVideoDeviceType: AVCaptureDevice.DeviceType? = nil
+        cinematicVideoDeviceType: AVCaptureDevice.DeviceType? = nil,
+        supportedWhiteBalanceModes: [AVCaptureDevice.WhiteBalanceMode] = AVCaptureDevice.WhiteBalanceMode.prm_allCases
     ) -> PRMCameraDevice {
         PRMCameraDevice(
             uniqueID: "id",
@@ -29,7 +30,8 @@ struct PRMCameraDeviceTests {
             maxFrameRate: 240,
             maxSupportedPhotoDimensions: maxSupportedPhotoDimensions,
             supportsCinematicVideo: supportsCinematicVideo,
-            cinematicVideoDeviceType: cinematicVideoDeviceType
+            cinematicVideoDeviceType: cinematicVideoDeviceType,
+            supportedWhiteBalanceModes: supportedWhiteBalanceModes
         )
     }
 
@@ -46,6 +48,8 @@ struct PRMCameraDeviceTests {
         #expect(device.cinematicFrameRateRange == nil)
         #expect(device.cinematicVideoDeviceType == nil)
         #expect(device.maxSupportedPhotoDimensions == nil)
+        #expect(!device.supportsLowLightBoost)
+        #expect(!device.supportsVideoHDR)
     }
 
     @Test
@@ -65,5 +69,17 @@ struct PRMCameraDeviceTests {
         #expect(fortyEight == makeDevice(maxSupportedPhotoDimensions: CMVideoDimensions(width: 8064, height: 6048)))
         #expect(fortyEight != makeDevice(maxSupportedPhotoDimensions: CMVideoDimensions(width: 4032, height: 3024)))
         #expect(fortyEight != makeDevice())
+    }
+
+    @Test
+    func `Supported modes default to every mode and take part in equality`() {
+        let device = makeDevice()
+        #expect(device.supportedExposureModes == [.locked, .autoExpose, .continuousAutoExposure, .custom])
+        #expect(device.supportedWhiteBalanceModes == [.locked, .autoWhiteBalance, .continuousAutoWhiteBalance])
+        #expect(device.supportedFocusModes == [.locked, .autoFocus, .continuousAutoFocus])
+        // An iPhone camera: no one-shot auto white balance.
+        let iPhone = makeDevice(supportedWhiteBalanceModes: [.locked, .continuousAutoWhiteBalance])
+        #expect(!iPhone.supportedWhiteBalanceModes.contains(.autoWhiteBalance))
+        #expect(iPhone != device)
     }
 }

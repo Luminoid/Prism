@@ -179,7 +179,8 @@ public final class PRMNightModeCapture: @unchecked Sendable {
         codec: AVVideoCodecType?
     ) async throws -> PRMNightPhoto {
         await stacker.drain()
-        let mergedCount = stacker.currentStatus.merged
+        let status = stacker.currentStatus
+        let mergedCount = status.merged
         guard let (merged, attachments) = stacker.finish() else {
             throw PRMSessionError.photoCaptureFailed("Night capture got no usable frames")
         }
@@ -202,7 +203,8 @@ public final class PRMNightModeCapture: @unchecked Sendable {
         PRMLog.notice(
             .capture,
             """
-            Night photo: \(mergedCount) of \(plan.frameCount) frames, key \(String(format: "%.3f", stats.logAverage)), \
+            Night photo: \(mergedCount) of \(plan.frameCount) frames (\(status.rejected) rejected, \(status.skipped) skipped while merging), \
+            key \(String(format: "%.3f", stats.logAverage)), \
             gain +\(String(format: "%.1f", gain)) EV, \(Int(upright.extent.width))×\(Int(upright.extent.height)), \(data.count) bytes
             """
         )

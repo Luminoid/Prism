@@ -138,6 +138,17 @@ struct PRMCameraFeaturesTests {
     }
 
     @Test
+    func `A focus-only tap keeps pinned manual values`() async {
+        let camera = PRMCamera()
+        await camera.setCustomExposure(duration: CMTimeMakeWithSeconds(0.01, preferredTimescale: 1_000_000), iso: 400)
+        await camera.setFocusAndExposure(focusMode: .autoFocus, exposureMode: nil, at: CGPoint(x: 0.5, y: 0.5))
+        #expect(camera.intendedISO == 400)
+        #expect(camera.intendedExposureMode == .custom)
+        await camera.setFocusAndExposure(focusMode: .autoFocus, exposureMode: nil, in: CGRect(x: 0.4, y: 0.4, width: 0.2, height: 0.2))
+        #expect(camera.intendedISO == 400)
+    }
+
+    @Test
     func `A lens move without a camera returns instead of waiting forever`() async {
         let camera = PRMCamera()
         // Before the fix this awaited a stream nothing would ever finish.

@@ -126,6 +126,15 @@ extension PRMPhotoCapture {
         return "\(dims.width)x\(dims.height)"
     }
 
+    /// `" (asked for up to 8064x6048: <reason>)"` when the photo came back smaller than the
+    /// settings asked, otherwise empty.
+    static func smallerThanRequestedText(_ delivered: CMVideoDimensions, requested: CMVideoDimensions?, sizeLimit: String?) -> String {
+        guard let requested,
+              Int64(delivered.width) * Int64(delivered.height) < Int64(requested.width) * Int64(requested.height)
+        else { return "" }
+        return " (asked for up to \(requested.width)x\(requested.height): \(sizeLimit ?? "AVFoundation delivered a smaller size"))"
+    }
+
     /// The container type of encoded photo data (`"public.heic"`, `"public.jpeg"`), read
     /// from its header without decoding.
     static func formatText(of data: Data) -> String {
@@ -135,15 +144,22 @@ extension PRMPhotoCapture {
         return type as String
     }
 
-    /// One notice line per finished capture; failures are logged where they happen.
-    static func logOutcome(_ result: Result<PRMPhoto, any Error>, isLivePhoto: Bool) {
+    /// One notice line per finished capture; failures are logged where they happen. A photo
+    /// smaller than `requested` says so, with `sizeLimit` as the reason when it's known.
+    static func logOutcome(
+        _ result: Result<PRMPhoto, any Error>,
+        isLivePhoto: Bool,
+        requested: CMVideoDimensions? = nil,
+        sizeLimit: String? = nil
+    ) {
         let kind = isLivePhoto ? "Live Photo" : "Photo"
         switch result {
         case let .success(photo):
             let proxy = photo.underlyingPhoto is AVCaptureDeferredPhotoProxy ? " (deferred proxy)" : ""
+            let smaller = smallerThanRequestedText(photo.underlyingPhoto.resolvedSettings.photoDimensions, requested: requested, sizeLimit: sizeLimit)
             PRMLog.notice(
                 .capture,
-                "\(kind) captured: \(dimensionsText(of: photo.underlyingPhoto)) \(formatText(of: photo.data)), \(photo.data.count) bytes\(proxy)"
+                "\(kind) captured: \(dimensionsText(of: photo.underlyingPhoto)) \(formatText(of: photo.data)), \(photo.data.count) bytes\(proxy)\(smaller)"
             )
         case let .failure(error):
             if error as? PRMSessionError == .cancelled {

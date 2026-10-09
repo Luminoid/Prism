@@ -1,3 +1,4 @@
+import PrismCore
 import SnapKit
 import UIKit
 
@@ -95,6 +96,8 @@ final class SectionHeaderLabel: UILabel {
 
 /// The demos' shared feedback path: one toast at a time, announced to VoiceOver, and
 /// ``report(_:context:)`` for errors, which logs the error in full and toasts a short message.
+/// Settings that can't be on together go through ``gaveWay(_:)`` (the newest turned others
+/// off) and ``refused(_:because:)``, each with one log line.
 @MainActor
 final class ToastPresenter {
     // MARK: - Properties
@@ -118,23 +121,59 @@ final class ToastPresenter {
 
     // MARK: - Showing
 
-    /// Shows `message` for two seconds, replacing a toast that's still up.
+    /// Shows `message` long enough to read (two seconds, longer for long messages),
+    /// replacing a toast that's still up. The same message again only keeps it up, so a
+    /// slider drag doesn't re-announce it on every tick.
     func show(_ message: String) {
-        UIAccessibility.post(notification: .announcement, argument: message)
+        let isRepeat = toast?.text == message
+        if !isRepeat {
+            UIAccessibility.post(notification: .announcement, argument: message)
+        }
         guard let label = toast ?? makeToast() else { return }
         label.text = message
         dismissTask?.cancel()
+        let duration = Self.readingDuration(of: message)
         dismissTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(2))
+            try? await Task.sleep(for: duration)
             guard !Task.isCancelled else { return }
             self?.dismiss()
         }
     }
 
-    /// Logs `error` under the Example's UI category and toasts "<context> failed: …".
+    /// Logs and toasts what a setting turned off (or on) to take effect. Nothing when it
+    /// changed nothing.
+    func gaveWay(_ change: SettingChange) {
+        guard !change.isEmpty else { return }
+        ExampleLog.ui.notice("\(change.logLine, privacy: .public)")
+        show(change.message)
+    }
+
+    /// Logs and toasts why `setting` was refused; `message` is the toast ("Stop recording to
+    /// change ISO.").
+    func refused(_ setting: String, because message: String) {
+        ExampleLog.ui.notice("Refused: \(setting, privacy: .public) (\(message, privacy: .public))")
+        show(message)
+    }
+
+    /// Logs `error` under the Example's UI category and toasts "<context> failed: …", or for
+    /// a setting the camera can't take right now, "Not available: <reason>".
     func report(_ error: any Error, context: String) {
-        ExampleLog.ui.error("\(context, privacy: .public) failed: \(String(describing: error), privacy: .public)")
-        show("\(context) failed: \(error.localizedDescription)")
+        let described = PRMLog.describe(error)
+        ExampleLog.ui.error("\(context, privacy: .public) failed: \(described.summary, privacy: .public)")
+        if let detail = described.detail {
+            ExampleLog.ui.debug("\(context, privacy: .public) error detail: \(detail, privacy: .private)")
+        }
+        if case let .unsupportedConfiguration(reason) = error as? PRMSessionError {
+            show("Not available: \(reason)")
+        } else {
+            show("\(context) failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Two seconds, plus one per 50 characters past the first 50, up to five.
+    static func readingDuration(of message: String) -> Duration {
+        let extra = max(0, message.count - 50) / 50
+        return .seconds(min(5, 2 + extra))
     }
 
     // MARK: - Helpers

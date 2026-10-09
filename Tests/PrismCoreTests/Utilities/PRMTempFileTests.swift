@@ -2,6 +2,9 @@ import Foundation
 import Testing
 @testable import PrismCore
 
+/// Serialized: `clearAll` empties the shared `Prism/` directory, so in parallel it can delete
+/// another test's file between its write and its check.
+@Suite(.serialized)
 struct PRMTempFileTests {
     @Test
     func `Generates a unique URL in Prism/ subdirectory`() {

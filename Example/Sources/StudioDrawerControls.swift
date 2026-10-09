@@ -28,6 +28,11 @@ final class StudioDrawerControls {
         var isNightMode: Bool
         /// Night mode plans ISO and shutter per capture, so the manual rows don't apply.
         var nightFixesExposure: Bool
+        /// PHOTO, LIVE or PORTRAIT: Max Dimensions applies.
+        var isPhotoMode: Bool
+        /// The camera is virtual, so a manual control would switch to the wide camera first
+        /// (refused while recording).
+        var manualNeedsCameraSwitch: Bool
     }
 
     /// Runner keys: one per camera setting, so exposure changes from different rows still
@@ -50,16 +55,15 @@ final class StudioDrawerControls {
     private(set) var autoRedEyeReductionEnabled = false
 
     private let camera: PRMCamera
-    private let toast: (String) -> Void
-    /// Studio's hop to the single wide camera before manual exposure, white balance or focus
-    /// (virtual devices reject them), and the hop back once everything is auto again.
-    private let prepareForManualExposure: () async -> Void
+    private let toaster: ToastPresenter
+    /// Studio's conflict rule before a setting turns on (``StudioViewController/prepare(for:)``):
+    /// it turns off what conflicts and, for manual controls, hops to the single wide camera
+    /// (virtual devices reject manual values). `false` refuses the change.
+    private let prepare: (StudioSetting) async -> Bool
+    /// The hop back to the virtual camera once everything is auto again.
     private let didReturnToAutoExposure: () async -> Void
     /// Studio's 35mm-equivalent focal length for a raw zoom factor (the ramp row's labels).
     private let focalLength: (CGFloat) -> Double
-    /// Called once a Max Dimensions change has landed, so Studio can gate the modes it
-    /// excludes.
-    private let maxDimensionsDidChange: (Bool) -> Void
     private let runner = LatestWinsRunner()
     private var rampTask: Task<Void, Never>?
 
@@ -105,18 +109,16 @@ final class StudioDrawerControls {
 
     init(
         camera: PRMCamera,
-        toast: @escaping (String) -> Void,
-        prepareForManualExposure: @escaping () async -> Void,
+        toaster: ToastPresenter,
+        prepare: @escaping (StudioSetting) async -> Bool,
         didReturnToAutoExposure: @escaping () async -> Void,
-        focalLength: @escaping (CGFloat) -> Double,
-        maxDimensionsDidChange: @escaping (Bool) -> Void
+        focalLength: @escaping (CGFloat) -> Double
     ) {
         self.camera = camera
-        self.toast = toast
-        self.prepareForManualExposure = prepareForManualExposure
+        self.toaster = toaster
+        self.prepare = prepare
         self.didReturnToAutoExposure = didReturnToAutoExposure
         self.focalLength = focalLength
-        self.maxDimensionsDidChange = maxDimensionsDidChange
     }
 
     deinit {
@@ -204,10 +206,20 @@ final class StudioDrawerControls {
         let row = makeRow(symbol: "lock.shield", title: "Exposure Mode", value: "auto", content: segmented)
         segmented.addAction(UIAction { [weak self, weak row] action in
             guard let self, !isApplyingExternalUpdate, let segmented = action.sender as? UISegmentedControl else { return }
+            let modes: [AVCaptureDevice.ExposureMode] = [.locked, .autoExpose, .continuousAutoExposure]
+            if modes.indices.contains(segmented.selectedSegmentIndex), let device = camera.device,
+               !device.supportedExposureModes.contains(modes[segmented.selectedSegmentIndex]) {
+                refuse("\(modes[segmented.selectedSegmentIndex].prm_name) exposure", offered: device.supportedExposureModes.map(\.prm_name), by: device)
+                Self.applyExposureModeUI(camera.state.exposureMode, to: segmented, row: row)
+                return
+            }
             switch segmented.selectedSegmentIndex {
             case 0:
                 row?.valueText = "locked"
-                runner.run(Key.exposure) { [camera] in await camera.setExposureMode(.locked) }
+                runner.run(Key.exposure) { [weak self] in
+                    guard let self, await prepare(.manualExposure("Locked exposure")) else { return }
+                    await camera.setExposureMode(.locked)
+                }
             case 1:
                 row?.valueText = "auto"
                 setAutoExposure(.autoExpose)
@@ -215,7 +227,7 @@ final class StudioDrawerControls {
                 row?.valueText = "continuous"
                 setAutoExposure(.continuousAutoExposure)
             default:
-                toast("Drag ISO or Shutter to enter Custom")
+                toaster.show("Drag ISO or Shutter to enter Custom")
                 Self.applyExposureModeUI(camera.state.exposureMode, to: segmented, row: row)
             }
         }, for: .valueChanged)
@@ -259,8 +271,7 @@ final class StudioDrawerControls {
             // land on a different brightness than the one on screen.
             let baseline = currentAutoExposureBaseline()
             runner.run(Key.exposure) { [weak self] in
-                guard let self else { return }
-                await prepareForManualExposure()
+                guard let self, await prepare(.manualExposure("ISO")) else { return }
                 await camera.setISO(iso, baseline: baseline)
             }
         }, for: .valueChanged)
@@ -280,6 +291,7 @@ final class StudioDrawerControls {
         // Same touch-down snap as the ISO slider.
         slider.addAction(UIAction { [weak self] action in
             guard let self, let slider = action.sender as? UISlider, !shutterStops.isEmpty else { return }
+            runner.forget(Key.exposure)
             let state = camera.state
             guard Self.isAutoExposure(state.exposureMode), let seconds = state.exposureDurationSeconds, seconds > 0 else { return }
             slider.value = sliderPosition(forShutter: seconds)
@@ -291,9 +303,8 @@ final class StudioDrawerControls {
             row?.valueText = CaptureLabels.shutter(seconds)
             customExposureSegmented?.selectedSegmentIndex = UISegmentedControl.noSegment
             let baseline = currentAutoExposureBaseline()
-            runner.run(Key.exposure) { [weak self] in
-                guard let self else { return }
-                await prepareForManualExposure()
+            runner.run(Key.exposure, deduplicating: seconds) { [weak self] in
+                guard let self, await prepare(.manualExposure("Shutter")) else { return }
                 await camera.setShutterSpeed(seconds: seconds, baseline: baseline)
             }
         }, for: .valueChanged)
@@ -322,8 +333,7 @@ final class StudioDrawerControls {
             // mode segment follows on the next state tick.
             syncManualExposureControls(durationSeconds: seconds, iso: preset.iso)
             runner.run(Key.exposure) { [weak self] in
-                guard let self else { return }
-                await prepareForManualExposure()
+                guard let self, await prepare(.manualExposure("Custom exposure")) else { return }
                 await camera.setCustomExposure(duration: preset.duration, iso: preset.iso)
             }
         }, for: .valueChanged)
@@ -362,11 +372,22 @@ final class StudioDrawerControls {
             case 1: (.autoWhiteBalance, "auto")
             default: (.continuousAutoWhiteBalance, "continuous")
             }
+            // iPhone cameras have no one-shot auto white balance.
+            if let device = camera.device, !device.supportedWhiteBalanceModes.contains(mode) {
+                refuse("\(mode.prm_name) white balance", offered: device.supportedWhiteBalanceModes.map(\.prm_name), by: device)
+                segmented.selectedSegmentIndex = Self.whiteBalanceSegment(for: camera.state.whiteBalanceMode)
+                return
+            }
             row?.valueText = label
             runner.run(Key.whiteBalance) { [weak self] in
                 guard let self else { return }
-                await camera.setWhiteBalanceMode(mode)
-                await didReturnToAutoExposure()
+                if mode == .locked {
+                    guard await prepare(.whiteBalanceLock("Locked white balance")) else { return }
+                    await camera.setWhiteBalanceMode(mode)
+                } else {
+                    await camera.setWhiteBalanceMode(mode)
+                    await didReturnToAutoExposure()
+                }
             }
         }, for: .valueChanged)
         wbModeSegmented = segmented
@@ -408,8 +429,7 @@ final class StudioDrawerControls {
                 isApplyingExternalUpdate = false
                 // Locking moves the mode to Locked; the WB Mode segment follows on the next tick.
                 runner.run(Key.whiteBalance) { [weak self] in
-                    guard let self else { return }
-                    await prepareForManualExposure()
+                    guard let self, await prepare(.whiteBalanceLock("\(entry.name) white balance")) else { return }
                     await camera.lockWhiteBalance(preset: entry.preset)
                 }
             }
@@ -421,8 +441,7 @@ final class StudioDrawerControls {
             row?.valueText = "\(Int(kelvin))K"
             let values = AVCaptureDevice.PRMTemperatureAndTint(temperature: kelvin, tint: 0)
             runner.run(Key.whiteBalance) { [weak self] in
-                guard let self else { return }
-                await prepareForManualExposure()
+                guard let self, await prepare(.whiteBalanceLock("White balance")) else { return }
                 await camera.lockWhiteBalance(values)
             }
         }, for: .valueChanged)
@@ -444,9 +463,22 @@ final class StudioDrawerControls {
             case 1: (.autoFocus, "auto")
             default: (.continuousAutoFocus, "continuous")
             }
+            if let device = camera.device, !device.supportedFocusModes.contains(mode) {
+                refuse("\(mode.prm_name) focus", offered: device.supportedFocusModes.map(\.prm_name), by: device)
+                segmented.selectedSegmentIndex = Self.focusSegment(for: camera.state.focusMode)
+                return
+            }
             row?.valueText = label
-            // Through the facade: it refuses (instead of crashing) while Cinematic Video is on.
-            runner.run(Key.focus) { [camera] in await camera.setFocusMode(mode) }
+            // Cinematic Video owns focus (AVFoundation raises on a focus-mode change), so it
+            // gives way first; the facade would refuse otherwise.
+            runner.run(Key.focus) { [weak self] in
+                guard let self, await prepare(.focusMode) else { return }
+                await camera.setFocusMode(mode)
+                // A locked focus kept Studio on the wide camera.
+                if mode != .locked {
+                    await didReturnToAutoExposure()
+                }
+            }
         }, for: .valueChanged)
         focusModeSegmented = segmented
         return row
@@ -475,8 +507,7 @@ final class StudioDrawerControls {
             // Locking a lens position moves focus to Locked. Virtual devices refuse custom lens
             // positions (only the physical wide camera honors them), so hop first.
             runner.run(Key.focus) { [weak self] in
-                guard let self else { return }
-                await prepareForManualExposure()
+                guard let self, await prepare(.manualFocus) else { return }
                 await camera.setLensPosition(position)
             }
         }, for: .valueChanged)
@@ -510,7 +541,7 @@ final class StudioDrawerControls {
             let current = camera.state.zoomFactor
             let target = min(max(current < 1.5 ? 2.0 : 1.0, device.minZoomFactor), device.maxZoomFactor)
             guard abs(target - current) > 0.05 else {
-                toast("Already at \(CaptureLabels.focalLength(focalLength(target)))")
+                toaster.show("Already at \(CaptureLabels.focalLength(focalLength(target)))")
                 return
             }
             row?.valueText = "ramping → \(CaptureLabels.focalLength(focalLength(target)))…"
@@ -554,6 +585,7 @@ final class StudioDrawerControls {
             }
             hdrChoice = label
             hdrRow?.valueText = label
+            logChoice("HDR", label)
             runner.run(Key.hdr) { [camera] in await camera.setVideoHDR(enabled) }
         }, for: .valueChanged)
         hdrRow = row
@@ -569,6 +601,7 @@ final class StudioDrawerControls {
             let isOn = toggle.isOn
             lowLightChoice = isOn
             lowLightRow?.valueText = isOn ? "on" : "off"
+            logChoice("Low-Light Boost", isOn ? "on" : "off")
             runner.run(Key.lowLight) { [camera] in await camera.setLowLightBoost(isOn) }
         }, for: .valueChanged)
         lowLightRow = row
@@ -585,6 +618,7 @@ final class StudioDrawerControls {
             let option = options[segmented.selectedSegmentIndex]
             stabilizationChoice = option
             row?.valueText = option.name
+            logChoice("Stabilization", option.name)
             runner.run(Key.stabilization) { [camera] in await camera.setStabilization(option.mode) }
         }, for: .valueChanged)
         stabilizationRow = row
@@ -601,6 +635,7 @@ final class StudioDrawerControls {
             guard let self, let segmented = action.sender as? UISegmentedControl else { return }
             photoCodec = segmented.selectedSegmentIndex == 0 ? .jpeg : .hevc
             row?.valueText = photoCodec == .jpeg ? "jpeg" : "heic"
+            logChoice("Codec", photoCodec == .jpeg ? "jpeg" : "heic")
         }, for: .valueChanged)
         return row
     }
@@ -608,7 +643,9 @@ final class StudioDrawerControls {
     /// Max Dimensions switches the active format to the 48MP one, which only the physical wide
     /// camera has: virtual devices top out at their fusion formats (24MP on iPhone 15 Pro Max),
     /// so turning it on hops to the wide camera first and turning it off hops back once
-    /// everything is automatic again. The 48MP format excludes Live Photo, Burst and Portrait.
+    /// everything is automatic again. Turning it on turns off what it can't run with (LIVE,
+    /// PORTRAIT and BURST, Cinematic Video, manual exposure and white balance); see
+    /// ``StudioViewController/prepare(for:)``.
     private func makeMaxDimensionsRow() -> PRMSettingsRow {
         let toggle = UISwitch()
         toggle.isOn = capMaxDimensions
@@ -629,15 +666,34 @@ final class StudioDrawerControls {
     private func setHighResolutionFormat(_ isOn: Bool) {
         runner.run(Key.maxDimensions) { [weak self] in
             guard let self else { return }
-            if isOn {
-                await prepareForManualExposure()
+            if isOn, await !prepare(.maxDimensions) {
+                showMaxDimensions(false)
+                return
             }
-            await camera.setHighResolutionPhotoFormat(isOn)
+            // A refusal (reported on the error stream) leaves the switch where the format is.
+            if await !camera.setHighResolutionPhotoFormat(isOn) {
+                showMaxDimensions(!isOn)
+                return
+            }
             if !isOn {
                 await didReturnToAutoExposure()
             }
-            maxDimensionsDidChange(isOn)
         }
+    }
+
+    /// Turns Max Dimensions off for a setting that can't run with it (Studio's conflict rule),
+    /// moving the switch without its action. Returns once the regular format is back.
+    func turnOffMaxDimensions() async {
+        guard capMaxDimensions else { return }
+        showMaxDimensions(false)
+        ExampleLog.session.notice("Studio Max Dimensions → off (a newer setting needs it off)")
+        await camera.setHighResolutionPhotoFormat(false)
+    }
+
+    private func showMaxDimensions(_ isOn: Bool) {
+        capMaxDimensions = isOn
+        maxDimensionsToggle?.isOn = isOn
+        maxDimensionsRow?.valueText = isOn ? "cap" : "default"
     }
 
     private func makeRedEyeRow() -> PRMSettingsRow {
@@ -648,6 +704,7 @@ final class StudioDrawerControls {
             guard let self, let toggle = action.sender as? UISwitch else { return }
             autoRedEyeReductionEnabled = toggle.isOn
             row?.valueText = toggle.isOn ? "on" : "off"
+            logChoice("Auto Red-Eye", toggle.isOn ? "on" : "off")
         }, for: .valueChanged)
         return row
     }
@@ -676,17 +733,34 @@ final class StudioDrawerControls {
     /// on turns off and the format goes back, so the session's high-resolution intent doesn't
     /// follow the camera.
     private func syncMaxDimensionsRow() {
-        guard let row = maxDimensionsRow, let toggle = maxDimensionsToggle else { return }
-        guard !supportsHighResPhoto else {
-            row.setDisabled(message: nil)
-            return
-        }
-        row.setDisabled(message: "This camera caps at 12MP. Use the back camera for higher resolution.")
-        guard toggle.isOn else { return }
-        toggle.isOn = false
-        capMaxDimensions = false
-        row.valueText = "default"
+        guard let row = maxDimensionsRow else { return }
+        row.setDisabled(message: maxDimensionsDisabledMessage(isPhotoMode: true))
+        guard !supportsHighResPhoto, capMaxDimensions else { return }
+        showMaxDimensions(false)
+        var change = SettingChange(camera.device?.localizedName ?? "This camera")
+        change.turnedOff("Max Dimensions", because: "it caps at 12 MP")
+        toaster.gaveWay(change)
         setHighResolutionFormat(false)
+    }
+
+    /// Why Max Dimensions can't be changed now: a camera without > 12MP, or a mode that
+    /// doesn't take photos from the format (the switch keeps its setting for PHOTO).
+    private func maxDimensionsDisabledMessage(isPhotoMode: Bool) -> String? {
+        if !supportsHighResPhoto {
+            return "This camera caps at 12MP. Use the back camera for higher resolution."
+        }
+        if isPhotoMode {
+            return nil
+        }
+        return capMaxDimensions
+            ? "Max Dimensions is for photos. It stays on for when you go back to PHOTO."
+            : "Max Dimensions is for photos. Switch to PHOTO to use it."
+    }
+
+    /// One line for a drawer choice the camera doesn't log itself, so a pasted log shows it
+    /// (a JPEG photo right after the Codec row went to JPEG, for one).
+    private func logChoice(_ title: String, _ value: String) {
+        ExampleLog.session.notice("Studio \(title, privacy: .public) → \(value, privacy: .public)")
     }
 
     // MARK: - Sync
@@ -720,26 +794,14 @@ final class StudioDrawerControls {
         }
         shutterRow?.valueText = state.exposureDurationSeconds.map { isCustom ? CaptureLabels.shutter($0) : "\(CaptureLabels.shutter($0)) (auto)" } ?? "auto"
 
-        if let wbModeSegmented {
-            wbModeSegmented.selectedSegmentIndex = switch state.whiteBalanceMode {
-            case .locked: 0
-            case .continuousAutoWhiteBalance: 2
-            default: 1
-            }
-        }
+        wbModeSegmented?.selectedSegmentIndex = Self.whiteBalanceSegment(for: state.whiteBalanceMode)
         if state.whiteBalanceMode == .locked, let wbKelvinSlider, !wbKelvinSlider.isTracking {
             wbKelvinSlider.value = state.whiteBalanceTemperature
         }
         let kelvin = "\(Int(state.whiteBalanceTemperature))K"
         wbRow?.valueText = state.whiteBalanceMode == .locked ? kelvin : "\(kelvin) (auto)"
 
-        if let focusModeSegmented {
-            focusModeSegmented.selectedSegmentIndex = switch state.focusMode {
-            case .locked: 0
-            case .autoFocus: 1
-            default: 2
-            }
-        }
+        focusModeSegmented?.selectedSegmentIndex = Self.focusSegment(for: state.focusMode)
         if state.focusMode == .locked, let lensSlider, !lensSlider.isTracking {
             lensSlider.value = state.lensPosition
         }
@@ -765,8 +827,18 @@ final class StudioDrawerControls {
         customExposureSegmented?.isEnabled = !presetsLocked
         customExposureSegmented?.alpha = presetsLocked ? 0.45 : 1
 
-        isoRow?.setDisabled(message: context.nightFixesExposure ? "Night mode sets ISO for each capture" : nil)
-        shutterRow?.setDisabled(message: context.nightFixesExposure ? "Night mode sets the shutter for each capture" : nil)
+        // A manual change on a virtual camera switches to the wide camera, which a recording
+        // can't survive.
+        let switchWhileRecording = context.isRecording && context.manualNeedsCameraSwitch
+        isoRow?.setDisabled(message: context.nightFixesExposure
+            ? "Night mode sets ISO for each capture"
+            : switchWhileRecording ? "Stop recording to change ISO: manual exposure needs the wide camera." : nil)
+        shutterRow?.setDisabled(message: context.nightFixesExposure
+            ? "Night mode sets the shutter for each capture"
+            : switchWhileRecording ? "Stop recording to change the shutter: manual exposure needs the wide camera." : nil)
+        maxDimensionsRow?.setDisabled(message: maxDimensionsDisabledMessage(isPhotoMode: context.isPhotoMode))
+        hdrRow?.setDisabled(message: camera.device?.supportsVideoHDR == false ? "This camera format has no video HDR" : nil)
+        lowLightRow?.setDisabled(message: camera.device?.supportsLowLightBoost == false ? "This camera has no low-light boost" : nil)
 
         let recordingMessage = context.isRecording ? "Setting locked while recording" : nil
         let customWhiteBalanceMessage = camera.device?.supportsCustomWhiteBalance == false
@@ -799,7 +871,7 @@ final class StudioDrawerControls {
             control.accessibilityLabel = title
         }
         let row = PRMSettingsRow(symbolName: symbol, title: title, valueText: value, content: content)
-        row.onDisabledTap = { [weak self] message in self?.toast(message) }
+        row.onDisabledTap = { [weak self] message in self?.toaster.refused(title, because: message) }
         return row
     }
 
@@ -835,6 +907,29 @@ final class StudioDrawerControls {
             }
         }
         return bestIndex
+    }
+
+    /// Toasts and logs that the camera has no `mode` and what it offers instead; the caller puts
+    /// the segment back.
+    private func refuse(_ mode: String, offered: [String], by device: PRMCameraDevice) {
+        let message = "\(device.localizedName) has no \(mode). It offers \(ListFormatter.localizedString(byJoining: offered))."
+        toaster.refused(mode, because: message)
+    }
+
+    private static func whiteBalanceSegment(for mode: AVCaptureDevice.WhiteBalanceMode) -> Int {
+        switch mode {
+        case .locked: 0
+        case .continuousAutoWhiteBalance: 2
+        default: 1
+        }
+    }
+
+    private static func focusSegment(for mode: AVCaptureDevice.FocusMode) -> Int {
+        switch mode {
+        case .locked: 0
+        case .autoFocus: 1
+        default: 2
+        }
     }
 
     private static func applyExposureModeUI(_ mode: AVCaptureDevice.ExposureMode, to segmented: UISegmentedControl, row: PRMSettingsRow?) {

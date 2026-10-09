@@ -6,8 +6,9 @@ import os
 /// under `dev.luminoid.prism.example`, so Console can show either or both:
 /// `/usr/bin/log stream --level debug --predicate 'subsystem BEGINSWITH "dev.luminoid.prism"'`.
 ///
-/// Errors are logged with `String(describing:)` (the enum case and its payload), never
-/// `localizedDescription`, which is for the toast.
+/// Errors are logged with `PRMLog.describe(_:)`: the enum case or NSError domain and code,
+/// plus the underlying error's, with the full description (which can carry paths) private.
+/// Never `localizedDescription`, which is for the toast.
 enum ExampleLog {
     /// Boot, mode changes, device hops.
     static let session = Logger(subsystem: subsystem, category: "Session")

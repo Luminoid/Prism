@@ -33,16 +33,21 @@ final class ModernCaptureControls {
     private let camera: PRMCamera
     private let captureEventHelper: PRMCaptureEventHelper
     private let toast: (String) -> Void
-    /// Studio's hop to the single wide camera before manual exposure (virtual devices
-    /// reject locked exposure axes), and the hop back once everything is auto again.
-    private let prepareForManualExposure: () async -> Void
+    /// Studio's conflict rule before a setting turns on (``StudioViewController/prepare(for:)``):
+    /// it turns off what conflicts and, for manual exposure, hops to the single wide camera
+    /// (virtual devices reject locked exposure axes). `false` refuses the change.
+    private let prepare: (StudioSetting) async -> Bool
+    /// The hop back to the virtual camera once everything is auto again.
     private let didReturnToAutoExposure: () async -> Void
     /// Studio's refresh after a control changed cameras (Cinematic Video's switch to the
-    /// Dual Wide camera): rotation, lens strip, drawer ranges.
+    /// camera that runs it): rotation, lens strip, drawer ranges.
     private let cameraDidChange: () async -> Void
 
     /// Per-row availability, re-evaluated when the device changes.
     private var availabilityChecks: [(row: PRMSettingsRow, reason: (PRMCameraDevice) -> String?)] = []
+    /// Rows that also depend on the session (a recording, Subject Tracking), re-evaluated on
+    /// every state tick after the device check, which wins.
+    private var stateChecks: [(row: PRMSettingsRow, reason: (PRMCameraState, Bool) -> String?)] = []
     private var lastCheckedDevice: PRMCameraDevice?
 
     /// When on, tap-to-focus meters a rect twice the system default instead of a point.
@@ -101,6 +106,8 @@ final class ModernCaptureControls {
     private weak var simulatedApertureRow: PRMSettingsRow?
     private weak var cinematicMetadataRow: PRMSettingsRow?
     private var cinematicMetadataLabel = "auto"
+    private weak var lensLockControl: UISegmentedControl?
+    private weak var lensLockRow: PRMSettingsRow?
     private weak var aspectControl: UISegmentedControl?
     private weak var aspectRow: PRMSettingsRow?
     private var aspectRatios: [PRMAspectRatio] = []
@@ -111,14 +118,14 @@ final class ModernCaptureControls {
         camera: PRMCamera,
         captureEventHelper: PRMCaptureEventHelper,
         toast: @escaping (String) -> Void,
-        prepareForManualExposure: @escaping () async -> Void,
+        prepare: @escaping (StudioSetting) async -> Bool,
         didReturnToAutoExposure: @escaping () async -> Void,
         cameraDidChange: @escaping () async -> Void
     ) {
         self.camera = camera
         self.captureEventHelper = captureEventHelper
         self.toast = toast
-        self.prepareForManualExposure = prepareForManualExposure
+        self.prepare = prepare
         self.didReturnToAutoExposure = didReturnToAutoExposure
         self.cameraDidChange = cameraDidChange
         usesCustomSounds = PRMCaptureEventHelper.usesCustomCaptureSounds
@@ -182,18 +189,21 @@ final class ModernCaptureControls {
     /// Tap-to-focus at a device point. With Cinematic Video on, a tap on a detected face or
     /// body tracks it, and the weak / fixed tap styles send their own focus request.
     /// Otherwise: continuous AF while tracking (that engages it), and a rect twice the
-    /// default size when rect focus is on.
+    /// default size when rect focus is on. Under a manual exposure (custom, a priority mode,
+    /// locked) the tap focuses only, so the ISO and shutter the user set stay.
     func focus(atDevicePoint point: CGPoint) async {
         if isCinematicVideoEnabled, let request = cinematicFocusRequest(at: point) {
             await camera.setCinematicFocus(request)
             return
         }
         let focusMode: AVCaptureDevice.FocusMode = isTrackingEnabled ? .continuousAutoFocus : .autoFocus
+        let exposure = camera.state.exposureMode
+        let exposureMode: AVCaptureDevice.ExposureMode? = exposure == .custom || exposure == .locked ? nil : .autoExpose
         if usesRectFocus, let base = await camera.defaultFocusRect(for: point) {
             let rect = base.insetBy(dx: -base.width / 2, dy: -base.height / 2)
-            await camera.setFocusAndExposure(focusMode: focusMode, exposureMode: .autoExpose, in: rect, monitorSubjectAreaChange: true)
+            await camera.setFocusAndExposure(focusMode: focusMode, exposureMode: exposureMode, in: rect, monitorSubjectAreaChange: true)
         } else {
-            await camera.setFocusAndExposure(focusMode: focusMode, exposureMode: .autoExpose, at: point, monitorSubjectAreaChange: true)
+            await camera.setFocusAndExposure(focusMode: focusMode, exposureMode: exposureMode, at: point, monitorSubjectAreaChange: true)
         }
     }
 
@@ -307,10 +317,11 @@ final class ModernCaptureControls {
     }
 
     /// Mirrors device truth back into the controls (modes can change under the user).
-    func sync(from state: PRMCameraState) {
+    func sync(from state: PRMCameraState, isRecording: Bool) {
         if let device = camera.device, device != lastCheckedDevice {
             applyAvailability(for: device)
         }
+        applyStateAvailability(state, isRecording: isRecording)
         isTrackingEnabled = state.isContinuousAutoFocusTrackingEnabled
         isCinematicVideoEnabled = state.isCinematicVideoCaptureEnabled
         trackingSwitch?.isOn = state.isContinuousAutoFocusTrackingEnabled
@@ -353,6 +364,39 @@ final class ModernCaptureControls {
         }
     }
 
+    // MARK: - Giving way
+
+    /// Turns Cinematic Video off for a setting that can't run with it (Studio's conflict
+    /// rule), moving the switch without its action. Returns once the camera it moved away
+    /// from is back.
+    func turnOffCinematicVideo() async {
+        cinematicSwitch?.isOn = false
+        cinematicRow?.valueText = "off"
+        let cameraBefore = camera.device?.uniqueID
+        do {
+            try await camera.setCinematicVideoEnabled(false)
+        } catch {
+            toast("Cinematic Video: \(error.localizedDescription)")
+        }
+        if camera.device?.uniqueID != cameraBefore {
+            await cameraDidChange()
+        }
+    }
+
+    /// Turns Subject Tracking off for Cinematic Video, which drives focus itself.
+    func turnOffSubjectTracking() async {
+        trackingSwitch?.isOn = false
+        await camera.setContinuousAutoFocusTrackingEnabled(false)
+    }
+
+    /// Releases Lens Lock before the move to the wide camera that manual controls make: the
+    /// lock picks a lens of the virtual camera being left.
+    func releaseLensLock() async {
+        lensLockControl?.selectedSegmentIndex = 0
+        lensLockRow?.valueText = "auto"
+        await camera.lockLens(nil)
+    }
+
     private func syncPriority() {
         guard let priorityControl else { return }
         let index = switch camera.exposurePriorityAxes {
@@ -390,6 +434,7 @@ final class ModernCaptureControls {
 
     func makeSections(device: PRMCameraDevice) -> [(title: String, rows: [PRMSettingsRow])] {
         availabilityChecks.removeAll()
+        stateChecks.removeAll()
         lastCheckedDevice = device
         return [
             ("Exposure+ (iOS 27)", [
@@ -451,7 +496,9 @@ final class ModernCaptureControls {
             }
             applyPending("priority") { [weak self] in
                 guard let self else { return }
-                if index > 0 { await prepareForManualExposure() }
+                if index > 0 {
+                    guard await prepare(.manualExposure("Priority")) else { return }
+                }
                 switch index {
                 case 1: await camera.setExposure(aperture: .auto, shutterSeconds: .current, iso: .auto)
                 case 2: await camera.setExposure(aperture: .auto, shutterSeconds: .auto, iso: .current)
@@ -472,11 +519,12 @@ final class ModernCaptureControls {
             case 2:
                 let iso = slider.value.rounded()
                 row?.valueText = "iso \(Int(iso))"
-                runner.run("priorityValue") { [camera] in await camera.setISOPriority(iso) }
+                runner.run("priorityValue", deduplicating: iso) { [camera] in await camera.setISOPriority(iso) }
             default:
                 break
             }
         }, for: .valueChanged)
+        slider.addAction(UIAction { [weak self] _ in self?.runner.forget("priorityValue") }, for: .touchDown)
         priorityControl = segmented
         priorityValueSlider = slider
         priorityRow = row
@@ -518,12 +566,12 @@ final class ModernCaptureControls {
             guard let self, let slider = action.sender as? UISlider else { return }
             let fNumber = Self.snapped(slider.value, to: camera.device?.recommendedApertureStops ?? [])
             row?.valueText = String(format: "f/%.1f", fNumber)
-            runner.run("aperture") { [weak self] in
-                guard let self else { return }
-                await prepareForManualExposure()
+            runner.run("aperture", deduplicating: fNumber) { [weak self] in
+                guard let self, await prepare(.manualExposure("Aperture")) else { return }
                 await camera.setAperturePriority(fNumber)
             }
         }, for: .valueChanged)
+        slider.addAction(UIAction { [weak self] _ in self?.runner.forget("aperture") }, for: .touchDown)
         apertureSlider = slider
         gate(row, device: device) { [weak self] device in
             guard let range = device.apertureRange else { return CameraCapability.variableAperture.unavailableMessage(for: "Aperture") }
@@ -614,7 +662,10 @@ final class ModernCaptureControls {
             row?.valueText = type.map(Self.shortName) ?? "auto"
             runner.run("lensLock") { [camera] in await camera.lockLens(type) }
         }, for: .valueChanged)
+        lensLockControl = segmented
+        lensLockRow = row
         gate(row, device: device, requires: .lensLock, feature: "Lens lock")
+        gateOnState(row) { _, isRecording in isRecording ? "Stop recording to change the lens lock: it switches cameras." : nil }
         return row
     }
 
@@ -676,7 +727,13 @@ final class ModernCaptureControls {
             guard let self, let toggle = action.sender as? UISwitch else { return }
             let isOn = toggle.isOn
             row?.valueText = isOn ? "tap to track" : "off"
-            runner.run("tracking") { [camera] in await camera.setContinuousAutoFocusTrackingEnabled(isOn) }
+            runner.run("tracking") { [weak self] in
+                guard let self else { return }
+                if isOn {
+                    _ = await prepare(.subjectTracking)
+                }
+                await camera.setContinuousAutoFocusTrackingEnabled(isOn)
+            }
         }, for: .valueChanged)
         trackingSwitch = toggle
         gate(row, device: device, requires: .subjectTracking, feature: "Subject tracking")
@@ -698,6 +755,9 @@ final class ModernCaptureControls {
         trackingBiasSlider = slider
         trackingBiasRow = row
         gate(row, device: device, requires: .subjectTracking, feature: "Subject tracking")
+        gateOnState(row) { state, _ in
+            state.isContinuousAutoFocusTrackingEnabled ? nil : "Turn on Subject Tracking to set its bias"
+        }
         return row
     }
 
@@ -755,11 +815,16 @@ final class ModernCaptureControls {
             row?.valueText = enabled ? "turning on…" : "off"
             applyPending("cinematic") { [weak self, weak toggle] in
                 guard let self else { return }
-                // On a Pro iPhone's Triple camera, Prism switches to the Dual Wide camera for
-                // Cinematic Video and back when it's turned off.
+                // From a camera without Cinematic Video formats (a Pro iPhone's Triple camera),
+                // Prism switches to one that has them and back when it's turned off.
+                if enabled {
+                    _ = await prepare(.cinematicVideo)
+                }
                 let cameraBefore = camera.device?.uniqueID
                 do {
                     try await camera.setCinematicVideoEnabled(enabled)
+                } catch PRMSessionError.cancelled {
+                    // A newer toggle or camera switch took over; it sets the switch.
                 } catch {
                     toggle?.isOn = !enabled
                     toast("Cinematic Video: \(error.localizedDescription)")
@@ -767,11 +832,17 @@ final class ModernCaptureControls {
                 if camera.device?.uniqueID != cameraBefore {
                     await cameraDidChange()
                 }
+                // Cinematic Video that ran on the wide camera a manual control had moved to
+                // kept Studio there.
+                if !enabled {
+                    await didReturnToAutoExposure()
+                }
             }
         }, for: .valueChanged)
         cinematicSwitch = toggle
         cinematicRow = row
         gate(row, device: device, requires: .cinematicVideo, feature: "Cinematic Video")
+        gateOnState(row) { _, isRecording in isRecording ? "Stop recording to change Cinematic Video." : nil }
         return row
     }
 
@@ -877,6 +948,7 @@ final class ModernCaptureControls {
         aspectControl = segmented
         aspectRow = row
         gate(row, device: device, requires: .dynamicAspectRatio, feature: "Dynamic aspect ratio")
+        gateOnState(row) { _, isRecording in isRecording ? "Stop recording to change the sensor aspect ratio." : nil }
         return row
     }
 
@@ -963,6 +1035,20 @@ final class ModernCaptureControls {
     /// Gates a row on one capability, with its shared "<feature> needs …" message.
     private func gate(_ row: PRMSettingsRow, device: PRMCameraDevice, requires capability: CameraCapability, feature: String) {
         gate(row, device: device) { capability.isSupported(by: $0) ? nil : capability.unavailableMessage(for: feature) }
+    }
+
+    /// Registers a row's session-dependent check (see ``stateChecks``).
+    private func gateOnState(_ row: PRMSettingsRow, _ reason: @escaping (PRMCameraState, Bool) -> String?) {
+        stateChecks.append((row, reason))
+    }
+
+    /// The device's reason wins (the row can't work on this camera at all), then the state's.
+    private func applyStateAvailability(_ state: PRMCameraState, isRecording: Bool) {
+        guard let device = camera.device else { return }
+        for check in stateChecks {
+            let deviceReason = availabilityChecks.first { $0.row === check.row }?.reason(device)
+            check.row.setDisabled(message: deviceReason ?? check.reason(state, isRecording))
+        }
     }
 
     private func applyAvailability(for device: PRMCameraDevice) {

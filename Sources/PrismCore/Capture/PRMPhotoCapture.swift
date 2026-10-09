@@ -164,12 +164,17 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         let liveOutput = try await resolveCurrentOutput()
         try await waitUntilReady(liveOutput)
         let settings = portrait ? Self.portraitSettings(from: requested, output: liveOutput) : requested
-        let dims = liveOutput.maxPhotoDimensions
+        let prepared = prepareStillSettings(settings, output: liveOutput)
+        let dims = prepared.settings.maxPhotoDimensions
+        let ceiling = liveOutput.maxPhotoDimensions
         PRMLog.debug(
             .capture,
-            "capturePhoto entry: maxDim=\(dims.width)×\(dims.height), live=\(liveOutput.isLivePhotoCaptureEnabled), depth=\(liveOutput.isDepthDataDeliveryEnabled), portrait=\(portrait)"
+            """
+            capturePhoto: \(Self.sizeText(dims)) (output allows \(ceiling.width)×\(ceiling.height)), \
+            quality=\(Self.name(of: prepared.settings.photoQualityPrioritization)), \
+            depth=\(liveOutput.isDepthDataDeliveryEnabled), portrait=\(portrait)
+            """
         )
-        let prepared = prepareStillSettings(settings, output: liveOutput)
         await Self.applyRotation(settings.rotationAngle, to: liveOutput)
         let pending = PendingCapture(
             kind: .single,
@@ -177,6 +182,8 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
             filterCodec: settings.codec,
             manualISO: prepared.manualISO,
             manualExposureDuration: prepared.manualDuration,
+            requestedDimensions: dims,
+            sizeLimit: prepared.sizeLimit,
             willCapture: willCapture
         )
         return try await fire(prepared.settings, on: liveOutput, pending: pending) { pending, continuation in
@@ -357,11 +364,13 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
 
     // MARK: - Settings
 
-    /// The settings to fire plus the manual values to patch into EXIF.
+    /// The settings to fire, the manual values to patch into EXIF, and why the photo may
+    /// come back smaller than the settings ask (see ``sizeLimit(of:output:manualCapture:)``).
     private struct PreparedSettings {
         let settings: AVCapturePhotoSettings
         let manualISO: Float?
         let manualDuration: CMTime?
+        let sizeLimit: String?
     }
 
     /// Builds the settings against the output as it is now (after the readiness wait).
@@ -385,9 +394,50 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         }
         let regular = settings.makeAVSettings(for: output)
         clampFlashMode(on: regular, output: output)
-        applyManualExposureOverrides(on: regular, output: output)
+        let forcedSpeed = applyManualExposureOverrides(on: regular, output: output)
         let exifPatch = deviceInCustom ? override : nil
-        return PreparedSettings(settings: regular, manualISO: exifPatch?.iso, manualDuration: exifPatch?.duration)
+        return PreparedSettings(
+            settings: regular,
+            manualISO: exifPatch?.iso,
+            manualDuration: exifPatch?.duration,
+            sizeLimit: Self.sizeLimit(of: regular, output: output, manualCapture: forcedSpeed)
+        )
+    }
+
+    /// Why AVFoundation may deliver a smaller photo than `settings.maxPhotoDimensions`, when
+    /// that's known before firing. AVFoundation shrinks the photo without an error, so the
+    /// outcome line carries the reason.
+    ///
+    /// - A manual capture (custom or locked exposure, locked white balance) fires at the
+    ///   speed prioritization or as a bracket, which AVFoundation doesn't deliver above 12 MP
+    ///   (Apple: 48 MP with a custom exposure "is not currently possible").
+    /// - The 24 MP entry (5712 × 4284) is only delivered through auto-deferred photo delivery
+    ///   (`AVCapturePhotoOutput.maxPhotoDimensions`).
+    static func sizeLimit(of settings: AVCapturePhotoSettings, output: AVCapturePhotoOutput, manualCapture: Bool) -> String? {
+        if manualCapture || settings is AVCapturePhotoBracketSettings {
+            return "manual exposure and locked white balance capture at 12 MP"
+        }
+        let dims = settings.maxPhotoDimensions
+        if dims.width == 5712, dims.height == 4284, !output.isAutoDeferredPhotoDeliveryEnabled {
+            return "24 MP is only delivered with auto-deferred photo delivery on"
+        }
+        return nil
+    }
+
+    /// `"up to 8064×6048"`, or `"default size"` when the settings leave the size to
+    /// AVFoundation (its smallest supported size, 12 MP on recent iPhones).
+    static func sizeText(_ dimensions: CMVideoDimensions) -> String {
+        dimensions.width > 0 && dimensions.height > 0 ? "up to \(dimensions.width)×\(dimensions.height)" : "default size"
+    }
+
+    /// "speed", "balanced", "quality".
+    static func name(of quality: AVCapturePhotoOutput.QualityPrioritization) -> String {
+        switch quality {
+        case .speed: "speed"
+        case .balanced: "balanced"
+        case .quality: "quality"
+        @unknown default: "\(quality.rawValue)"
+        }
     }
 
     /// Why a manual-exposure bracket can't fire on `output` now, `nil` when it can. Firing one
@@ -411,12 +461,7 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         device: AVCaptureDevice?,
         output: AVCapturePhotoOutput
     ) -> PreparedSettings {
-        let processedFormat: [String: Any]? = if let codec = settings.codec,
-                                                 output.availablePhotoCodecTypes.contains(codec) {
-            [AVVideoCodecKey: codec]
-        } else {
-            nil
-        }
+        let processedFormat: [String: Any]? = PRMPhotoSettings.availableCodec(settings.codec, on: output).map { [AVVideoCodecKey: $0] }
         let bracketed = AVCaptureManualExposureBracketedStillImageSettings.manualExposureSettings(
             exposureDuration: override?.duration ?? AVCaptureDevice.currentExposureDuration,
             iso: override?.iso ?? AVCaptureDevice.currentISO
@@ -444,7 +489,12 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         // EXIF patch: the override values, or what the device reports right before firing.
         let iso = override?.iso ?? device?.iso
         let duration = override?.duration ?? device?.exposureDuration
-        return PreparedSettings(settings: bracket, manualISO: iso, manualDuration: duration)
+        return PreparedSettings(
+            settings: bracket,
+            manualISO: iso,
+            manualDuration: duration,
+            sizeLimit: Self.sizeLimit(of: bracket, output: output, manualCapture: true)
+        )
     }
 
     /// `exposure` clamped to the device's active format, `nil` without a device to clamp
@@ -477,13 +527,22 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
     /// The manual mode wins over a caller's `.balanced` / `.quality`: the user would not
     /// understand "I set ISO 800 and the photo shows ISO 200". In continuous-auto the
     /// caller's choice stands.
-    private func applyManualExposureOverrides(on settings: AVCapturePhotoSettings, output: AVCapturePhotoOutput) {
-        guard let device = output.prm_sourceDevice else { return }
+    ///
+    /// Returns whether it forced `.speed`.
+    @discardableResult
+    private func applyManualExposureOverrides(on settings: AVCapturePhotoSettings, output: AVCapturePhotoOutput) -> Bool {
+        guard let device = output.prm_sourceDevice else { return false }
         let exposureIsManual = device.exposureMode == .custom || device.exposureMode == .locked
         let whiteBalanceIsLocked = device.whiteBalanceMode == .locked
-        guard exposureIsManual || whiteBalanceIsLocked else { return }
+        guard exposureIsManual || whiteBalanceIsLocked else { return false }
         settings.photoQualityPrioritization = .speed
-        PRMLog.debug(.capture, "Manual exposure / locked WB at capture time — photoQualityPrioritization set to .speed")
+        let reason = switch (exposureIsManual, whiteBalanceIsLocked) {
+        case (true, true): "manual exposure and locked white balance"
+        case (true, false): "manual exposure"
+        default: "locked white balance"
+        }
+        PRMLog.debug(.capture, "Quality prioritization set to speed for \(reason)")
+        return true
     }
 
     /// Force `AVCapturePhotoSettings.flashMode` into a value the current photo output
@@ -563,6 +622,10 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
         /// `fileDataRepresentation(with:)`.
         let manualISO: Float?
         let manualExposureDuration: CMTime?
+        /// The `maxPhotoDimensions` the capture fired with, and why the photo may come back
+        /// smaller, for the outcome line.
+        let requestedDimensions: CMVideoDimensions?
+        let sizeLimit: String?
         var singleContinuation: CheckedContinuation<PRMPhoto, any Error>?
         var liveContinuation: CheckedContinuation<PRMLivePhoto, any Error>?
         var cancelled: Bool = false
@@ -576,6 +639,8 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
             filterCodec: AVVideoCodecType? = nil,
             manualISO: Float? = nil,
             manualExposureDuration: CMTime? = nil,
+            requestedDimensions: CMVideoDimensions? = nil,
+            sizeLimit: String? = nil,
             willCapture: (@Sendable () -> Void)?
         ) {
             self.kind = kind
@@ -583,6 +648,8 @@ public final class PRMPhotoCapture: NSObject, @unchecked Sendable {
             self.filterCodec = filterCodec
             self.manualISO = manualISO
             self.manualExposureDuration = manualExposureDuration
+            self.requestedDimensions = requestedDimensions
+            self.sizeLimit = sizeLimit
             self.willCapture = willCapture
         }
     }

@@ -213,7 +213,7 @@ final class CameraPreviewHost {
             "data connection \(connectionAngle.map { "\(Int($0))°" } ?? "n/a")",
             "mirrored \(dataMirrored.map(String.init) ?? "n/a")",
         ].joined(separator: ", ")
-        ExampleLog.session.notice(
+        ExampleLog.session.debug(
             "Preview orientation: \(camera, privacy: .public) → \(Int(rotation.rawValue))° mirrored=\(mirroring) (\(angles, privacy: .public))"
         )
         delegate?.cameraHost(self, didOrientPreview: rotation, mirroring: mirroring)

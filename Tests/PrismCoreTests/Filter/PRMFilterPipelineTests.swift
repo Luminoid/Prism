@@ -46,6 +46,17 @@ struct PRMFilterPipelineTests {
         #expect(summary?.maximum == 0.050)
     }
 
+    @Test(arguments: [
+        (average: 0.040, maximum: 0.060, isSlow: false),
+        (average: 0.100, maximum: 0.120, isSlow: true),
+        (average: 0.045, maximum: 0.750, isSlow: true),
+        (average: 0.099, maximum: 0.249, isSlow: false),
+    ])
+    func `Only a laggy latency window is slow`(average: Double, maximum: Double, isSlow: Bool) {
+        let summary = LatencyWindow.Summary(average: average, maximum: maximum, count: 150, span: 5)
+        #expect(summary.isSlow == isSlow)
+    }
+
     @Test
     func `Frame stream can be created without crashing`() {
         let pipeline = PRMFilterPipeline()

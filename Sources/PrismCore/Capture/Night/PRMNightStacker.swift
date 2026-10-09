@@ -11,12 +11,31 @@ import simd
 /// ``offer(_:)`` runs on the data-output queue and returns at once: a frame that arrives
 /// while the previous one is still merging is skipped, so at most one capture buffer is held
 /// at a time. The first accepted frame is the reference; later frames are rejected when much
-/// blurrier than it (hand shake) or when they can't be aligned.
+/// blurrier than the frames so far (hand shake; see ``SharpnessGate``) or when they can't be
+/// aligned.
 final class PRMNightStacker: @unchecked Sendable {
     struct Status: Equatable {
         var merged = 0
+        /// Too blurred, or not alignable.
         var rejected = 0
+        /// At the planned exposure but arrived while the previous frame was still merging.
+        var skipped = 0
         var lastAcceptedTime: CFTimeInterval?
+    }
+
+    /// What ``offer(_:)`` does with a frame.
+    enum Intake: Equatable {
+        case merge
+        /// A frame the plan wanted, dropped because the previous one is still merging.
+        case skip
+        /// Not wanted: the capture is over, the plan is full, or the exposure isn't the
+        /// planned one yet.
+        case ignore
+    }
+
+    static func intake(isAccepting: Bool, isBusy: Bool, merged: Int, planned: Int, atPlannedExposure: Bool) -> Intake {
+        guard isAccepting, merged < planned, atPlannedExposure else { return .ignore }
+        return isBusy ? .skip : .merge
     }
 
     private let plan: PRMNightPlan
@@ -34,7 +53,7 @@ final class PRMNightStacker: @unchecked Sendable {
     private var merger: PRMNightMerger?
     private var registration: PRMNightRegistration?
     private var referenceSmall: CVPixelBuffer?
-    private var referenceSharpness: Float = 0
+    private var sharpnessGate = SharpnessGate()
     private var referenceAttachments: [String: Any]?
     private var conversionBuffer: CVPixelBuffer?
 
@@ -83,11 +102,19 @@ final class PRMNightStacker: @unchecked Sendable {
         let now = CACurrentMediaTime()
 
         lock.lock()
-        let accept = isAccepting && !isBusy && status.merged < plan.frameCount
-            && (matches ?? (now >= settleDeadline))
+        let intake = Self.intake(
+            isAccepting: isAccepting,
+            isBusy: isBusy,
+            merged: status.merged,
+            planned: plan.frameCount,
+            atPlannedExposure: matches ?? (now >= settleDeadline)
+        )
+        let accept = intake == .merge
         if accept {
             isBusy = true
             status.lastAcceptedTime = now
+        } else if intake == .skip {
+            status.skipped += 1
         }
         let logFormat = !loggedFrameFormat
         loggedFrameFormat = true
@@ -148,19 +175,20 @@ final class PRMNightStacker: @unchecked Sendable {
         }
         guard let small = registration.makeSmall(bgra) else { return reject("downscale failed") }
         let sharpness = PRMNightRegistration.sharpness(small)
+        let typicalSharpness = sharpnessGate.typical
+        let isSharpEnough = sharpnessGate.admits(sharpness)
 
         guard let referenceSmall else {
             guard merger.add(frame: bgra, frameSmall: small, referenceSmall: small, warp: matrix_identity_float3x3, isReference: true, ghost: ghost) else {
                 return reject("GPU merge failed")
             }
             self.referenceSmall = small
-            referenceSharpness = sharpness
             referenceAttachments = attachments
             merged()
             return
         }
-        if referenceSharpness > 0, sharpness < 0.5 * referenceSharpness {
-            return reject("blurred (sharpness \(Int(sharpness)) vs \(Int(referenceSharpness)))")
+        guard isSharpEnough else {
+            return reject("blurred (sharpness \(Int(sharpness)) vs typical \(Int(typicalSharpness ?? 0)))")
         }
         guard let warp = registration.warp(floatingSmall: small, referenceSmall: referenceSmall) else {
             return reject("couldn't align")
@@ -199,6 +227,34 @@ final class PRMNightStacker: @unchecked Sendable {
         let count = status.rejected
         lock.unlock()
         PRMLog.debug(.capture, "Night: frame \(count) rejected: \(reason)")
+    }
+
+    // MARK: - Sharpness
+
+    /// Rejects frames much blurrier than the burst so far: under half the median sharpness of
+    /// the frames seen before (accepted or not).
+    ///
+    /// The median rather than the reference frame: on a flat scene the metric sits near its
+    /// noise floor, and one frame that measured sharper than the rest (sharpness 10 against 4
+    /// to 5 on a device run) made every later frame look blurred, leaving 3 of 17 merged.
+    struct SharpnessGate {
+        private(set) var seen: [Float] = []
+
+        /// The median of the frames seen so far, `nil` before the first.
+        var typical: Float? {
+            guard !seen.isEmpty else { return nil }
+            let sorted = seen.sorted()
+            let middle = sorted.count / 2
+            return sorted.count.isMultiple(of: 2) ? (sorted[middle - 1] + sorted[middle]) / 2 : sorted[middle]
+        }
+
+        /// Records `sharpness` and returns whether the frame is sharp enough to merge. The
+        /// first frame always is.
+        mutating func admits(_ sharpness: Float) -> Bool {
+            defer { seen.append(sharpness) }
+            guard let typical, typical > 0 else { return true }
+            return sharpness >= 0.5 * typical
+        }
     }
 
     // MARK: - Result

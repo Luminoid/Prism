@@ -72,6 +72,31 @@ struct PRMNightPlannerTests {
     }
 
     @Test
+    func `A shutter shorter than the frame duration still takes a whole frame`() {
+        // The 2026-10-08 device run: about 1/40 s at ISO 55 on a 30 fps format planned 39
+        // frames for one second, more than the camera delivers.
+        let lit = PRMNightPlanInput(
+            exposureDuration: 0.008,
+            iso: 207,
+            targetOffset: 0,
+            minISO: 55,
+            maxISO: 12320,
+            minExposureDuration: 1.0 / 40000,
+            maxExposureDuration: 1,
+            minFrameDuration: 1.0 / 30,
+            focalLength35mm: 24,
+            isStable: false
+        )
+        let plan = PRMNightPlanner.plan(lit, duration: .seconds(1))
+        #expect(plan.frameDuration < 1.0 / 30)
+        #expect(plan.frameCount == 30)
+        // Frames longer than the frame duration are unaffected.
+        var dark = darkRoom
+        dark.minFrameDuration = 1.0 / 30
+        #expect(PRMNightPlanner.plan(dark, duration: .automatic).frameCount == 24)
+    }
+
+    @Test
     func `Requested durations are clamped and frames never drop below three`() {
         #expect(PRMNightPlanner.plan(darkRoom, duration: .seconds(5)).duration == 5)
         #expect(PRMNightPlanner.plan(darkRoom, duration: .seconds(100)).duration == 30)

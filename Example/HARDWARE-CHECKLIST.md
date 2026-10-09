@@ -62,15 +62,79 @@ Behavior changed by the 2026-10-04 audit fix pass. Library changes first, then t
   - [ ] the front preview is upright and mirrored like a mirror; the `Preview orientation:` line reads `→ 90°` with `data connection 270°` (send it if not);
   - [ ] tap-to-focus on the front camera lands where you tap, and *Detect → Faces* outlines sit on the faces (the 270° connection's frames are assumed to be in the same space as the focus point);
   - [ ] a front photo and a front recording save upright.
-- [ ] **Cinematic Video on a Pro iPhone.** The Triple camera has no Cinematic Video format (Apple supports it on the Dual Wide and TrueDepth cameras), so the drawer row used to stay disabled.
-  - [ ] *Cinematic Video* turns on from the Triple camera: the log shows `Cinematic Video: BuiltInTripleCamera has no Cinematic Video format, switching to BuiltInDualWideCamera`, the lens strip changes to the Dual Wide camera's lenses, and a VIDEO recording has the shallow depth of field;
+- [ ] **Cinematic Video on a Pro iPhone.** The Triple camera has no Cinematic Video format, so the drawer row used to stay disabled.
+  - [ ] *Cinematic Video* turns on from the Triple camera: the log shows `Cinematic Video: BuiltInTripleCamera has no Cinematic Video format, switching to …`, the lens strip changes to that camera's lenses, and a VIDEO recording has the shallow depth of field;
   - [ ] turning it off returns to the Triple camera (`Cinematic Video off: switching back to BuiltInTripleCamera`);
-  - [ ] a flip with it on lands on the front camera Cinematic Video runs on (TrueDepth) with it still on, and a flip back lands on the Dual Wide camera;
-  - [ ] the `Frame latency` lines with it on (the open item in iOS 26 → Cinematic Video).
+  - [ ] a flip with it on lands on the front camera Cinematic Video runs on with it still on, and a flip back lands on the back camera it ran on;
+  - [ ] no `Slow frame latency` line with it on (the open item in iOS 26 → Cinematic Video).
+  - Result 2026-10-08 (iPhone 18 Pro Max, iOS 27.0): it switched to `BuiltInWideAngleCamera` (not the Dual Wide camera), a flip landed on the front `BuiltInUltraWideCamera` without a switch, and VIDEO recorded. On the front camera in PHOTO the preview lagged (`Slow frame latency` avg 105 ms); PHOTO now turns Cinematic Video off, so check the lag in front VIDEO.
 - [ ] **Night plan.** The `Night: N frames at …` line shows a real auto shutter (no `n/a`), and a dim scene plans a brighter exposure than auto (the plan is now read before the switch to InputPriority, which restarted auto exposure: on 2026-10-07 it read 1/170 s and planned frames too dark).
 - [ ] **Fewer camera switches.** SLO-MO → NIGHT logs one `swapInput` (staying on the wide camera), and a flip back to the rear camera in NIGHT logs one `swapInput` straight to the wide camera.
 - [ ] **Filter Chain 48MP format.** The `Started:` line shows `420f` (it was `420v`), and the log has no `no CGColorSpace payload` notice.
-- [ ] **Latency log.** After the app comes back from the background, the next `Frame latency` line spans about 5 s (it spanned the time away).
+- [ ] **Latency log.** After the app comes back from the background, a `Slow frame latency` line, if one appears, spans about 5 s, not the time away.
+  - Result 2026-10-07 (iPhone 18 Pro Max, iOS 27.0): steady windows read 30 to 50 ms, so the line now appears only for a slow window (an average of 100 ms or more, or one frame 250 ms behind).
+
+## Log review fixes (2026-10-07, second run)
+
+- [ ] **Unsupported modes.** In Studio's drawer, *WB Mode → Auto* on an iPhone toasts "Back Camera has no auto (one-shot) white balance. It offers locked and continuous auto." and snaps back to the current mode; the camera stays where it was (on 2026-10-07 the refusal left Studio thinking white balance was automatic, so it hopped back to the Triple camera while the wide camera's white balance stayed locked).
+- [ ] **Photo size.** Each `capturePhoto:` debug line shows the size asked for (`up to 8064×6048`) and the quality; a `Photo captured:` line smaller than that ends with the reason, such as `(asked for up to 8064x6048: manual exposure and locked white balance capture at 12 MP)`. With Max Dimensions on, automatic exposure and continuous white balance, a photo in daylight comes back 8064x6048 (send the line if it doesn't).
+- [ ] **SLO-MO → NIGHT.** No `Live Photo requested but not supported: a movie output is attached` line: slow motion's exit now drops the movie output and its frame rate before the photo output comes back.
+- [ ] **Slider logs.** A shutter, ISO, white balance or aperture drag logs two lines (the first value and `… (settled after N more)`), not one per tick, and the aperture slider sends each stop once per drag.
+
+## Setting conflicts (newest wins)
+
+Each change below should land, move the other controls to match, toast the text shown, and log a `Conflict:` line (`Refused:` for the refusals). Send the line for any row that doesn't.
+
+- [ ] **Max Dimensions on** in LIVE (or PORTRAIT, BURST): Studio moves to PHOTO first. "Max Dimensions turned off LIVE: the 48 MP format has no Live Photo movie or depth."
+- [ ] **Max Dimensions on** with WB locked (or an ISO, shutter, aperture or priority set): "Max Dimensions turned off locked white balance: manual photos are 12 MP." Exposure and white balance read auto afterwards, and a daylight photo comes back 8064x6048.
+- [ ] **ISO drag** with Max Dimensions on: "ISO turned off Max Dimensions: manual photos are 12 MP."
+- [ ] **ISO drag** in LIVE: "ISO turned off LIVE: Live Photo keeps exposure automatic." In PORTRAIT: "… turned off PORTRAIT: a manual capture carries no depth."
+- [ ] **LIVE** with Max Dimensions on, ISO set or WB locked: "LIVE turned off Max Dimensions and manual exposure: …"; **PORTRAIT** turns off manual exposure the same way; **BURST** turns off Max Dimensions.
+- [ ] **Cinematic Video on** in PHOTO or PORTRAIT with Subject Tracking on: Studio moves to VIDEO. "Cinematic Video turned off Subject Tracking and PORTRAIT: …". With Max Dimensions on, it's turned off too.
+- [ ] With **Cinematic Video on**: PHOTO, PORTRAIT, LIVE, NIGHT or SLO-MO turns it off ("PHOTO turned off Cinematic Video: photos would come from Cinematic Video's 16:9 video format."), as do Focus Mode, the Focus slider and Subject Tracking ("… turned off Cinematic Video: Cinematic Video controls focus."), and ISO / WB ("… Cinematic Video keeps exposure and white balance automatic."). The camera goes back to the Triple camera in each case.
+- [ ] **Lens Lock** on a Triple-camera lens, then an ISO drag: "ISO turned off Lens Lock: manual controls run on the wide camera.", and the Lens Lock segment reads Auto.
+- [ ] **Flip to the front camera** with Max Dimensions on: "Front Camera turned off Max Dimensions: it caps at 12 MP." (the camera's own name).
+- [ ] **Configuration Lab**: turning on *Live Photo capture* with *Movie file output* on toasts "Live Photo capture turned off Movie file output: Live Photo can't run beside a movie output."; *Portrait-effects matte* on with depth off toasts "… turned on Depth-data delivery …".
+- [ ] **Refused**:
+  - [ ] In VIDEO, SLO-MO and NIGHT the Max Dimensions row is dimmed ("Max Dimensions is for photos"); it keeps its setting, and back in PHOTO the 48MP format comes back (`applyPhotoFormat(max-dimensions)` in the log; it used to stay at 12MP after a frame-rate change).
+  - [ ] While recording on the Triple camera, ISO and Shutter are dimmed ("Stop recording to change ISO: manual exposure needs the wide camera."), and so are Cinematic Video, Lens Lock and Sensor Aspect.
+  - [ ] Tracking Bias is dimmed until Subject Tracking is on.
+  - [ ] Low-light boost and HDR are dimmed on a camera or format without them.
+  - [ ] A vertical EV drag under a custom exposure toasts "EV does nothing under manual exposure. Set exposure to Auto first." and leaves the exposure alone.
+  - [ ] A camera refusal toasts "Not available: <reason>" instead of "Camera failed: Unsupported in the current configuration: …".
+- [ ] **Tap to focus** under a custom exposure focuses and keeps the ISO and shutter (it used to reset them to auto).
+
+## Log review fixes (2026-10-08)
+
+The 2026-10-08 log (iPhone 18 Pro Max, iOS 27.0) confirmed the WB *Auto* refusal, the photo-size lines and an 8064x6048 Max Dimensions photo, the slider bursts, SLO-MO → NIGHT on one camera, the Filter Chain `420f` format, a real auto reading in the Night plan, and the Max Dimensions → LIVE, LIVE → manual exposure and Cinematic Video → manual exposure conflicts. Fixes from it to check:
+
+- [ ] **Shutter during a mode change.** Pick SLO-MO from VIDEO and tap the shutter at once: the recording starts once the switch to the wide camera lands (`Record waited for the camera setup in flight`). It used to start on the old camera and fail with "Cannot Record" (AVError -11805) when the setup switched cameras under it.
+- [x] **Night, 1 s handheld.** Most frames merge. On 2026-10-08, 14 of 17 were rejected as blurred against a first frame that measured twice as sharp as the rest; each frame is now compared with the median of the frames before it. Rejections read `blurred (sharpness N vs typical M)`.
+  - Result 2026-10-09 (lit room): 29 of 39 frames at *1s*, 53 of 64 at *3s*. The 39 was more than a 30 fps format delivers in a second; see the 2026-10-09 section.
+- [x] **Cinematic Video and PHOTO.** With Cinematic Video on, PHOTO turns it off (toast above), and turning it on in PHOTO moves to VIDEO. With it on, front photos had come back 2160x3840 JPEG from its 16:9 format.
+  - Result 2026-10-09: both directions logged their `Conflict:` line.
+- [x] **Cinematic Video from a manual exposure.** With an aperture or ISO set (so Studio is on the wide camera), turning Cinematic Video on logs no `swapInput` on an iPhone 18 Pro Max, whose wide camera runs it (it used to go to the Triple camera and straight back). Turning it off goes back to the Triple camera (`Studio: back to BuiltInTripleCamera, …`).
+  - Result 2026-10-09: from 𝑓/4.0, no switch; PHOTO turned it off and went back to the Triple camera.
+- [ ] **A locked focus keeps the wide camera.** Drag *Focus*, set ISO, then set exposure and WB back to auto: Studio stays on the wide camera and the focus stays put. *Focus Mode → Cont* then goes back to the Triple camera.
+- [x] **Hops say why.** Each manual hop's `swapInput` follows a `Studio: to the wide camera for <control>` line, and each return a `Studio: back to …` line. A focus drag logs `PRMCamera.setLensPosition(…)` like the other sliders.
+  - Result 2026-10-09: NIGHT, ISO, White balance, Manual focus and Max Dimensions each named.
+- [x] **Codec.** With HEIC selected, the 48MP photos, the aperture photos and the front Cinematic Video photos came back JPEG on 2026-10-08. A JPEG photo now logs `Photo codec hvc1 isn't offered by the output now (it offers …)` when that's why; send that line, or the `Photo captured:` line if there's none (the capture then ignored the codec).
+  - Result 2026-10-09: every photo was HEIC until one right after the focus rows; from then on all were JPEG with no codec notice. The *Codec* row sits just below them and logged nothing, so it was most likely set to JPEG. It logs now (2026-10-09 section).
+  - Result 2026-10-09, second log: `Studio Codec → jpeg`, then JPEG photos. Not a camera fault.
+- [ ] **Error lines.** A failed capture logs the error case and codes (`Record failed: … <- AVFoundationErrorDomain -11805 <- NSOSStatusErrorDomain -16418`), not the whole Swift description. A capture with no size set reads `capturePhoto: default size`, not `up to 0×0`.
+
+## Log review fixes (2026-10-09)
+
+The 2026-10-09 log (iPhone 18 Pro Max, iOS 27.0) confirmed HEIC from PHOTO, LIVE, PORTRAIT, BURST and NIGHT, the hop reasons, the focus-slider line, `capturePhoto: default size`, the PHOTO and Cinematic Video conflicts in both directions, and Cinematic Video turned on from an aperture without a camera switch. Fixes from it to check:
+
+- [x] **Drawer choices are logged.** Changing *Codec*, *HDR*, *Low-Light Boost*, *Stabilization* or *Auto Red-Eye* logs `Studio <row> → <value>`. A JPEG photo now follows a `Studio Codec → jpeg` line or the codec notice; one with neither is a camera that ignored the codec.
+  - Result 2026-10-09, second log: `Studio Codec → jpeg`, then a JPEG photo.
+- [x] **Night frame counts.** In a lit room, *1s* plans about 30 frames on a 30 fps format. It planned 39 from a 1/38 s shutter, more than the format delivers in a second, so "29 of 39" looked like ten rejections. The photo line now reads `Night photo: N of M frames (R rejected, S skipped while merging)`: skipped frames arrived while the previous one was still merging; rejected ones were blurred or couldn't be aligned.
+  - Result 2026-10-09, second log: *AUTO* planned 30 frames at 1/40 s and merged 27 (0 rejected, 3 skipped). *3s* merged 64 of 64 twice (2 and 19 skipped).
+- [ ] **A manual control in VIDEO keeps VIDEO's frame rate.** In VIDEO, set the aperture or ISO: after `Studio: to the wide camera for …` the log shows `PRMCamera.setFrameRate(30.0, …)` and `switching sessionPreset Photo → InputPriority`, and the return to auto does the same after `Studio: back to …`. A clip recorded after the switch has the same dimensions as one recorded before it. The switch used to leave VIDEO on the Photo preset (`preset=Photo` in the `Switched device` line, and no `resetFrameRate: restoring` line on the way to PHOTO).
+- [ ] **VIDEO → PHOTO from the wide camera.** With Cinematic Video on (or a manual hop) in VIDEO, picking PHOTO logs `Movie output detached, Live Photo off` before `Studio: back to BuiltInTripleCamera`; the `swapInput post:` line reads `live(supported=true, …)` and the outputs list has no `movie`. It used to swap with the movie output attached (`live(supported=false, …)`, `hardwareCost=0.50`).
+- [ ] **Max Dimensions in VIDEO.** Tapping the dimmed row toasts "Max Dimensions is for photos. Switch to PHOTO to use it." when it's off, and "… It stays on for when you go back to PHOTO." when it's on. It used to say it was kept even when off.
+- [ ] **Focus Mode is traced.** A *Focus Mode* change logs `PRMCamera.setFocusMode(…)` at debug, before any `Studio: back to …` it causes.
 
 ## iOS 26
 
@@ -90,11 +154,11 @@ Behavior changed by the 2026-10-04 audit fix pass. Library changes first, then t
   - [ ] `CINE·DARK` appears in a dim room;
   - [ ] photo capture still works with Cinematic Video on, or AVError -11872 appears (if so, enable with `targetPhotoOutputAttached: false`);
   - [ ] the preview never freezes after enabling (a frozen preview means the Cinematic format doesn't offer BGRA);
-  - [ ] the preview keeps up with motion: the debug line `Frame latency over 5.0s: avg … ms` stays under about 100 ms, and the *Stabilization* row reads `→ off` or `→ low latency` in the preview (the movie gets the chosen mode while recording);
+  - [ ] the preview keeps up with motion: no debug line `Slow frame latency over 5.0s: …` (it appears when a window averages 100 ms or more, or one frame lags 250 ms), and the *Stabilization* row reads `→ off` or `→ low latency` in the preview (the movie gets the chosen mode while recording);
     - Result 2026-10-06 (iPhone 18 Pro Max, iOS 27.0): the preview lagged far behind. The data connection fed the preview with the requested stabilization (`.auto`, which is cinematic on video formats). If the lag remains with low latency, it's Cinematic Video's own rendering, and the next step is a system preview layer for that mode.
   - [ ] a camera switch keeps Cinematic Video on, and no readiness timeout is logged;
   - [ ] enabling on a format that needs a switch logs both commits without a readiness timeout between them;
-  - [ ] *Focus Mode* and the lens-position slider are refused with a toast (no crash), and leaving VIDEO for PHOTO keeps Cinematic Video on;
+  - [ ] *Focus Mode* and the lens-position slider turn Cinematic Video off with a toast (no crash), and leaving VIDEO for PHOTO turns it off too (`Conflict: PHOTO turned off Cinematic Video …`);
   - [ ] turning Cinematic Video off brings back photo depth (Portrait) and stops the face / body detection feed.
 - [ ] **Dynamic aspect ratio (iPhone 17 front camera).** *Sensor Aspect* switches between the offered ratios while the phone stays upright; the preview resizes without freezing. Note whether a format change (48MP, slo-mo) resets the ratio and whether 1:1 changes saved photo dimensions.
 - [ ] **Smart Framing (iPhone 17 front camera).** Turn on *Smart Framing* with several people in frame; *Apply* changes the ratio and zoom to the suggestion.

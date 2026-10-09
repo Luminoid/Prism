@@ -45,6 +45,7 @@ extension PRMCameraSession {
             focalLength = halfAngle > 0 ? 18 / tan(halfAngle) : 26
         }
         let duration = CMTimeGetSeconds(device.exposureDuration)
+        let frameDuration = CMTimeGetSeconds(device.activeVideoMinFrameDuration)
         return PRMNightPlanInput(
             exposureDuration: duration.isFinite && duration > 0 ? duration : 1.0 / 30.0,
             iso: device.iso,
@@ -53,6 +54,7 @@ extension PRMCameraSession {
             maxISO: format.maxISO,
             minExposureDuration: CMTimeGetSeconds(format.minExposureDuration),
             maxExposureDuration: CMTimeGetSeconds(format.maxExposureDuration),
+            minFrameDuration: frameDuration.isFinite && frameDuration > 0 ? frameDuration : 0,
             focalLength35mm: focalLength,
             isStable: isStable
         )

@@ -176,13 +176,30 @@
         /// format (`false`) in one begin/commit, and remembers the choice across camera
         /// switches. Checked and applied in one actor turn.
         ///
+        /// Turning it off while a movie output is attached only drops the choice (allowed
+        /// while recording); the video format stays.
+        ///
         /// - Throws: ``PRMSessionError/unsupportedConfiguration(_:)`` while Cinematic Video is
-        ///   enabled (it owns the format) or while recording.
+        ///   enabled (it owns the format), while recording, or, when enabling, while a movie
+        ///   output is attached (the photo format would replace the video format the movie
+        ///   output records).
         public func setHighResolutionPhotoFormat(_ enabled: Bool) throws {
+            // Off with a movie output attached only drops the choice: the active format is the
+            // video mode's (or Cinematic Video's), and `resetFrameRate()` brings the photo
+            // format back. Nothing changes on the session, so it isn't refused while recording.
+            if !enabled, movieFileOutput != nil {
+                wantsHighResolutionPhotoFormat = false
+                return
+            }
             if isCinematicVideoCaptureActive {
                 throw PRMSessionError.unsupportedConfiguration("Changing the photo format isn't available while Cinematic Video is enabled")
             }
             try refuseWhileBusy("Changing the photo format")
+            if enabled, movieFileOutput != nil {
+                throw PRMSessionError.unsupportedConfiguration(
+                    "The 48MP photo format would replace the video format; detach the movie output first"
+                )
+            }
             wantsHighResolutionPhotoFormat = enabled
             if enabled {
                 applyHighResolutionPhotoFormat()
@@ -227,7 +244,6 @@
         /// sees a "48MP format + depth enabled" transient that would either reject
         /// the swap or downgrade captures to a tiny preview frame.
         func applyHighResolutionPhotoFormat() {
-            PRMLog.debug(.session, "applyHighResolutionPhotoFormat")
             // **Do NOT snapshot `baselineActiveFormat` here.** The configure-time
             // and `swapInput` snapshots are the authoritative "known-good" state.
             // A per-toggle snapshot would clobber that with whatever happens to be

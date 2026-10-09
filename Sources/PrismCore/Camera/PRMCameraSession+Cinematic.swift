@@ -71,9 +71,10 @@ public extension PRMCameraSession {
     ///     AVError -11872 (ISP bandwidth). `nil` leaves it as is when enabling, and
     ///     re-attaches it per the configuration when disabling.
     /// - Throws: ``PRMSessionError/unsupportedConfiguration(_:)`` before iOS 26, while
-    ///   recording, when a depth data output is attached, or when the device has no
-    ///   Cinematic Video format. A failed enable leaves the format, preset and subject
-    ///   tracking as they were. ``PRMSessionError/cancelled`` when a later toggle or camera
+    ///   recording, when a depth data output is attached, while the 48MP photo format is
+    ///   wanted (``setHighResolutionPhotoFormat(_:)``), or when the device has no Cinematic
+    ///   Video format. A failed enable leaves the format, preset and subject tracking as
+    ///   they were. ``PRMSessionError/cancelled`` when a later toggle or camera
     ///   switch overtook the enable while it waited for the first rebuild.
     func setCinematicVideoCaptureEnabled(_ enabled: Bool, targetPhotoOutputAttached: Bool? = nil) async throws {
         PRMLog.debug(.session, "setCinematicVideoCaptureEnabled(\(enabled))")
@@ -83,6 +84,11 @@ public extension PRMCameraSession {
             throw PRMSessionError.unsupportedConfiguration("Cinematic Video requires iOS 26")
         }
         try refuseWhileBusy("Toggling Cinematic Video")
+        if enabled, wantsHighResolutionPhotoFormat {
+            throw PRMSessionError.unsupportedConfiguration(
+                "Cinematic Video replaces the 48MP photo format; turn the high-resolution photo format off first"
+            )
+        }
         cinematicGeneration += 1
         guard enabled else {
             session.beginConfiguration()
@@ -240,6 +246,9 @@ extension PRMCameraSession {
         wantsCinematicVideo = true
         // Cinematic Video owns focus; tracking can't run with it and shouldn't come back on
         // its own when Cinematic Video is turned off.
+        if wantsContinuousAutoFocusTracking {
+            PRMLog.notice(.session, "Cinematic Video turns subject tracking off: Cinematic Video drives focus itself")
+        }
         wantsContinuousAutoFocusTracking = false
 
         if !device.activeFormat.isCinematicVideoCaptureSupported {

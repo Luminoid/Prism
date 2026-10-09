@@ -106,10 +106,17 @@ extension StudioViewController {
 
     /// Runs `body` as the capture in flight (after `pending`, when given): the shutter ignores
     /// taps until it ends, and a failure goes to the toast.
+    ///
+    /// It starts once the mode setups, flips and camera hops queued before it have landed. A
+    /// capture fired mid-setup fails: a recording started while SLO-MO's setup was still
+    /// switching to the wide camera stopped with AVError -11805 ("Cannot Record").
     private func runCapture(context: String, after pending: Task<Void, Never>? = nil, _ body: @escaping @MainActor () async throws -> Void) {
         captureGeneration += 1
         let generation = captureGeneration
         captureTask = Task { [weak self] in
+            if await self?.awaitSessionWork() == true {
+                ExampleLog.capture.info("\(context, privacy: .public) waited for the camera setup in flight")
+            }
             await pending?.value
             do {
                 try await body()
@@ -137,7 +144,7 @@ extension StudioViewController {
                 try await PhotoLibrarySaver.save(.video(recording.url))
                 ExampleLog.capture.notice("Saved the recording that was running when Studio closed")
             } catch {
-                ExampleLog.capture.error("Recording at close failed: \(String(describing: error), privacy: .public)")
+                ExampleLog.capture.error("Recording at close failed: \(PRMLog.describe(error).summary, privacy: .public)")
             }
         }
         exitTask = finishing
@@ -322,24 +329,26 @@ extension StudioViewController {
 // MARK: - Video
 
 extension StudioViewController {
+    /// The recorder is read once the setup in flight has landed: a mode change into VIDEO
+    /// attaches the movie output only then.
     private func startRecording() {
-        guard let videoRecorder else {
-            ExampleLog.capture.error("Record refused: the movie output isn't attached yet")
-            toaster.show("Recording isn't ready yet. Try again in a moment.")
-            return
-        }
         let angle = host.captureRotationAngle
         runCapture(context: "Record") { [weak self] in
+            guard let self else { return }
+            guard mode.isVideo, let videoRecorder else {
+                ExampleLog.capture.error("Record refused: the movie output isn't attached")
+                toaster.show("Recording isn't ready yet. Try again in a moment.")
+                return
+            }
             try await videoRecorder.start(rotationAngle: angle)
-            self?.recordingDidStart()
+            recordingDidStart()
         }
     }
 
     /// Stops after a start that's still under way (a press-and-hold released early).
     private func stopRecording() {
-        guard let videoRecorder else { return }
         runCapture(context: "Stop recording", after: captureTask) { [weak self] in
-            guard self?.recordingStartedAt != nil else { return }
+            guard self?.recordingStartedAt != nil, let videoRecorder = self?.videoRecorder else { return }
             let recording: PRMRecording
             do {
                 recording = try await videoRecorder.stop()

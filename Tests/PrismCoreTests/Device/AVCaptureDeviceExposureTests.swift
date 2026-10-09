@@ -19,7 +19,7 @@ struct AVCaptureDeviceExposureTests {
         let setCustom: (AVCaptureDevice) -> (CMTime, Float, (@Sendable (CMTime) -> Void)?) throws -> Void =
             { device in device.prm_setCustomExposure }
         let focusExp: (AVCaptureDevice) ->
-            (AVCaptureDevice.FocusMode, AVCaptureDevice.ExposureMode, CGPoint, Bool) throws -> Void =
+            (AVCaptureDevice.FocusMode, AVCaptureDevice.ExposureMode?, CGPoint, Bool) throws -> Void =
             { device in device.prm_setFocusAndExposure }
         let manualCapture: KeyPath<AVCaptureDevice, Bool> = \.prm_supportsManualExposureCapture
         _ = (setMode, setBias, setCustom, focusExp, manualCapture)
@@ -73,7 +73,7 @@ struct AVCaptureDeviceExposureTests {
 
     @Test
     func `iOS 26 focus signatures compile`() {
-        let rect: (AVCaptureDevice) -> (AVCaptureDevice.FocusMode, AVCaptureDevice.ExposureMode, CGRect, Bool) throws -> Void =
+        let rect: (AVCaptureDevice) -> (AVCaptureDevice.FocusMode, AVCaptureDevice.ExposureMode?, CGRect, Bool) throws -> Void =
             { device in device.prm_setFocusAndExposure }
         let defaultRect: (AVCaptureDevice) -> (CGPoint) -> CGRect? = { device in device.prm_defaultFocusRect }
         let exposureOnly: (AVCaptureDevice) -> (CGPoint, AVCaptureDevice.ExposureMode) throws -> Void =

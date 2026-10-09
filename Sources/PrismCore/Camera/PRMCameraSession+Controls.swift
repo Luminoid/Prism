@@ -99,6 +99,8 @@ public extension PRMCameraSession {
     /// The restore is best-effort: a preset the current format can't take is left alone.
     ///
     /// While Cinematic Video is enabled only the frame durations are cleared; its format stays.
+    /// When ``setHighResolutionPhotoFormat(_:)`` asked for the 48MP format and no movie output
+    /// is attached, the 48MP format comes back too (the preset restore replaces it).
     ///
     /// - Throws: ``PRMSessionError/unsupportedConfiguration(_:)`` while recording;
     ///   AVFoundation's lock error.
@@ -125,8 +127,16 @@ public extension PRMCameraSession {
                 )
             }
         }
+        let frameDurations = (device.activeVideoMinFrameDuration, device.activeVideoMaxFrameDuration)
         try device.prm_resetFrameRate()
-        // The preset restore can replace the active format.
+        if frameDurations != (device.activeVideoMinFrameDuration, device.activeVideoMaxFrameDuration) {
+            PRMLog.debug(.session, "resetFrameRate: frame rate back to the format's default")
+        }
+        // The preset restore can replace the active format, the 48MP one included: put it
+        // back when it's still wanted (a VIDEO → PHOTO round trip, the end of a Night capture).
+        if wantsHighResolutionPhotoFormat, movieFileOutput == nil, !isOnHighResolutionPhotoFormat {
+            applyHighResolutionPhotoFormat()
+        }
         refreshVideoDataOutputPixelFormat()
         refreshOutputMaxPhotoDimensions()
         applyFeatureIntents()
@@ -153,7 +163,13 @@ public extension PRMCameraSession {
         guard let device = videoDevice else { return false }
         session.beginConfiguration()
         defer { session.commitConfiguration() }
+        let previousFormat = device.activeFormat
         guard try device.prm_enableDepthFormat() else { return false }
+        if device.activeFormat !== previousFormat {
+            let dimensions = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
+            let subtype = PRMLog.fourCC(CMFormatDescriptionGetMediaSubType(device.activeFormat.formatDescription))
+            PRMLog.debug(.session, "enableDepthFormat: switched to \(dimensions.width)x\(dimensions.height) \(subtype)")
+        }
         if let photoOutput {
             if photoOutput.isDepthDataDeliverySupported {
                 photoOutput.isDepthDataDeliveryEnabled = false

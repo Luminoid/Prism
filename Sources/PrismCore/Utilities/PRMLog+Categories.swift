@@ -2,8 +2,8 @@
 //  PRMLog+Categories.swift
 //  PrismCore
 //
-//  Prism's log categories and small logging helpers. The core in `PRMLog.swift` is shared
-//  across Luminoid packages; everything Prism-specific lives here.
+//  Prism's log categories and small logging helpers. The core is in `PRMLog.swift`;
+//  everything Prism-specific lives here.
 //
 
 import AVFoundation

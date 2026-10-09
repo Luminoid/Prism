@@ -12,7 +12,9 @@ public extension AVCaptureDevice {
     ///   support `mode`, or AVFoundation's lock error.
     func prm_setExposureMode(_ mode: AVCaptureDevice.ExposureMode) throws {
         guard isExposureModeSupported(mode) else {
-            throw PRMSessionError.unsupportedConfiguration("Exposure mode \(mode.rawValue) isn't supported by \(localizedName)")
+            throw PRMSessionError.unsupportedConfiguration(
+                "Exposure mode \(mode.prm_name) isn't supported; \(prm_supportedModesText(prm_supportedExposureModes.map(\.prm_name)))"
+            )
         }
         try prm_withConfigurationLock {
             if mode != .custom {
@@ -148,10 +150,11 @@ public extension AVCaptureDevice {
     ///
     /// Coordinates are in *device* space (`0,0` = top-left of camera sensor) and are
     /// clamped into `0...1`. Most callers convert from view coordinates via
-    /// `PRMPreviewView.texturePoint(fromViewPoint:)`.
+    /// `PRMPreviewView.texturePoint(fromViewPoint:)`. A `nil` `exposureMode` focuses without
+    /// touching exposure, so a manual exposure stays.
     func prm_setFocusAndExposure(
         focusMode: AVCaptureDevice.FocusMode,
-        exposureMode: AVCaptureDevice.ExposureMode,
+        exposureMode: AVCaptureDevice.ExposureMode?,
         at devicePoint: CGPoint,
         monitorSubjectAreaChange: Bool = false
     ) throws {
@@ -161,7 +164,7 @@ public extension AVCaptureDevice {
                 focusPointOfInterest = devicePoint
                 self.focusMode = focusMode
             }
-            if isExposurePointOfInterestSupported, isExposureModeSupported(exposureMode) {
+            if let exposureMode, isExposurePointOfInterestSupported, isExposureModeSupported(exposureMode) {
                 exposurePointOfInterest = devicePoint
                 self.exposureMode = exposureMode
             }
@@ -193,10 +196,11 @@ public extension AVCaptureDevice {
     /// mode is set afterwards because the SDK only applies a new rect on a mode change.
     ///
     /// Falls back to the point overload at the rect's center when the OS is older than
-    /// iOS 26 or the device doesn't support rects for that axis.
+    /// iOS 26 or the device doesn't support rects for that axis. A `nil` `exposureMode`
+    /// focuses without touching exposure.
     func prm_setFocusAndExposure(
         focusMode: AVCaptureDevice.FocusMode,
-        exposureMode: AVCaptureDevice.ExposureMode,
+        exposureMode: AVCaptureDevice.ExposureMode?,
         in rect: CGRect,
         monitorSubjectAreaChange: Bool = false
     ) throws {
@@ -219,7 +223,7 @@ public extension AVCaptureDevice {
                 }
                 self.focusMode = focusMode
             }
-            if isExposurePointOfInterestSupported, isExposureModeSupported(exposureMode) {
+            if let exposureMode, isExposurePointOfInterestSupported, isExposureModeSupported(exposureMode) {
                 if isExposureRectOfInterestSupported {
                     exposureRectOfInterest = Self.prm_clampedRectOfInterest(rect, minimumSize: minExposureRectOfInterestSize)
                 } else {

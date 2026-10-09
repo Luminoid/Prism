@@ -78,7 +78,6 @@ public extension PRMCamera {
     ///     ``PRMCameraSession/setCinematicVideoCaptureEnabled(_:targetPhotoOutputAttached:)``.
     /// - Throws: As ``PRMCameraSession/setCinematicVideoCaptureEnabled(_:targetPhotoOutputAttached:)``.
     func setCinematicVideoEnabled(_ enabled: Bool, targetPhotoOutputAttached: Bool? = nil) async throws {
-        PRMLog.debug(.session, "PRMCamera.setCinematicVideoEnabled(\(enabled))")
         if enabled {
             try await moveToCinematicVideoCamera()
         }
@@ -226,10 +225,12 @@ extension PRMCamera {
     /// the camera actor's turn that checked the Cinematic flag.
     nonisolated static func applyCinematicTapFocus(
         on device: AVCaptureDevice,
-        exposureMode: AVCaptureDevice.ExposureMode,
+        exposureMode: AVCaptureDevice.ExposureMode?,
         at devicePoint: CGPoint
     ) throws {
-        try device.prm_setExposurePointOfInterest(devicePoint, mode: exposureMode)
+        if let exposureMode {
+            try device.prm_setExposurePointOfInterest(devicePoint, mode: exposureMode)
+        }
         if #available(iOS 26.0, *) {
             try device.prm_setCinematicFocus(.trackPoint(devicePoint, mode: .strong))
         }

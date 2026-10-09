@@ -21,12 +21,14 @@
 		93636A85D08729B0AF1FF66F /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9205AC2DEE68D93059206669 /* AppDelegate.swift */; };
 		95F5118FF1F39719876FF078 /* ModernCaptureControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = EAA80CF7BD9362871178071E /* ModernCaptureControls.swift */; };
 		9D43F0503BE85D458C36D21B /* StudioDrawerControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49F22E26E7992991C1BB9762 /* StudioDrawerControls.swift */; };
+		A3F9C32BADB20F23F92AE746 /* SettingConflicts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B8B6C9DC31DF46A10BAF149 /* SettingConflicts.swift */; };
 		B4DC424EC2415F532F95D72F /* StudioViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A393F4CE7D1B2A788030F14F /* StudioViewController.swift */; };
 		C04BD7D17BC8EED689F3EEC6 /* CameraPreviewHost.swift in Sources */ = {isa = PBXBuildFile; fileRef = CD22463A10782144E6483BA1 /* CameraPreviewHost.swift */; };
 		CAB426AE80B5DFBB750EB84F /* StudioViewController+DeviceHops.swift in Sources */ = {isa = PBXBuildFile; fileRef = F59469F5C6C67FAB8A85EA18 /* StudioViewController+DeviceHops.swift */; };
 		D60B6DD1C21325EA0F3E04F4 /* StudioViewController+Capture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 416B9772379C21278C3BF2A3 /* StudioViewController+Capture.swift */; };
 		D81079311A19F1F0850894FD /* PrismUI in Frameworks */ = {isa = PBXBuildFile; productRef = 3C35934D9D337FA8B1F10B78 /* PrismUI */; };
 		DA9364011D14F658F366D99E /* CaptureLabels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 805F7246E4A71C9B8A134055 /* CaptureLabels.swift */; };
+		E07AAEF06C87AFC5926E58E9 /* StudioViewController+Conflicts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09A28AC0B070C1651C7ABF7B /* StudioViewController+Conflicts.swift */; };
 		EF1CD153FAB443912C2D6EE2 /* PermissionsViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = B16B67D838E073419ABD2F17 /* PermissionsViewController.swift */; };
 		F4BCB78F5FA9AF6651776A95 /* PhotoLibrarySaver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 97F6D7EC7BAB8E16D64005D5 /* PhotoLibrarySaver.swift */; };
 		FC5BF218BC1C2CD9917620D3 /* StudioComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2168F1C9DCD3204B5328503F /* StudioComponents.swift */; };
@@ -34,6 +36,7 @@
 
 /* Begin PBXFileReference section */
 		033F012A261FEFF4499FEB98 /* ConfigurationLabViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConfigurationLabViewController.swift; sourceTree = "<group>"; };
+		09A28AC0B070C1651C7ABF7B /* StudioViewController+Conflicts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "StudioViewController+Conflicts.swift"; sourceTree = "<group>"; };
 		2168F1C9DCD3204B5328503F /* StudioComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StudioComponents.swift; sourceTree = "<group>"; };
 		2309B42ACC42C5336112552E /* FilterChainViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilterChainViewController.swift; sourceTree = "<group>"; };
 		3F1C92FD3DDF93CF6CBC8EE0 /* ExampleLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExampleLog.swift; sourceTree = "<group>"; };
@@ -41,6 +44,7 @@
 		486B33EDCCB72EDE25192E3F /* PrismExample.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PrismExample.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		49F22E26E7992991C1BB9762 /* StudioDrawerControls.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StudioDrawerControls.swift; sourceTree = "<group>"; };
 		4F84EFBD24D61E5FF6AE4844 /* Prism */ = {isa = PBXFileReference; lastKnownFileType = folder; name = Prism; path = ..; sourceTree = SOURCE_ROOT; };
+		5B8B6C9DC31DF46A10BAF149 /* SettingConflicts.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingConflicts.swift; sourceTree = "<group>"; };
 		63A161EAFA4DB72BD5F5F2C0 /* ExampleComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExampleComponents.swift; sourceTree = "<group>"; };
 		7AFBED18985B4C42614023AD /* SceneDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneDelegate.swift; sourceTree = "<group>"; };
 		805F7246E4A71C9B8A134055 /* CaptureLabels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureLabels.swift; sourceTree = "<group>"; };
@@ -122,10 +126,12 @@
 				97F6D7EC7BAB8E16D64005D5 /* PhotoLibrarySaver.swift */,
 				C1BFC379ED771940D5CB70AB /* RootCatalogViewController.swift */,
 				7AFBED18985B4C42614023AD /* SceneDelegate.swift */,
+				5B8B6C9DC31DF46A10BAF149 /* SettingConflicts.swift */,
 				2168F1C9DCD3204B5328503F /* StudioComponents.swift */,
 				49F22E26E7992991C1BB9762 /* StudioDrawerControls.swift */,
 				A393F4CE7D1B2A788030F14F /* StudioViewController.swift */,
 				416B9772379C21278C3BF2A3 /* StudioViewController+Capture.swift */,
+				09A28AC0B070C1651C7ABF7B /* StudioViewController+Conflicts.swift */,
 				F59469F5C6C67FAB8A85EA18 /* StudioViewController+DeviceHops.swift */,
 			);
 			path = Sources;
@@ -218,9 +224,11 @@
 				F4BCB78F5FA9AF6651776A95 /* PhotoLibrarySaver.swift in Sources */,
 				40258322CB68603979892393 /* RootCatalogViewController.swift in Sources */,
 				2E271F3B4DF03489EF8BBB9C /* SceneDelegate.swift in Sources */,
+				A3F9C32BADB20F23F92AE746 /* SettingConflicts.swift in Sources */,
 				FC5BF218BC1C2CD9917620D3 /* StudioComponents.swift in Sources */,
 				9D43F0503BE85D458C36D21B /* StudioDrawerControls.swift in Sources */,
 				D60B6DD1C21325EA0F3E04F4 /* StudioViewController+Capture.swift in Sources */,
+				E07AAEF06C87AFC5926E58E9 /* StudioViewController+Conflicts.swift in Sources */,
 				CAB426AE80B5DFBB750EB84F /* StudioViewController+DeviceHops.swift in Sources */,
 				B4DC424EC2415F532F95D72F /* StudioViewController.swift in Sources */,
 			);

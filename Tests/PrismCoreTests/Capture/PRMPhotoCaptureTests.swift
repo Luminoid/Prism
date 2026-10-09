@@ -130,6 +130,43 @@ struct PRMPhotoCaptureTests {
     }
 
     @Test
+    func `A photo smaller than asked for says so, with the known reason`() {
+        let fortyEight = CMVideoDimensions(width: 8064, height: 6048)
+        let twelve = CMVideoDimensions(width: 4032, height: 3024)
+        #expect(PRMPhotoCapture.smallerThanRequestedText(twelve, requested: fortyEight, sizeLimit: "why") == " (asked for up to 8064x6048: why)")
+        #expect(PRMPhotoCapture.smallerThanRequestedText(twelve, requested: fortyEight, sizeLimit: nil)
+            == " (asked for up to 8064x6048: AVFoundation delivered a smaller size)")
+        #expect(PRMPhotoCapture.smallerThanRequestedText(fortyEight, requested: fortyEight, sizeLimit: "why").isEmpty)
+        #expect(PRMPhotoCapture.smallerThanRequestedText(twelve, requested: nil, sizeLimit: "why").isEmpty)
+    }
+
+    @Test
+    func `The capture line says default size when no size is set`() {
+        #expect(PRMPhotoCapture.sizeText(CMVideoDimensions(width: 0, height: 0)) == "default size")
+        #expect(PRMPhotoCapture.sizeText(CMVideoDimensions(width: 8064, height: 6048)) == "up to 8064×6048")
+    }
+
+    @Test
+    func `A codec the output doesn't offer falls back to the default`() {
+        let output = AVCapturePhotoOutput()
+        #expect(PRMPhotoSettings.availableCodec(nil, on: output) == nil)
+        let offered = output.availablePhotoCodecTypes
+        #expect(PRMPhotoSettings.availableCodec(.hevc, on: output) == (offered.contains(.hevc) ? .hevc : nil))
+    }
+
+    @Test
+    func `Manual captures and 24MP without deferred delivery report why they're smaller`() {
+        let output = AVCapturePhotoOutput()
+        let settings = AVCapturePhotoSettings()
+        #expect(PRMPhotoCapture.sizeLimit(of: settings, output: output, manualCapture: true) != nil)
+        settings.maxPhotoDimensions = CMVideoDimensions(width: 5712, height: 4284)
+        let twentyFour = PRMPhotoCapture.sizeLimit(of: settings, output: output, manualCapture: false)
+        #expect(twentyFour?.contains("deferred") == true)
+        settings.maxPhotoDimensions = CMVideoDimensions(width: 8064, height: 6048)
+        #expect(PRMPhotoCapture.sizeLimit(of: settings, output: output, manualCapture: false) == nil)
+    }
+
+    @Test
     func `Sendable conformance via actor hop`() async {
         let capture = PRMPhotoCapture(output: AVCapturePhotoOutput())
         // Sending across an `await` boundary requires Sendable.
